@@ -43,7 +43,7 @@ The ICC specification defines the `kTRC` tag as a **decode** curve: given a stor
 $$
 Y = \begin{cases}
 \left(\dfrac{L^* + 16}{116}\right)^3 & \text{if } L^* > 8 \\[10pt]
-\dfrac{L^*}{903.3} & \text{if } L^* \leq 8
+\dfrac{L^{*}}{903.3} & \text{if } L^{*} \leq 8
 \end{cases}
 $$
 
