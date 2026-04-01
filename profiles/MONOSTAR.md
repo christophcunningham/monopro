@@ -154,7 +154,7 @@ Display P3 is the native colour space of all Apple displays since 2016. monopro 
 
 ## License
 
-monostar is open and freely redistributable. No attribution required, though it is appreciated.
+monostar is released to the public domain under the Creative Commons CC0 1.0 Universal license. No rights reserved.
 
 The profile binary is generated deterministically from first principles (CIE standard, ICC specification). No third-party ICC data or Adobe IP is incorporated.
 
