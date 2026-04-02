@@ -9,7 +9,7 @@ Released April 1, 2026 · Open · Freely redistributable
 
 ## What this is
 
-monostar is a grayscale ICC v4.4 profile whose `kTRC` tag encodes the inverse CIE L\* transfer function as a `para` type 4 parametric curve — 7 exact rational coefficients with zero quantisation error. This means pixel values stored in a monostar-tagged TIFF are L\*-encoded — perceptually uniform — and any color-managed application will correctly decode them back to linear light for display or further processing.
+monostar is a grayscale ICC v4.4 profile whose `kTRC` tag encodes the inverse CIE L\* transfer function as a `para` type 3 parametric curve — 5 exact rational coefficients with zero quantisation error. This means pixel values stored in a monostar-tagged TIFF are L\*-encoded — perceptually uniform — and any color-managed application will correctly decode them back to linear light for display or further processing.
 
 To our knowledge, this is the first openly distributed grayscale ICC profile to use L\* as its TRC rather than a power-law gamma or dot-gain approximation.
 
@@ -45,15 +45,15 @@ Y = L* / 903.3                 if L* ≤ 8
 where L* = code × 100
 ```
 
-This is encoded as an ICC v4 `para` type 4 parametric curve — 7 exact rational coefficients, zero quantisation error, 40 bytes. The equivalent 1024-point `curv` table would be 2,060 bytes with up to 0.03% rounding error at each sample point.
+This is encoded as an ICC v4 `para` type 3 parametric curve — 5 exact rational coefficients, zero quantisation error, 32 bytes. The equivalent 1024-point `curv` table would be 2,060 bytes with up to 0.03% rounding error at each sample point.
 
-### The `para` type 4 coefficients
+### The `para` type 3 coefficients
 
-The ICC v4 `para` type 4 curve takes the form:
+The ICC v4 `para` type 3 curve takes the form:
 
 ```
-Y = (a·X + b)^g + e    for X ≥ d
-Y = c·X + f            for X < d
+Y = (a·X + b)^g    for X ≥ d
+Y = c·X            for X < d
 ```
 
 For monostar, substituting the inverse L\* function (where X is the normalised code value in [0, 1]):
@@ -64,9 +64,9 @@ a = 100/116           ≈ 0.862069
 b = 16/116            ≈ 0.137931
 c = 100/903.3         ≈ 0.110706
 d = 8/100  = 0.08     (L*=8 threshold in code-value space)
-e = 0.0
-f = 0.0
 ```
+
+Type 3 is used rather than type 4 (which adds offset parameters e and f) because both offsets are zero for L\*. This matches the TRC encoding used by eciRGB v2 ICCv4.
 
 These are exact rational values derived directly from the CIE L\* definition. Encoded as s15Fixed16Number (signed 16.16 fixed point), the maximum rounding per coefficient is 1/65536 ≈ 0.0015%.
 
@@ -76,13 +76,13 @@ Most common grayscale profiles — Gray Gamma 1.8, Gray Gamma 2.2, Dot Gain 20% 
 
 ### Round-trip accuracy
 
-The `para` parametric curve is mathematically exact — no sampling, no quantisation. The only rounding occurs in the s15Fixed16Number encoding of the 7 coefficients (fixed-point with 16 fractional bits), which introduces error of at most 1/65536 ≈ 0.0015% per coefficient. Verification of the decoded curve at key tonal values:
+The `para` parametric curve is mathematically exact — no sampling, no quantisation. The only rounding occurs in the s15Fixed16Number encoding of the 5 coefficients (fixed-point with 16 fractional bits), which introduces error of at most 1/65536 ≈ 0.0015% per coefficient. Verification of the decoded curve at key tonal values:
 
 | Linear Y | L\* code | para decode Y | Error |
 |:--------:|:--------:|:-------------:|:-----:|
 | 0.0000 | 0.0000 | 0.0000 | 0.000% |
-| 0.0089 | 0.0801 | 0.0089 | <0.002% |
-| 0.2140 | 0.5000 | 0.2140 | <0.002% |
+| 0.0089 | 0.0800 | 0.0089 | <0.002% |
+| 0.1842 | 0.5000 | 0.1842 | <0.002% |
 | 0.5000 | 0.7607 | 0.5000 | <0.002% |
 | 1.0000 | 1.0000 | 1.0000 | 0.000% |
 
@@ -96,13 +96,14 @@ The `para` parametric curve is mathematically exact — no sampling, no quantisa
 | Profile class | Display (`mntr`) |
 | Colour space | Gray |
 | PCS | XYZ |
-| PCS illuminant | D50 (0.96420, 1.00000, 0.82491) |
-| TRC tag | `kTRC` — `para` type 4 parametric curve (inverse L\*, 7 coefficients, 40 bytes) |
+| PCS illuminant | D50 (0.96420, 1.00000, 0.82488) |
+| TRC tag | `kTRC` — `para` type 3 parametric curve (inverse L\*, 5 coefficients, 32 bytes) |
 | Description | `mluc` enUS — "monostar" |
 | Copyright | `mluc` enUS — "C. Cunningham / monopro project" |
 | Creator | `CRC ` |
 | Created | 2026-04-01 |
-| File size | 536 bytes |
+| Profile ID | MD5 (computed per ICC v4 clause 7.2.18) |
+| File size | 528 bytes |
 
 ---
 
@@ -144,9 +145,9 @@ monostar does not perform dot-gain compensation. It is not intended for files go
 
 | File | Description |
 |------|-------------|
-| `monostar.icc` | The profile — 536 bytes, ICC v4.4, `para` TRC. Install in `~/Library/ColorSync/Profiles/` on macOS |
+| `monostar.icc` | The profile — 528 bytes, ICC v4.4, `para` TRC. Install in `~/Library/ColorSync/Profiles/` on macOS |
 | `eciRGB_v2_ICCv4.icc` | eciRGB v2 ICCv4 from [eci.org](https://www.eci.org) — used by monopro for toned RGB exports |
-| `DisplayP3-v4.icc` | Display P3 ICC v4 — 480 bytes, description string `sP3` — from [saucecontrol/Compact-ICC-Profiles](https://github.com/saucecontrol/Compact-ICC-Profiles) (CC0) — used by monopro for JPEG proof exports |
+| `DisplayP3-v4.icc` | Display P3 ICC v4— description string `sP3`, 480 bytes — from [saucecontrol/Compact-ICC-Profiles](https://github.com/saucecontrol/Compact-ICC-Profiles) (CC0) — used by monopro for JPEG proof exports |
 
 Display P3 is the native colour space of all Apple displays since 2016. monopro uses it for screen-destined JPEG proof exports so that colour-managed display on Apple Silicon Macs is exact.
 
@@ -154,7 +155,7 @@ Display P3 is the native colour space of all Apple displays since 2016. monopro 
 
 ## License
 
-monostar is released to the public domain under the Creative Commons CC0 1.0 Universal license. No rights reserved.
+monostar is open and freely redistributable. No attribution required, though it is appreciated.
 
 The profile binary is generated deterministically from first principles (CIE standard, ICC specification). No third-party ICC data or Adobe IP is incorporated.
 
