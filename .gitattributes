@@ -1,0 +1,5 @@
+# Markdown uses trailing double spaces for intentional hard line breaks.
+*.md whitespace=-blank-at-eol
+
+# Preserve upstream font notices verbatim, including their whitespace.
+fonts/JetBrainsMono/*.txt whitespace=-blank-at-eol

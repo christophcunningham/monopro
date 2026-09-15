@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/raw-core",
+    "crates/raw-graph",
+    "crates/raw-gpu",
+    "crates/raw-app",
+]
+
+# catalog/ is deliberately absent — lightbox comes after tabs.
+#
+# graph/ arrived at milestone 3, on the build order's schedule: hardcode a linear
+# pipeline first, refactor into a node graph at module three or four when it
+# earns its complexity. Contrast Mask is what earned it — it forks and joins, so
+# it cannot be expressed as a line.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "GPL-3.0-or-later" # rawler is LGPL-2.1; see docs/decisions.md
+
+[workspace.dependencies]
+raw-core = { path = "crates/raw-core" }
+raw-graph = { path = "crates/raw-graph" }
+raw-gpu = { path = "crates/raw-gpu" }
+
+rawler = "0.7.2"
+# Must match what egui-wgpu 0.35 depends on, or wgpu types from eframe's render
+# state are a *different crate* to ours and will not typecheck. egui-wgpu 0.35
+# pins wgpu 29.0; wgpu 30 exists but nothing in the egui stack uses it yet.
+wgpu = "29.0"
+# `persistence` is not a default feature. Without it the app forgets even where
+# its own window was; with it, window geometry and egui's own memory (which is
+# where panel widths live) survive a restart for the cost of a feature flag.
+eframe = { version = "0.35", features = ["persistence"] }
+egui = "0.35"
+egui-wgpu = "0.35"
+# The docking layout. Chosen because 0.16 depends on **egui 0.35, exactly the
+# version pinned above** — a docking crate that forced the egui/eframe/wgpu stack
+# forward would have been the largest risk in milestone 8, and this retires it
+# before the first line. Its `serde` feature is on by default and is what lets the
+# tile tree persist through eframe storage. See `docs/decisions.md`.
+egui_tiles = "0.16"
+bytemuck = { version = "1", features = ["derive"] }
+rayon = "1"
+# Copy-on-write file copies where the filesystem has them (APFS, Btrfs, ReFS),
+# with a real copy everywhere else. Saving a duplicate copies the raw, and raws
+# are immutable — so on APFS a duplicate costs nothing until a file changes,
+# which never happens.
+reflink-copy = "0.1"
+# `settings.toml` only. TOML because the file is meant to be hand-editable, and
+# serde because writing a TOML parser to avoid a dependency would be a worse
+# dependency. Deliberately NOT used for the sidecar: that is a compatibility
+# surface whose wire format should be chosen rather than inherited from a struct
+# layout, and it is hand-written for that reason. See raw_core::sidecar.
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+# Read-only XML DOM for the .mono.xmp sidecar. A real parser rather than string
+# matching: the sidecar is a compatibility surface that must survive hand editing
+# and files written by the Python prototype, which means entities, namespaces and
+# attribute quoting all have to be handled properly.
+roxmltree = "0.21"
+thiserror = "2"
+pollster = "0.4"
+
+[profile.dev]
+opt-level = 1 # decoding a 100MP RAF in a debug build is otherwise unusable
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -1,0 +1,40 @@
+[package]
+name = "raw-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Decode -> scene. No GPU, no UI. Headless-testable against a folder of reference raws.
+
+[dependencies]
+rawler.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+bytemuck.workspace = true
+roxmltree.workspace = true
+# Only for resizing the embedded preview — rawler already hands back a
+# DynamicImage, so this adds the resampler and no new decode surface.
+image = { version = "0.25", default-features = false }
+# EXIF for the files rawler will not open — a JPEG or a TIFF in Lightbox. Taken
+# rather than written for two reasons. It is the standard Rust reader, pure Rust
+# with no unsafe and one small dependency, so the C-library options (ImageMagick,
+# exiv2) would have added a system dependency and an FFI surface to read a header.
+# And it covers TIFF, which the alternative did not: `image`'s `exif_metadata` is
+# implemented for JPEG, PNG and WebP only, so a hand-rolled reader on top of it
+# would have left half of Lightbox's own extension list with no metadata at all.
+kamadak-exif = "0.6.1"
+
+[target.'cfg(windows)'.dependencies]
+# `std::fs::rename` cannot replace an existing destination on Windows. Persistence
+# publishes completed files with ReplaceFileW so the second save is as atomic as the
+# first one is on Unix.
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
+
+# Examples only — the demosaic comparison writes crops and difference maps to look
+# at, and "ship only the algorithms that visibly differ" is a judgement nobody can
+# make from summary statistics alone. The library itself has no image-writing
+# dependency and should not acquire one.
+[dev-dependencies]
+png = "0.18.1"

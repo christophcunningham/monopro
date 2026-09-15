@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Build the x86-64 AppImage on the oldest supported Linux userspace.
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/../.." && pwd)"
+
+if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
+  echo "The Linux package must be built on x86-64 Linux." >&2
+  exit 2
+fi
+
+linuxdeploy="${LINUXDEPLOY:-}"
+if [[ -z "$linuxdeploy" ]]; then
+  linuxdeploy="$(command -v linuxdeploy || true)"
+fi
+if [[ -z "$linuxdeploy" || ! -x "$linuxdeploy" ]]; then
+  echo "linuxdeploy was not found. Set LINUXDEPLOY or put it on PATH." >&2
+  exit 2
+fi
+
+version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_root/Cargo.toml" | head -n 1)"
+if [[ -z "$version" ]]; then
+  echo "Could not read workspace version from Cargo.toml." >&2
+  exit 2
+fi
+
+dist="$repo_root/dist"
+appdir="$dist/monopro.AppDir"
+output="$dist/monopro-$version-linux-x86_64.AppImage"
+binary="$repo_root/target/x86_64-unknown-linux-gnu/release/monopro"
+
+cd "$repo_root"
+cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+rm -rf "$appdir"
+mkdir -p \
+  "$appdir/usr/bin" \
+  "$appdir/usr/share/applications" \
+  "$appdir/usr/share/icons/hicolor/1024x1024/apps" \
+  "$appdir/usr/share/licenses/monopro" \
+  "$appdir/usr/share/metainfo"
+
+install -m 0755 "$binary" "$appdir/usr/bin/monopro"
+install -m 0644 "$script_dir/monopro.desktop" "$appdir/usr/share/applications/monopro.desktop"
+sed -i "s/@VERSION@/$version/g" "$appdir/usr/share/applications/monopro.desktop"
+install -m 0644 "$repo_root/icon.png" "$appdir/usr/share/icons/hicolor/1024x1024/apps/monopro.png"
+install -m 0644 "$repo_root/LICENSE" "$appdir/usr/share/licenses/monopro/LICENSE"
+install -m 0644 "$script_dir/com.christophercunningham.monopro.metainfo.xml" \
+  "$appdir/usr/share/metainfo/com.christophercunningham.monopro.metainfo.xml"
+
+rm -f "$output"
+export LDAI_OUTPUT="$output"
+export LINUXDEPLOY_OUTPUT_VERSION="$version"
+"$linuxdeploy" \
+  --appdir "$appdir" \
+  --executable "$appdir/usr/bin/monopro" \
+  --desktop-file "$appdir/usr/share/applications/monopro.desktop" \
+  --icon-file "$appdir/usr/share/icons/hicolor/1024x1024/apps/monopro.png" \
+  --output appimage
+
+test -x "$output"
+"$script_dir/verify" "$output"

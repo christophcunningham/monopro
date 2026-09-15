@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Fetch the reviewed linuxdeploy continuous build and reject silent replacement.
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/../.." && pwd)"
+destination="${1:-$repo_root/dist/tools/linuxdeploy-x86_64.AppImage}"
+url="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+# continuous commit 07333c6e942c7d71782b66be924c5d867f9dfdfc, published 2026-09-01
+sha256="36a2d7e274d12e1050d0e9ecfe11d339ed54720b2bec464c286d53f8b07f5c62"
+
+mkdir -p "$(dirname "$destination")"
+curl --fail --location --retry 3 --silent --show-error "$url" --output "$destination"
+printf '%s  %s\n' "$sha256" "$destination" | sha256sum --check --status
+chmod 0755 "$destination"
+printf '%s\n' "$destination"

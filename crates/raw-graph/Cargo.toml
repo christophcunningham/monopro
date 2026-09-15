@@ -1,0 +1,15 @@
+[package]
+name = "raw-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Node graph: executor topology, typed connectors, ROI propagation.
+#
+# No wgpu, deliberately. The ROI arithmetic is the most bug-prone part of the
+# pipeline and the GPU tests skip when there is no adapter; these must not.
+
+[dependencies]
+raw-core.workspace = true
+thiserror.workspace = true

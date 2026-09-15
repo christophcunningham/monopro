@@ -1,0 +1,211 @@
+#!/bin/zsh
+# Build a distributable macOS .app and .dmg into dist/.
+#
+#   ./package                     universal, ad-hoc-signed local package
+#   ./package --arm64             Apple Silicon-only local package
+#   ./package --signed            universal, Developer ID-signed and notarized release
+#
+# Everything here uses the Rust toolchain and tools that ship with macOS — hdiutil,
+# sips and lipo. No cargo-bundle, no create-dmg, nothing to install first.
+#
+# The default build is ad-hoc signed for local testing. `--signed` is the public-release
+# path and requires MONOPRO_MAC_SIGNING_IDENTITY plus a notarytool keychain profile in
+# MONOPRO_NOTARY_PROFILE. It fails closed if either credential is unavailable.
+#
+# **Release, always.** This is the one thing that leaves the machine, and the debug
+# default `./run` uses would ship an opt-level 1 build to somebody who will judge the app
+# by how it feels.
+
+set -e
+here=${0:A:h}
+cd "$here"
+
+universal=1
+signed=0
+while (( $# )); do
+  case "$1" in
+    --arm64) universal=0 ;;
+    --signed) signed=1 ;;
+    *) echo "usage: ./package [--arm64] [--signed]" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if (( signed )); then
+  : ${MONOPRO_MAC_SIGNING_IDENTITY:?MONOPRO_MAC_SIGNING_IDENTITY is required by --signed}
+  : ${MONOPRO_NOTARY_PROFILE:?MONOPRO_NOTARY_PROFILE is required by --signed}
+fi
+
+app_name="monopro"
+version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+dist="$here/dist"
+app="$dist/$app_name.app"
+dmg="$dist/$app_name-$version.dmg"
+
+mkdir -p "$dist"
+rm -rf \
+  "$app" \
+  "$dmg" \
+  "$dist/READ ME FIRST.txt" \
+  "$dist/LICENSE.txt" \
+  "$dist/stage" \
+  "$dist/$app_name.iconset" \
+  "$dist/$app_name-rgb.png" \
+  "$dist/make_icns"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+
+# ── The binary ────────────────────────────────────────────────────────────────
+#
+# `lipo` glues the two architectures into one file. A universal binary is about twice
+# the size and runs natively on both, which is worth it when you do not know what the
+# person opening it is holding.
+echo "building release (this uses fat LTO and is not quick)…" >&2
+cargo build --release --locked --target aarch64-apple-darwin
+arm="$here/target/aarch64-apple-darwin/release/$app_name"
+
+if (( universal )); then
+  cargo build --release --locked --target x86_64-apple-darwin
+  intel="$here/target/x86_64-apple-darwin/release/$app_name"
+  lipo -create -output "$app/Contents/MacOS/$app_name" "$arm" "$intel"
+else
+  cp "$arm" "$app/Contents/MacOS/$app_name"
+fi
+chmod +x "$app/Contents/MacOS/$app_name"
+
+# ── The icon ──────────────────────────────────────────────────────────────────
+#
+# A full .iconset is ten files, 16 through 512 at 1x and 2x. `sips` generates them
+# from one 1024 square, after converting the monochrome source into an explicit sRGB
+# PNG. A tiny dependency-free Rust helper writes the ICNS container because macOS 26.4
+# `iconutil` rejects even iconsets it just unpacked. Skipped without complaint if
+# icon.png is missing: the app still builds and simply wears the generic icon.
+if [[ -f "$here/icon.png" ]]; then
+  set="$dist/$app_name.iconset"
+  rgb_icon="$dist/$app_name-rgb.png"
+  mkdir -p "$set"
+  sips --matchTo '/System/Library/ColorSync/Profiles/sRGB Profile.icc' \
+    "$here/icon.png" --out "$rgb_icon" >/dev/null
+  for s in 16 32 128 256 512; do
+    sips -z $s $s        "$rgb_icon" --out "$set/icon_${s}x${s}.png"    >/dev/null
+    sips -z $((s*2)) $((s*2)) "$rgb_icon" --out "$set/icon_${s}x${s}@2x.png" >/dev/null
+  done
+  rustc --edition 2024 "$here/packaging/macos/make_icns.rs" -o "$dist/make_icns"
+  "$dist/make_icns" "$set" "$app/Contents/Resources/$app_name.icns"
+  rm -rf "$set" "$rgb_icon" "$dist/make_icns"
+  icon_line="    <key>CFBundleIconFile</key><string>$app_name</string>"
+else
+  echo "no icon.png at the repo root — packaging without one" >&2
+  icon_line=""
+fi
+
+# ── Info.plist ────────────────────────────────────────────────────────────────
+#
+# `NSHighResolutionCapable` is the one that is not boilerplate: without it macOS runs the
+# window through its 2x upscaler and every pixel of the picture is soft, which for this
+# application would be the whole point missed.
+#
+# `LSMinimumSystemVersion` is 11.0 because that is where Apple Silicon starts, and the
+# universal binary has nothing older to offer.
+cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>$app_name</string>
+    <key>CFBundleDisplayName</key><string>$app_name</string>
+    <key>CFBundleExecutable</key><string>$app_name</string>
+    <key>CFBundleIdentifier</key><string>com.christophercunningham.$app_name</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>$version</string>
+    <key>CFBundleVersion</key><string>$version</string>
+$icon_line
+    <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>monopro needs access to removable drives and camera cards so you can browse and develop their photographs.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>monopro needs access to network volumes so you can browse and develop photographs stored there.</string>
+</dict>
+</plist>
+PLIST
+
+# ── Application signature ────────────────────────────────────────────────────
+if (( signed )); then
+  codesign --force --deep --options runtime --timestamp \
+    --sign "$MONOPRO_MAC_SIGNING_IDENTITY" "$app"
+  codesign --verify --deep --strict --verbose=2 "$app"
+else
+  # Not a Developer ID and does not satisfy Gatekeeper. It does stop macOS treating
+  # arm64 code as having no signature at all.
+  codesign --force --deep --sign - "$app" 2>/dev/null || \
+    echo "ad-hoc signing failed; the app may not launch on Apple Silicon" >&2
+fi
+
+# ── What the DMG says about itself ────────────────────────────────────────────
+if (( signed )); then
+cat > "$dist/READ ME FIRST.txt" <<'TXT'
+monopro
+-------
+
+Drag monopro.app to the Applications folder.
+
+SOURCE
+------
+monopro is free software under the GNU General Public License v3 or later, so
+you are entitled to the complete source for this binary. The repository at
+https://github.com/christophcunningham/monopro includes the full licence text
+and the acknowledgements for the libraries it builds on.
+TXT
+else
+cat > "$dist/READ ME FIRST.txt" <<'TXT'
+monopro
+-------
+
+Drag monopro.app to the Applications folder.
+
+LOCAL TEST PACKAGE
+------------------
+This build is ad-hoc signed, not Developer ID-signed or notarized. It is for local
+package validation and must not be published as a release.
+
+SOURCE
+------
+monopro is free software under the GNU General Public License v3 or later, so
+you are entitled to the complete source for this binary. The repository at
+https://github.com/christophcunningham/monopro includes the full licence text
+and the acknowledgements for the libraries it builds on.
+TXT
+fi
+cp "$here/LICENSE" "$dist/LICENSE.txt" 2>/dev/null || true
+
+# ── The DMG ───────────────────────────────────────────────────────────────────
+#
+# Staged in its own directory so the disk image contains exactly four things and not
+# whatever else `dist/` has collected. The /Applications symlink is what makes it a
+# drag-to-install rather than a folder somebody has to know what to do with.
+stage="$dist/stage"
+mkdir -p "$stage"
+cp -R "$app" "$stage/"
+cp "$dist/READ ME FIRST.txt" "$stage/"
+[[ -f "$dist/LICENSE.txt" ]] && cp "$dist/LICENSE.txt" "$stage/"
+ln -s /Applications "$stage/Applications"
+
+hdiutil create -volname "$app_name" -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null
+rm -rf "$stage"
+
+if (( signed )); then
+  codesign --force --timestamp --sign "$MONOPRO_MAC_SIGNING_IDENTITY" "$dmg"
+  xcrun notarytool submit "$dmg" --keychain-profile "$MONOPRO_NOTARY_PROFILE" --wait
+  xcrun stapler staple "$dmg"
+  xcrun stapler validate "$dmg"
+fi
+
+verify_args=()
+(( universal )) || verify_args+=(--arm64)
+(( signed )) && verify_args+=(--notarized)
+"$here/packaging/macos/verify" "${verify_args[@]}"
+
+echo
+echo "  $app"
+echo "  $dmg  ($(du -h "$dmg" | cut -f1))"
+lipo -archs "$app/Contents/MacOS/$app_name" | sed 's/^/  architectures: /'

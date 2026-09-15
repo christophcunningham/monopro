@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.christophercunningham.monopro</id>
+  <name>monopro</name>
+  <summary>Develop monochrome photographs from RAW sensor data</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      monopro is a monochrome RAW processor for culling and editing photographs for
+      digital printing and alternative printmaking.
+    </p>
+  </description>
+  <launchable type="desktop-id">monopro.desktop</launchable>
+  <provides>
+    <binary>monopro</binary>
+  </provides>
+</component>

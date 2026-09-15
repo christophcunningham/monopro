@@ -1,0 +1,109 @@
+name: Package candidates
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-candidates-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: Universal macOS candidate
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust and both macOS targets
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup default 1.92.0
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Build and verify the ad-hoc-signed candidate
+        run: ./package
+      - name: Upload the candidate and checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: monopro-macos-candidate
+          path: |
+            dist/monopro-*.dmg
+            dist/monopro-*.dmg.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows x64 candidate
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup default 1.92.0
+          rustup target add x86_64-pc-windows-msvc
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build and verify the unsigned candidate
+        shell: pwsh
+        run: .\packaging\windows\package.ps1 -Unsigned
+      - name: Upload the candidate and checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: monopro-windows-candidate
+          path: |
+            dist/monopro-*-windows-x86_64-setup.exe
+            dist/monopro-*-windows-x86_64-setup.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Ubuntu 24.04 AppImage candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup default 1.92.0
+          rustup target add x86_64-unknown-linux-gnu
+      - name: Install package validators and the AppImage runtime library
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes appstream desktop-file-utils libfuse2t64
+      - name: Fetch the pinned linuxdeploy build
+        run: ./packaging/linux/fetch-linuxdeploy
+      - name: Build and verify the AppImage
+        run: |
+          LINUXDEPLOY="$PWD/dist/tools/linuxdeploy-x86_64.AppImage" \
+            ./packaging/linux/package
+      - name: Check Fedora and Arch-family userspace compatibility
+        run: ./packaging/linux/verify-containers
+      - name: Upload the candidate and checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: monopro-linux-candidate
+          path: |
+            dist/monopro-*-linux-x86_64.AppImage
+            dist/monopro-*-linux-x86_64.AppImage.sha256
+          if-no-files-found: error
+          retention-days: 14

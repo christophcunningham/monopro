@@ -1,0 +1,52 @@
+[package]
+name = "raw-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# egui shell. At milestone 1 this is one window, one image, two sliders.
+
+# **The executable is `monopro`, and that is not cosmetic.** macOS takes the application
+# menu's title from the running process, so a binary called `raw-app` put "Raw App" at
+# the top left of the screen whatever `Menus::install` was passed. The crate keeps its
+# name; only the artefact is renamed.
+[[bin]]
+name = "monopro"
+path = "src/main.rs"
+
+[dependencies]
+raw-core.workspace = true
+raw-gpu.workspace = true
+eframe.workspace = true      # default features select the wgpu backend, not glow
+egui.workspace = true
+egui_tiles.workspace = true
+egui-wgpu.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+png = "0.18.1"
+reflink-copy.workspace = true
+serde.workspace = true
+toml.workspace = true
+rfd = "0.17.2"
+rayon.workspace = true
+tiff = "0.11.3"
+resvg = { version = "0.47", default-features = false }
+jpeg-encoder = "0.7.1"
+# Reading cached Lightbox tiles back, and nothing else. `jpeg-encoder` above writes
+# them; this is the other half. **`default-features = false` with only `jpeg`**: the
+# full crate brings a decoder for every format it supports, which is a large decode
+# surface to acquire for reading files this app wrote itself.
+# Reading cached Lightbox tiles back, and thumbnailing the ordinary image formats
+# the grid now lists. `default-features = false` still: this is the set the browser
+# can actually show, chosen rather than inherited.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp", "bmp", "gif"] }
+pdf-writer = "0.15.0"
+ttf-parser = "0.25.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+# The native menu bar. Its Linux defaults are GTK and libxdo, but non-macOS builds
+# deliberately keep their shortcuts in egui until a native shell can attach a menu.
+muda = { version = "0.19", default-features = false }

@@ -1,0 +1,59 @@
+# Rebuildable output and local scratch files.
+/target/
+/dist/
+/tmp/
+.DS_Store
+Thumbs.db
+
+# Private photographs and edits must never be published.
+raws/
+*.dng
+*.DNG
+*.raf
+*.RAF
+*.arw
+*.ARW
+*.nef
+*.NEF
+*.cr2
+*.CR2
+*.cr3
+*.CR3
+*.rw2
+*.RW2
+*.orf
+*.ORF
+*.pef
+*.PEF
+*.srw
+*.SRW
+*.tif
+*.TIF
+*.tiff
+*.TIFF
+*.mono.xmp
+
+# Local application state and caches.
+app.ron
+settings.toml
+thumbcache/
+
+# Credentials and local environment files.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+
+# Editor/agent state and private preparation notes.
+.idea/
+.vscode/
+.claude/
+.codex/
+.agents/
+PUBLICATION-PLAN.local.md
+
+# Only the embedded font faces and their license notices are distributed.
+/fonts/JetBrainsMono-2.304/

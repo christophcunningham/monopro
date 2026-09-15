@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Inspect an AppImage without trusting a desktop launch as package evidence.
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/../.." && pwd)"
+version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_root/Cargo.toml" | head -n 1)"
+artifact="${1:-$repo_root/dist/monopro-$version-linux-x86_64.AppImage}"
+
+for command in appstreamcli desktop-file-validate file ldd readelf sha256sum; do
+  command -v "$command" >/dev/null || {
+    echo "$command is required to verify the Linux package." >&2
+    exit 2
+  }
+done
+
+artifact="$(realpath "$artifact")"
+test -x "$artifact"
+file "$artifact" | grep -q 'ELF 64-bit.*x86-64'
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/monopro-appimage.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+"$artifact" --appimage-extract >/dev/null
+root="$work/squashfs-root"
+
+test -x "$root/AppRun"
+test -x "$root/usr/bin/monopro"
+test -f "$root/monopro.desktop"
+test -f "$root/monopro.png"
+test -f "$root/usr/share/licenses/monopro/LICENSE"
+test -f "$root/usr/share/metainfo/com.christophercunningham.monopro.metainfo.xml"
+
+readelf -h "$root/usr/bin/monopro" | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+desktop-file-validate "$root/monopro.desktop"
+appstreamcli validate --no-net \
+  "$root/usr/share/metainfo/com.christophercunningham.monopro.metainfo.xml"
+
+library_path="$root/usr/lib:$root/usr/lib/x86_64-linux-gnu"
+if LD_LIBRARY_PATH="$library_path" ldd "$root/usr/bin/monopro" | grep -q 'not found'; then
+  LD_LIBRARY_PATH="$library_path" ldd "$root/usr/bin/monopro" >&2
+  exit 1
+fi
+
+checksum="$artifact.sha256"
+(
+  cd "$(dirname "$artifact")"
+  sha256sum "$(basename "$artifact")" > "$(basename "$checksum")"
+)
+printf '%s\n' "$artifact" "$checksum"

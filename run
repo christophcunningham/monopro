@@ -1,0 +1,82 @@
+#!/bin/zsh
+# Build this tree and launch it.
+#
+# The one the old `lightbox` script got wrong: it only compiled when the binary
+# was *missing*, so every run after the first launched whatever was last built
+# and an edit you had just made was silently not in it. This always builds, and
+# cargo is the thing deciding whether that is a no-op — a warm tree costs about
+# a tenth of a second, which is cheaper than looking at a stale window and
+# believing it.
+#
+#   ./run                    open on the last folder
+#   ./run some.dng           straight to Develop with that file
+#   ./run --release          the release build instead of debug
+#   ./run --profile scratch  a separate set of remembered state
+#
+# Flags must come before any file argument; everything after them is passed to
+# the app untouched.
+#
+# **Debug is the default, which is the opposite of what the old script did.**
+# `[profile.release]` here is `lto = true` with `codegen-units = 1` — minutes of
+# linking for every run, which is the wrong price to pay to look at a panel you
+# just moved. `[profile.dev]` is `opt-level = 1` with every dependency at 3,
+# which the Cargo.toml comment picked precisely so decoding stays usable. Use
+# --release when you are judging speed rather than looks.
+#
+# --profile is the MONOPRO_APP_ID escape hatch (see `settings::app_id`). Unset,
+# the app is "monopro" and reads the state every install already has:
+# ~/Library/Application Support/monopro — window geometry and panel layout in
+# app.ron and preferences in settings.toml. Rebuildable thumbnails use the native
+# cache tree. Naming a profile gives both roots the monopro-<name> identity, which is
+# what you want
+# when running two builds side by side so neither rewrites the other's memory.
+# Deleting that directory resets the profile and leaves the real app alone.
+
+set -e
+here=${0:A:h}
+
+build=debug
+profile=
+
+while [[ "$1" == --* ]]; do
+  case "$1" in
+    --debug)
+      build=debug
+      shift
+      ;;
+    --release)
+      build=release
+      shift
+      ;;
+    --profile)
+      if [[ -z "$2" ]]; then
+        echo "run: --profile needs a name" >&2
+        exit 2
+      fi
+      profile="monopro-$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      # Not ours — hand it to the app rather than guessing at it.
+      break
+      ;;
+  esac
+done
+
+if [[ "$build" == "release" ]]; then
+  ( cd "$here" && cargo build --release )
+else
+  ( cd "$here" && cargo build )
+fi
+
+bin="$here/target/$build/monopro"
+
+if [[ -n "$profile" ]]; then
+  exec env MONOPRO_APP_ID="$profile" "$bin" "$@"
+else
+  exec "$bin" "$@"
+fi

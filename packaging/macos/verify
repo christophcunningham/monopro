@@ -1,0 +1,63 @@
+#!/bin/zsh
+# Verify the structure and checksum of a macOS candidate package.
+
+set -e
+
+here=${0:A:h}
+repo_root=${here:h:h}
+version=$(grep -m1 '^version' "$repo_root/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+app="$repo_root/dist/monopro.app"
+dmg="$repo_root/dist/monopro-$version.dmg"
+arm64_only=0
+notarized=0
+
+while (( $# )); do
+  case "$1" in
+    --arm64) arm64_only=1 ;;
+    --notarized) notarized=1 ;;
+    *) echo "usage: packaging/macos/verify [--arm64] [--notarized]" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+test -x "$app/Contents/MacOS/monopro"
+test -f "$app/Contents/Resources/monopro.icns"
+test -f "$dmg"
+[[ "$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")" == \
+  "com.christophercunningham.monopro" ]]
+[[ "$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist")" == \
+  "$version" ]]
+[[ "$(plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist")" == "11.0" ]]
+
+archs=$(lipo -archs "$app/Contents/MacOS/monopro")
+if (( arm64_only )); then
+  [[ "$archs" == "arm64" ]]
+else
+  [[ " $archs " == *" arm64 "* ]]
+  [[ " $archs " == *" x86_64 "* ]]
+fi
+codesign --verify --deep --strict "$app"
+hdiutil verify "$dmg" >/dev/null
+(( notarized )) && xcrun stapler validate "$dmg"
+
+mount_point=$(mktemp -d "${TMPDIR:-/tmp}/monopro-dmg.XXXXXX")
+mounted=0
+cleanup() {
+  (( mounted )) && hdiutil detach "$mount_point" >/dev/null
+  rmdir "$mount_point" 2>/dev/null || true
+}
+trap cleanup EXIT
+hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount_point" >/dev/null
+mounted=1
+test -d "$mount_point/monopro.app"
+test -L "$mount_point/Applications"
+test -f "$mount_point/LICENSE.txt"
+test -f "$mount_point/READ ME FIRST.txt"
+codesign --verify --deep --strict "$mount_point/monopro.app"
+
+checksum="$dmg.sha256"
+(
+  cd "${dmg:h}"
+  shasum -a 256 "${dmg:t}" > "${checksum:t}"
+)
+print -r -- "$dmg" "$checksum"

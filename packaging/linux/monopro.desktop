@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=monopro
+GenericName=RAW photo processor
+Comment=Develop monochrome photographs from RAW sensor data
+Exec=monopro %f
+Icon=monopro
+Terminal=false
+Categories=Graphics;Photography;
+StartupNotify=true
+StartupWMClass=monopro
+X-AppImage-Version=@VERSION@
