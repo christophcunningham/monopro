@@ -4,17 +4,45 @@ A monochrome RAW processor written in Rust, for editing photographs and preparin
 
 In development. A website with further documentation and a manual is in progress.
 
+## Getting started
+
+[Build from source](#build) to run the current version. Packaged downloads for
+macOS, Windows, and Linux are in preparation and will be listed under
+[Releases](https://github.com/christophcunningham/monopro/releases).
+
+In Lightbox, select a folder of RAW images in the folder tree. Double-click an image
+to open it in Develop. Use the modules, Dodge / Burn brushes, and Toning to edit
+before exporting. Use Inspector to read values, snapshots to compare edits, and
+history to undo or redo changes.
+
+Press `,` for Settings and `.` for the hotkey reference.
+
+## Lightbox
+
+A folder-based browser with thumbnails, ratings, color labels, sorting, filtering,
+and manual ordering. Search covers filenames and IPTC metadata. Lightbox also supports
+metadata editing and templates, copying develop settings, batch renaming, and PDF
+contact sheets.
+
+## Develop modules
+
+Decode · Luminance · Exposure · Contrast Mask · Curve · Tonal Transform · Grain ·
+Sharpening · Composition · Output · Frame · Export
+
+Dodge / Burn and Toning have separate panels. Inspector pins, snapshots, comparison
+views, and the print loupe provide measurement and review tools.
+
 ## Pipeline
 
-RAW decoding preserves the Bayer colour filter array. Each photosite is black-subtracted,
-normalised to its channel's white level, and gain-equalised:
+RAW decoding preserves the Bayer color filter array. Each photosite is black-subtracted,
+normalized to its channel's white level, and gain-equalized:
 
 ```text
 s_c = gain_c × (raw − black) / (white_c − black)
 ```
 
 Negative values and highlight headroom are retained. Sensor clipping is recorded before
-gain equalisation. Monochrome reconstruction supports RCD (the default), AMaZE,
+gain equalization. Monochrome reconstruction supports RCD (the default), AMaZE,
 Hamilton–Adams, bilinear interpolation, 2×2 SuperPixel binning, and DirectMosaic.
 The default channel weighting is `Y = ¼R + ½G + ¼B`; equal, single-channel, and custom
 weights are also available. These weights operate on sensor data.
@@ -25,7 +53,7 @@ wgpu. Inactive curve and masking stages are omitted; cached intermediates are re
 
 - **Exposure:** `Y′ = (Y − black_correction) × 2^EV`.
 - **Contrast mask:** Gaussian filtering in log₂ space. The blurred signal is subtracted
-  around an 18% grey pivot to compress local tonal range.
+  around an 18% gray pivot to compress local tonal range.
 - **Dodge / burn:** layered exposure adjustments with brush masks, tonal-range masks,
   and local contrast controls.
 - **Curves:** Fritsch–Carlson monotone cubic interpolation in a log₂ exposure domain.
@@ -39,24 +67,9 @@ the print loupe previews them at the selected output scale. Grain uses stochasti
 silver-halide crystal synthesis. Toning models material conversion and optical density;
 its coefficients are currently adjusted by eye rather than measured.
 
-Export supports TIFF, PNG, and JPEG. Greyscale masters can use L* encoding with the
-[monostar ICC profile](profiles/MONOSTAR.md). Toning introduces colour after the
+Export supports TIFF, PNG, and JPEG. Grayscale masters can use L* encoding with the
+[monostar ICC profile](profiles/MONOSTAR.md). Toning introduces color after the
 monochrome processing stages. Edits and metadata are stored in `.mono.xmp` sidecars.
-
-## Develop modules
-
-Decode · Luminance · Exposure · Contrast Mask · Curve · Tonal Transform · Grain ·
-Sharpening · Composition · Output · Frame.
-
-Dodge / Burn and Toning have separate panels. Inspector pins, snapshots, comparison
-views, and the print loupe provide measurement and review tools.
-
-## Lightbox
-
-A folder-based browser with thumbnails, ratings, colour labels, sorting, filtering,
-and manual ordering. Search covers filenames and IPTC metadata. Lightbox also supports
-metadata editing and templates, copying develop settings, batch renaming, and PDF
-contact sheets.
 
 ## Dependencies
 
@@ -82,7 +95,7 @@ The lockfile also records transitive dependencies.
 | resvg | 0.47.0 | SVG icons |
 | rfd | 0.17.2 | File dialogs |
 | reflink-copy | 0.1.30 | File duplication |
-| serde | 1.0.229 | Serialisation |
+| serde | 1.0.229 | Serialization |
 | toml | 0.9.12+spec-1.1.0 | Settings |
 | roxmltree | 0.21.1 | XMP parsing |
 | thiserror | 2.0.19 | Error types |
@@ -94,6 +107,23 @@ Bundled assets: JetBrains Mono, Phosphor and Lucide icons, and ICC profiles.
 Their notices are included in [fonts](fonts/JetBrainsMono), [icons](icons), and
 [profiles](profiles). Grain follows Aurélien Pierre's crystallographic synthesis;
 AgX follows Troy Sobotka's tone-mapping work.
+
+## Where it keeps things
+
+| File or directory | Contents |
+|---|---|
+| `<stem>.mono.xmp` | one image's edit, beside the raw |
+| `app.ron`, `settings.toml`, presets | durable application data |
+| `thumbcache/` | rebuildable Lightbox tiles in the OS cache location |
+
+| OS | Durable data | Rebuildable cache |
+|---|---|---|
+| macOS | `~/Library/Application Support/monopro` | `~/Library/Caches/monopro` |
+| Windows | `%APPDATA%\monopro\data` | `%LOCALAPPDATA%\monopro\cache` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/monopro` | `${XDG_CACHE_HOME:-~/.cache}/monopro` |
+
+`MONOPRO_APP_ID` overrides the final application name in both roots, which is what
+`./run --profile` uses to keep two builds from editing each other's memory or cache.
 
 ## Build
 
