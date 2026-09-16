@@ -59,9 +59,9 @@ foreach ($Encoding in @([System.Text.Encoding]::UTF8, [System.Text.Encoding]::Un
 if ([System.IO.Path]::GetFileName($Installer) -ne "monopro-$Version-windows-x86_64-setup.exe") {
     throw "The installer name does not match the workspace version and architecture."
 }
-$VersionInfo = (Get-Item $Installer).VersionInfo
+$VersionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Installer)
 if ($VersionInfo.ProductName -ne "monopro" -or $VersionInfo.ProductVersion -notlike "$Version*") {
-    throw "The installer version metadata does not identify monopro $Version."
+    throw "Expected monopro $Version; installer reports '$($VersionInfo.ProductName)' '$($VersionInfo.ProductVersion)'."
 }
 
 $Signature = Get-AuthenticodeSignature $Installer

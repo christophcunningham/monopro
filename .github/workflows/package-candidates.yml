@@ -71,6 +71,9 @@ jobs:
         run: |
           choco install innosetup --yes --no-progress
           "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Check the installer definition
+        shell: pwsh
+        run: .\packaging\windows\check-definition.ps1
       - name: Build and verify the unsigned candidate
         shell: pwsh
         run: .\packaging\windows\package.ps1 -Unsigned
