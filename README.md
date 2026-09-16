@@ -6,9 +6,16 @@ In development. A website with further documentation and a manual is in progress
 
 ## Getting started
 
-[Build from source](#build) to run the current version. Packaged downloads for
-macOS, Windows, and Linux are in preparation and will be listed under
-[Releases](https://github.com/christophcunningham/monopro/releases).
+[Download for macOS](https://github.com/christophcunningham/monopro/releases/download/v0.1.0/monopro-0.1.0.dmg)
+— version 0.1.0, Apple Silicon and Intel. Open the `.dmg`, drag **monopro.app** to
+**Applications**, eject the disk image, and launch the installed app.
+
+This is a development build and is not notarized by Apple. See the
+[release notes](https://github.com/christophcunningham/monopro/releases/tag/v0.1.0)
+for first-launch instructions and known limitations.
+
+Windows and Linux packages are in preparation. [Build from source](#build) to run
+the current source version.
 
 In Lightbox, select a folder of RAW images in the folder tree. Double-click an image
 to open it in Develop. Use the modules, Dodge / Burn brushes, and Toning to edit
