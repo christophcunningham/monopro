@@ -39,6 +39,20 @@ if (-not $Unsigned) {
 $Dist = Join-Path $RepoRoot "dist"
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 
+$PreviousEncodedFlags = $env:CARGO_ENCODED_RUSTFLAGS
+$RustFlags = @()
+if ($null -ne $PreviousEncodedFlags) {
+    $RustFlags += $PreviousEncodedFlags.Split([char]0x1f)
+}
+elseif (-not [string]::IsNullOrWhiteSpace($env:RUSTFLAGS)) {
+    $RustFlags += $env:RUSTFLAGS.Trim() -split '\s+'
+}
+$RustFlags += "--remap-path-prefix=$RepoRoot=/build/source"
+if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+    $RustFlags += "--remap-path-prefix=$env:USERPROFILE=/build/user"
+}
+$env:CARGO_ENCODED_RUSTFLAGS = $RustFlags -join [char]0x1f
+
 Push-Location $RepoRoot
 try {
     cargo build --release --locked --target x86_64-pc-windows-msvc
@@ -47,15 +61,15 @@ try {
     }
 
     $CompilerArgs = @(
-        "--define=AppVersion=$Version",
-        "--define=RepoRoot=$RepoRoot",
-        "--output-dir=$Dist"
+        "/DAppVersion=$Version",
+        "/DRepoRoot=$RepoRoot",
+        "/O$Dist"
     )
 
     if (-not $Unsigned) {
         $Signer = (Resolve-Path (Join-Path $PSScriptRoot "sign.cmd")).Path
-        $CompilerArgs += "--define=SignedBuild=1"
-        $CompilerArgs += ('--signtool=monopro=$q' + $Signer + '$q $f')
+        $CompilerArgs += "/DSignedBuild=1"
+        $CompilerArgs += ('/Smonopro=$q' + $Signer + '$q $f')
     }
 
     & $Iscc.Path @CompilerArgs (Join-Path $PSScriptRoot "monopro.iss")
@@ -82,5 +96,6 @@ try {
     Write-Host $Installer
 }
 finally {
+    $env:CARGO_ENCODED_RUSTFLAGS = $PreviousEncodedFlags
     Pop-Location
 }

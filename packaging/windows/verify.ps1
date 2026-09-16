@@ -41,6 +41,21 @@ function Get-PeMachine([string]$Path) {
 if ((Get-PeMachine $Binary) -ne 0x8664) {
     throw "The packaged monopro executable is not x86-64."
 }
+
+# Compiler-generated panic locations must not disclose the build machine's paths.
+$BinaryBytes = [System.IO.File]::ReadAllBytes($Binary)
+foreach ($Encoding in @([System.Text.Encoding]::UTF8, [System.Text.Encoding]::Unicode)) {
+    $BinaryText = $Encoding.GetString($BinaryBytes)
+    foreach ($PrivateRoot in @($RepoRoot, $env:USERPROFILE)) {
+        if (-not [string]::IsNullOrWhiteSpace($PrivateRoot)) {
+            foreach ($Variant in @($PrivateRoot, $PrivateRoot.Replace('\', '/'))) {
+                if ($BinaryText.Contains($Variant)) {
+                    throw "The executable contains an unremapped build-machine path."
+                }
+            }
+        }
+    }
+}
 if ([System.IO.Path]::GetFileName($Installer) -ne "monopro-$Version-windows-x86_64-setup.exe") {
     throw "The installer name does not match the workspace version and architecture."
 }

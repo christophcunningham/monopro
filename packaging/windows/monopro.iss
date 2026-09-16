@@ -53,6 +53,13 @@ Source: "target\x86_64-pc-windows-msvc\release\monopro.exe"; DestDir: "{app}"; F
 #endif
 Source: "LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "packaging\windows\monopro.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "fonts\JetBrainsMono\OFL.txt"; DestDir: "{app}\licenses\fonts"; Flags: ignoreversion
+Source: "fonts\JetBrainsMono\AUTHORS.txt"; DestDir: "{app}\licenses\fonts"; Flags: ignoreversion
+Source: "icons\LICENSE-Phosphor.txt"; DestDir: "{app}\licenses\icons"; Flags: ignoreversion
+Source: "icons\LICENSE-Lucide.txt"; DestDir: "{app}\licenses\icons"; Flags: ignoreversion
+Source: "profiles\LICENSE"; DestDir: "{app}\licenses\profiles"; DestName: "monostar-CC0.txt"; Flags: ignoreversion
+Source: "profiles\eciRGB_v2_license.rtf"; DestDir: "{app}\licenses\profiles"; Flags: ignoreversion
+Source: "profiles\licensing-iccorg.txt"; DestDir: "{app}\licenses\profiles"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\monopro"; Filename: "{app}\monopro.exe"; WorkingDir: "{userdocs}"; IconFilename: "{app}\monopro.ico"

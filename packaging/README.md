@@ -62,6 +62,10 @@ version an in-place upgrade. Packaging verifies the x86-64 payload, installer ve
 expected signature state and checksum. Each successful run writes a `.sha256` file
 beside the installer.
 
+The installer also includes font, icon, and profile notices under `licenses/`.
+Windows package builds remap source and user-directory paths before compilation;
+the validator rejects executables that still contain those build-machine paths.
+
 The default is a per-user install under the user's Program Files folder, with an
 optional installer prompt for an all-users install. Apps & Features removes the
 program. Settings and caches are retained across upgrades and uninstall.
@@ -103,8 +107,9 @@ desktop integration tool. Settings and caches are retained.
 
 `Native CI` compiles, lints and runs non-display tests on pinned macOS, Windows and
 Ubuntu hosted runners for every push and pull request. `Package candidates` is a manual
-workflow that builds all three unsigned/ad-hoc candidates, runs the package validators
-and retains the artifacts for 14 days.
+workflow with a platform selector: choose one platform or `all`. It runs the package
+validators and retains the artifacts for 14 days. Windows artifacts also include
+the matching source archive, its checksum, and the source commit identifier.
 
 Candidate workflow artifacts are not public releases. GitHub's Windows Server runner is
 not Windows 11 25H2, hosted runners do not provide the required interactive desktop/GPU

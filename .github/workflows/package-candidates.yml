@@ -2,6 +2,16 @@ name: Package candidates
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to package
+        type: choice
+        default: all
+        options:
+          - all
+          - macos
+          - windows
+          - linux
 
 permissions:
   contents: read
@@ -15,6 +25,7 @@ env:
 
 jobs:
   macos:
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'macos' }}
     name: Universal macOS candidate
     runs-on: macos-15
     timeout-minutes: 90
@@ -41,6 +52,7 @@ jobs:
           retention-days: 14
 
   windows:
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
     name: Windows x64 candidate
     runs-on: windows-2025
     timeout-minutes: 90
@@ -62,6 +74,15 @@ jobs:
       - name: Build and verify the unsigned candidate
         shell: pwsh
         run: .\packaging\windows\package.ps1 -Unsigned
+      - name: Include matching source and build identity
+        shell: pwsh
+        run: |
+          git archive --format=tar.gz --output=dist/monopro-windows-source.tar.gz HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Source archive failed." }
+          $Hash = (Get-FileHash -Algorithm SHA256 dist/monopro-windows-source.tar.gz).Hash.ToLowerInvariant()
+          "$Hash  monopro-windows-source.tar.gz" | Set-Content dist/monopro-windows-source.tar.gz.sha256 -Encoding ascii
+          "Source commit: $env:GITHUB_SHA" | Set-Content dist/monopro-windows-build.txt -Encoding ascii
+          "Unsigned Windows x64 test build. Requires Windows 11 25H2 (build 26200) or newer." | Add-Content dist/monopro-windows-build.txt
       - name: Upload the candidate and checksum
         uses: actions/upload-artifact@v7
         with:
@@ -69,10 +90,14 @@ jobs:
           path: |
             dist/monopro-*-windows-x86_64-setup.exe
             dist/monopro-*-windows-x86_64-setup.exe.sha256
+            dist/monopro-windows-source.tar.gz
+            dist/monopro-windows-source.tar.gz.sha256
+            dist/monopro-windows-build.txt
           if-no-files-found: error
           retention-days: 14
 
   linux:
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'linux' }}
     name: Ubuntu 24.04 AppImage candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 90
