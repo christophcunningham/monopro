@@ -60,7 +60,9 @@ if ([System.IO.Path]::GetFileName($Installer) -ne "monopro-$Version-windows-x86_
     throw "The installer name does not match the workspace version and architecture."
 }
 $VersionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Installer)
-if ($VersionInfo.ProductName -ne "monopro" -or $VersionInfo.ProductVersion -notlike "$Version*") {
+# Inno Setup pads version-resource strings with spaces.
+if (([string]$VersionInfo.ProductName).Trim() -ne "monopro" -or
+    ([string]$VersionInfo.ProductVersion).Trim() -ne $Version) {
     throw "Expected monopro $Version; installer reports '$($VersionInfo.ProductName)' '$($VersionInfo.ProductVersion)'."
 }
 

@@ -2389,7 +2389,11 @@ mod tests {
             decode_ms: 0,
         });
         let id = tabs.open(Path::new("/raws/t.dng")).expect("open");
-        let key = crate::decode::ContentKey::of(Path::new("/dev/null")).expect("key");
+        // Use a real, read-only fixture available on every platform.
+        let key = crate::decode::ContentKey::of(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .expect("key");
         let tab = tabs.by_id_mut(id).expect("tab");
         tab.image = Some(Image {
             sensor: std::sync::Arc::new(sensor),

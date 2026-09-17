@@ -213,10 +213,11 @@ mod tests {
     use super::*;
 
     fn scratch() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         std::env::temp_dir().join(format!(
             "monopro-curve-presets-{}-{}.toml",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
     }
 

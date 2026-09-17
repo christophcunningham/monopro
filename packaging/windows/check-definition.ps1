@@ -24,7 +24,9 @@ try {
     $Installer = Join-Path $TestRoot "dist\monopro-$Version-windows-x86_64-setup.exe"
     $Info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Installer)
     $Info | Select-Object ProductName, ProductVersion, FileVersion | ConvertTo-Json
-    if ($Info.ProductName -ne 'monopro' -or $Info.ProductVersion -notlike "$Version*") {
+    # Inno Setup pads version-resource strings with spaces.
+    if (([string]$Info.ProductName).Trim() -ne 'monopro' -or
+        ([string]$Info.ProductVersion).Trim() -ne $Version) {
         throw "Installer definition emitted unexpected version metadata."
     }
 }
