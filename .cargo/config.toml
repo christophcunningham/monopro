@@ -1,0 +1,18 @@
+# Build configuration shared by every cargo invocation in this workspace.
+#
+# SPARKLE_FRAMEWORK_PATH points the sparkle-updater build script at the vendored,
+# checksum-pinned Sparkle.framework (packaging/macos/Sparkle, see
+# packaging/README.md). `relative = true` resolves it against the workspace root,
+# so a fresh clone builds the updater without any manual export — and without
+# the build script panicking because it cannot find a framework. The path is the
+# directory *containing* Sparkle.framework, which is what the binding asks for.
+#
+# DYLD_FRAMEWORK_PATH is the runtime half of the same story. A development binary
+# or a test executable lives under target/, where the packaged app's
+# @executable_path/../Frameworks rpath cannot resolve, and dyld would abort at
+# launch. Cargo expands `relative` to an absolute path, which is what DYLD needs;
+# a packaged app is unaffected — its own bundle resolves first.
+
+[env]
+SPARKLE_FRAMEWORK_PATH = { value = "packaging/macos/Sparkle", relative = true }
+DYLD_FRAMEWORK_PATH = { value = "packaging/macos/Sparkle", relative = true }

@@ -75,6 +75,13 @@ fi
 
 bin="$here/target/$build/monopro"
 
+# The Sparkle framework is linked by install name (`@rpath/…`) and lives in
+# packaging/macos/Sparkle, not beside the bare development binary — so dyld needs
+# the hint here. A packaged app finds it through Contents/Frameworks and the
+# @executable_path rpath the build adds, and the updater disables itself outside a
+# bundle anyway; this only keeps the dev binary loadable at all.
+export DYLD_FRAMEWORK_PATH="$here/packaging/macos/Sparkle${DYLD_FRAMEWORK_PATH:+:$DYLD_FRAMEWORK_PATH}"
+
 if [[ -n "$profile" ]]; then
   exec env MONOPRO_APP_ID="$profile" "$bin" "$@"
 else

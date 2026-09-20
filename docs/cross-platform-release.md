@@ -104,6 +104,43 @@ supported Windows client release, container checks have no Wayland/X11 portal, a
 GPUs do not represent the Metal/DX12/Vulkan support matrix. No candidate workflow run or
 manual record has yet been made, so none of these definitions is release evidence yet.
 
+**2026-09-20 — macOS Sparkle auto-update slice.** macOS builds now carry a
+stable-channel Sparkle 2 updater behind a Mole-like surface: a silent daily
+background check (nothing appears while up to date), a badge at the right end of
+the title strip when a stable release exists, and a sheet offering update on
+quit (default), restart now (idle only) and skip this version. The manual route
+is the app menu's Check for Updates item and Settings → About. Release notes
+render as plain text from the appcast and are cached, so an offline launch still
+shows the version and notes it saw last.
+
+- Binding: `sparkle-updater` 0.1.0, verified against the Sparkle 2.9.6 API
+  surface and vendored under `vendor/sparkle-updater` for one addition:
+  `skip_current_update`, which delivers the Skip choice through Sparkle's
+  pending alert reply so a staged install-on-quit update is canceled, not left
+  to run at quit. `slint-ui/sparklers` was rejected because its delegate cannot
+  intercept the standard driver's alerts on scheduled checks; the abandoned
+  `hankbao/sparkle-updater` bundles Sparkle 1.x. The feed is a single stable
+  unversioned URL (the release asset alias); the enclosure is a ZIP of the
+  signed app, with the DMG kept for first installs. Windows and Linux remain
+  explicit non-goals and compile against an inert stub of the same boundary.
+- Packaging: `packaging/macos/Sparkle` vendors the pinned framework (2.9.6,
+  SHA-256 recorded in `packaging/README.md`) and its signing tools; `./package`
+  embeds and explicitly signs the framework, writes the Sparkle Info.plist keys,
+  notarizes the ZIP alongside the DMG, and signs the ZIP bytes with
+  `sign_update` (fail-closed without the EdDSA key). `packaging/macos/appcast`
+  assembles the feed with `generate_appcast`; `packaging/macos/verify` checks
+  the framework, plist keys, rpath, enclosure and signature.
+- Preferences: `check_for_updates` and `skipped_update_version` persist in
+  `settings.toml` with working controls in Settings → About; the skip is
+  mirrored into Sparkle's own skip default and answered through Sparkle's
+  pending alert reply, so both machineries agree and a staged install is
+  canceled. A user-initiated check clears the skip, as it does in Sparkle.
+- Not yet exercised with release credentials: the notarization of the ZIP
+  enclosure and the full feed publish flow require the Developer ID and EdDSA
+  key material. The ad-hoc package path (framework embed, plist keys, verify,
+  appcast assembly with a local test key, signature verification) was run on
+  the packaging host.
+
 ## Supported first-release matrix
 
 | Platform | Artifact | CPU | Minimum OS / desktop |

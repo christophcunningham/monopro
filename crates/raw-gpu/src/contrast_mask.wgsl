@@ -31,6 +31,20 @@
 // log2(0.18). Middle grey is the pivot everything else in this pipeline uses.
 const PIVOT: f32 = -2.4739312;
 
+fn reduced_mask(g: vec2<i32>) -> f32 {
+    let t = (vec2<f32>(g) + vec2<f32>(0.5)) * (p.mask_scale / p.scale)
+        - vec2<f32>(0.5) - vec2<f32>(f32(p.in2_x), f32(p.in2_y));
+    let hi = vec2<i32>(i32(p.in2_w) - 1, i32(p.in2_h) - 1);
+    // Extrapolate between the last two centres at a real image edge. Clamping
+    // would introduce a flat strip into an otherwise linear log ramp.
+    let a = clamp(vec2<i32>(floor(t)), vec2<i32>(0), max(hi - vec2<i32>(1), vec2<i32>(0)));
+    let b = min(a + vec2<i32>(1), hi);
+    let f = t - vec2<f32>(a);
+    let row0 = mix(textureLoad(mask, a, 0).r, textureLoad(mask, vec2<i32>(b.x, a.y), 0).r, f.x);
+    let row1 = mix(textureLoad(mask, vec2<i32>(a.x, b.y), 0).r, textureLoad(mask, b, 0).r, f.x);
+    return mix(row0, row1, f.y);
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= p.out_w || gid.y >= p.out_h) {
@@ -44,9 +58,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // apron for exactly this shift, in this direction.
     let shifted = g + vec2<i32>(i32(round(p.cm_off_x)), i32(round(p.cm_off_y)));
     let hi = vec2<i32>(i32(p.in2_w) - 1, i32(p.in2_h) - 1);
-    let m = textureLoad(mask, clamp(in2_coord(shifted), vec2<i32>(0, 0), hi), 0);
+    var blurred = textureLoad(mask, clamp(in2_coord(shifted), vec2<i32>(0, 0), hi), 0).r;
+    if (p.mask_scale != p.scale) {
+        blurred = reduced_mask(shifted);
+    }
 
-    let out = n.r - p.cm_contrast * (m.r - PIVOT);
+    let out = n.r - p.cm_contrast * (blurred - PIVOT);
 
     // Coverage comes from the negative, not the mask: it describes how much of
     // this pixel the image fills, which the blur has smeared and the shift has

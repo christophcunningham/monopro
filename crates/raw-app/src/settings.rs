@@ -379,6 +379,15 @@ pub struct Settings {
     /// overwrite each other — so its edits live only in memory and closing the app
     /// is the one action that silently discards them.
     pub warn_unsaved_duplicates: bool,
+    /// Whether the app checks the stable update feed by itself. **macOS only;**
+    /// live — see `updater`. The check is silent: nothing appears unless an
+    /// update is found, and then the badge is the whole announcement.
+    pub check_for_updates: bool,
+    /// The update the user chose to skip, as an exact feed version. **macOS
+    /// only;** live — see `updater`. Mirrored into Sparkle's own
+    /// `SUSkippedVersion` user default so both copies offer the same answer;
+    /// this one is what the badge reads and Settings → About shows.
+    pub skipped_update_version: Option<String>,
     /// The window the value readout averages over, as a stable key. See
     /// [`SampleArea`].
     pub sample_area: String,
@@ -558,6 +567,8 @@ impl Default for Settings {
             hotkeys_enabled: true,
             tooltips: true,
             warn_unsaved_duplicates: true,
+            check_for_updates: true,
+            skipped_update_version: None,
             frameless_tiles: false,
             sample_area: SampleArea::default().key().into(),
             reference_values: ReferenceValues::default().key().into(),
@@ -1560,6 +1571,8 @@ mod tests {
             hotkeys_enabled: false,
             tooltips: false,
             warn_unsaved_duplicates: false,
+            check_for_updates: false,
+            skipped_update_version: Some("0.0.9".into()),
             sample_area: "11".into(),
             reference_values: "rgb".into(),
             proof_container: "jpeg".into(),

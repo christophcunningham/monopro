@@ -219,10 +219,18 @@ impl Dialog {
                     ui.add_sized([360.0, 24.0], rename_edit(&mut self.sequence_base));
                     ui.end_row();
                     ui.label("Start at");
-                    ui.add(egui::DragValue::new(&mut self.sequence_start).range(0..=999_999));
+                    ui.add(crate::widgets::bounded_number(
+                        &mut self.sequence_start,
+                        0..=999_999,
+                        1.0,
+                    ));
                     ui.end_row();
                     ui.label("Digits");
-                    ui.add(egui::DragValue::new(&mut self.sequence_digits).range(1..=8));
+                    ui.add(crate::widgets::bounded_number(
+                        &mut self.sequence_digits,
+                        1..=8,
+                        1.0,
+                    ));
                     ui.end_row();
                 }
                 Mode::Replace => {
@@ -247,10 +255,18 @@ impl Dialog {
                     });
                     ui.end_row();
                     ui.label("Sequence start");
-                    ui.add(egui::DragValue::new(&mut self.sequence_start).range(0..=999_999));
+                    ui.add(crate::widgets::bounded_number(
+                        &mut self.sequence_start,
+                        0..=999_999,
+                        1.0,
+                    ));
                     ui.end_row();
                     ui.label("Sequence digits");
-                    ui.add(egui::DragValue::new(&mut self.sequence_digits).range(1..=8));
+                    ui.add(crate::widgets::bounded_number(
+                        &mut self.sequence_digits,
+                        1..=8,
+                        1.0,
+                    ));
                     ui.end_row();
                 }
             });

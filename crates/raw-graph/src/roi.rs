@@ -166,6 +166,27 @@ impl Roi {
         self.x + self.w as i32
     }
 
+    /// Cover this region on another grid, rounding edges outward. Keep the
+    /// identical-grid case exact so existing crop and empty-region rules survive.
+    pub fn on_grid(self, full: (u32, u32), scale: f32) -> Self {
+        if self.scale == scale {
+            return Self { full, ..self };
+        }
+        let ratio = scale / self.scale;
+        let x = (self.x as f32 * ratio).floor() as i32;
+        let y = (self.y as f32 * ratio).floor() as i32;
+        let right = (self.right() as f32 * ratio).ceil() as i32;
+        let bottom = (self.bottom() as f32 * ratio).ceil() as i32;
+        Self::window(
+            full,
+            scale,
+            x,
+            y,
+            (right - x).max(0) as u32,
+            (bottom - y).max(0) as u32,
+        )
+    }
+
     pub fn bottom(self) -> i32 {
         self.y + self.h as i32
     }

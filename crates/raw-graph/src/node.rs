@@ -49,9 +49,8 @@ pub enum NodeKind {
     /// grid onto the source grid, box-filters the footprint when zoomed out, and
     /// clamps at the frame border.
     ///
-    /// **The only node that touches source geometry.** Everything downstream
-    /// works on a plain pixel grid at a fixed scale, which is what makes ROI
-    /// arithmetic tractable at all.
+    /// Shares source sampling with MaskInput. Downstream nodes work on plain
+    /// pixel grids; ROI propagation converts between their scales.
     Input,
     /// `out = (in - black) * 2^stops`. Pointwise.
     Exposure,
@@ -60,6 +59,9 @@ pub enum NodeKind {
     Log2,
     /// log2 stops -> linear. Pointwise.
     Exp2,
+    /// Read and area-average exposed log luminance directly from the source.
+    /// Its base grid is capped at native resolution; the negative stays separate.
+    MaskInput { sigma: f32 },
     /// One axis of a separable blur. `sigma` and `support` are in **source** pixels;
     /// the apron converts support to this grid's pixels and the executor converts
     /// sigma. Carrying both here lets Contrast Mask and D&B local contrast share
@@ -105,10 +107,10 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
-    /// How many inputs this node takes. `Input` is the only source.
+    /// How many inputs this node takes. Input and MaskInput read the source.
     pub fn arity(self) -> usize {
         match self {
-            Self::Input => 0,
+            Self::Input | Self::MaskInput { .. } => 0,
             Self::ContrastMask { .. } | Self::DodgeBurn => 2,
             _ => 1,
         }
@@ -117,7 +119,7 @@ impl NodeKind {
     /// Whether `role` may be connected to input `index`.
     pub fn accepts(self, index: usize, role: StageRole) -> bool {
         match self {
-            Self::Input => false,
+            Self::Input | Self::MaskInput { .. } => false,
             Self::DodgeBurn => match index {
                 // The image being adjusted is always scene-linear.
                 0 => role == StageRole::Working,
@@ -149,6 +151,7 @@ impl NodeKind {
             Self::Exposure | Self::DodgeBurn | Self::Curve => StageRole::Working,
             Self::Log2 => StageRole::WorkingLog,
             Self::Exp2 => StageRole::Working,
+            Self::MaskInput { .. } => StageRole::WorkingLog,
             Self::Blur { .. } => inputs.first().copied().unwrap_or(StageRole::Working),
             Self::ContrastMask { .. } => StageRole::WorkingLog,
             Self::Display => StageRole::Display,
@@ -179,9 +182,8 @@ impl NodeKind {
 
     /// Full extent and scale of this node's output grid.
     ///
-    /// Identity for every node today, so the graph runs at one scale. The hook exists
-    /// because retrofitting a per-graph scale into a per-edge one would touch every ROI
-    /// computation; a downsampled large-radius blur is the case that would use it.
+    /// Only the mask branch changes grid. Powers of two anchor its cells to the
+    /// image rather than to a viewport/tile origin, so panning cannot move the blur.
     pub fn out_grid(
         self,
         input: Option<((u32, u32), f32)>,
@@ -189,6 +191,27 @@ impl NodeKind {
     ) -> ((u32, u32), f32) {
         match self {
             Self::Input => root,
+            Self::MaskInput { sigma } => {
+                let (full, scale) = root;
+                let mut factor = 1;
+                // Below 1:1 the input already averages sensor footprints before
+                // taking the log. Preserve that preview's exact boundary math:
+                // reducing it again changes partially covered edge rows. At native
+                // resolution and above, aim for sigma <= 16 reduced pixels, with
+                // at most 32x32 reads per cell and two centres for interpolation.
+                while scale >= 1.0
+                    && sigma * scale / factor as f32 > 16.0
+                    && factor < 32
+                    && full.0.div_ceil(factor * 2) >= 2
+                    && full.1.div_ceil(factor * 2) >= 2
+                {
+                    factor *= 2;
+                }
+                (
+                    (full.0.div_ceil(factor), full.1.div_ceil(factor)),
+                    scale / factor as f32,
+                )
+            }
             _ => input.unwrap_or(root),
         }
     }
@@ -199,6 +222,7 @@ impl NodeKind {
             Self::Exposure => "exposure",
             Self::Log2 => "log2",
             Self::Exp2 => "exp2",
+            Self::MaskInput { .. } => "mask source",
             Self::Blur { axis: Axis::X, .. } => "blur.x",
             Self::Blur { axis: Axis::Y, .. } => "blur.y",
             Self::ContrastMask { .. } => "contrast mask",

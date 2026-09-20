@@ -34,6 +34,36 @@ test -f "$dmg"
   "$version" ]]
 [[ "$(plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist")" == "11.0" ]]
 
+# ── The update machinery ──────────────────────────────────────────────────────
+#
+# The Sparkle framework must be present, executable, and covered by the bundle's
+# signature; the plist must carry the updater's keys (automatic checks stay off
+# in a local no-key build — that is the deliberate quiet state, not a defect).
+# The ZIP enclosure and its EdDSA signature exist only on the notarized path,
+# which is the only path that produces a publishable feed.
+framework="$app/Contents/Frameworks/Sparkle.framework"
+test -d "$framework"
+test -x "$framework/Autoupdate"
+test -d "$framework/XPCServices"
+plutil -extract SUEnableAutomaticChecks raw -o - "$app/Contents/Info.plist" >/dev/null
+codesign --verify --deep --strict "$framework"
+# The rpath that resolves Contents/Frameworks when dyld loads the framework.
+otool -l "$app/Contents/MacOS/monopro" | grep -q '@executable_path/../Frameworks'
+zip="$repo_root/dist/monopro-$version-macos.zip"
+if (( notarized )); then
+  feed=$(plutil -extract SUFeedURL raw -o - "$app/Contents/Info.plist")
+  [[ "$feed" == https://* ]] || {
+    echo "SUFeedURL is not https: $feed" >&2
+    exit 1
+  }
+  [[ -n "$(plutil -extract SUPublicEDKey raw -o - "$app/Contents/Info.plist")" ]]
+  plutil -extract SUScheduledCheckInterval raw -o - "$app/Contents/Info.plist" >/dev/null
+  test -s "$zip"
+  test -s "$zip.ed.sig"
+  grep -q 'sparkle:edSignature=' "$zip.ed.sig"
+  unzip -l "$zip" | grep -q 'monopro.app/Contents/MacOS/monopro'
+fi
+
 archs=$(lipo -archs "$app/Contents/MacOS/monopro")
 if (( arm64_only )); then
   [[ "$archs" == "arm64" ]]

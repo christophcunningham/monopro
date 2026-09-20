@@ -1094,8 +1094,8 @@ const fn m(
 /// bug, they just press the key again.
 ///
 /// **Typing suppresses the untyped-modifier bindings.** With a text field focused,
-/// `p` is a letter, not preview-original. Bindings with command are unaffected,
-/// because no field consumes those.
+/// `p` is a letter, not preview-original. Undo and Redo belong to the editor too;
+/// other command bindings remain available.
 ///
 /// `text_edit_focused`, **not** `egui_wants_keyboard_input`, which despite its name is
 /// `focused().is_some()` — true of a slider or a button you merely clicked. With that
@@ -1123,7 +1123,11 @@ pub fn pressed(ctx: &egui::Context, modal: bool, enabled: bool) -> Vec<Action> {
         let mut out: Vec<Action> = TABLE
             .iter()
             .filter(|bind| enabled || bind.action == Action::Settings)
-            .filter(|bind| !(typing && bind.mods.is_typing()))
+            .filter(|bind| {
+                !(typing
+                    && (bind.mods.is_typing()
+                        || matches!(bind.action, Action::Undo | Action::Redo)))
+            })
             .filter(|bind| {
                 if bind.modal {
                     modal
@@ -1148,10 +1152,161 @@ pub fn pressed(ctx: &egui::Context, modal: bool, enabled: bool) -> Vec<Action> {
     })
 }
 
+/// Give native-menu Undo/Redo to the focused egui editor before it is drawn.
+/// Keyboard Undo/Redo events are already left intact by `pressed`. AppKit may
+/// consume its menu accelerator, so a menu-only command needs an equivalent
+/// egui event. Never also return that command to photograph history.
+pub fn route_text_history(ctx: &egui::Context, actions: &mut Vec<Action>) {
+    if !ctx.text_edit_focused() {
+        return;
+    }
+    actions.retain(|action| {
+        let shift = match action {
+            Action::Undo => false,
+            Action::Redo => true,
+            _ => return true,
+        };
+        ctx.input_mut(|input| {
+            let modifiers = egui::Modifiers {
+                command: true,
+                shift,
+                ..Default::default()
+            };
+            // A menu accelerator can also arrive as a keyboard event. Forward
+            // it once, so one command cannot undo two text edits.
+            let already_present = input.events.iter().any(|event| {
+                matches!(event,
+                    egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers: m, .. }
+                        if m.matches_logically(modifiers)
+                )
+            });
+            if !already_present {
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: Option::None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                });
+            }
+        });
+        false
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn text_history_owns_keyboard_and_menu_undo_redo() {
+        // Test both platform modifier conventions and a native menu command with
+        // no key event, plus duplicate menu/keyboard delivery.
+        for mac in [false, true] {
+            for source in 0..3 {
+                let ctx = egui::Context::default();
+                let mut text = String::new();
+                for frame in 0..7 {
+                    let action = match frame {
+                        1 | 4 => Some(Action::Undo),
+                        5 => Some(Action::Redo),
+                        _ => Option::None,
+                    };
+                    let modifiers = egui::Modifiers {
+                        command: action.is_some(),
+                        mac_cmd: mac && action.is_some(),
+                        ctrl: !mac && action.is_some(),
+                        shift: action == Some(Action::Redo),
+                        ..Default::default()
+                    };
+                    let events = if action.is_some() && source != 1 {
+                        vec![egui::Event::Key {
+                            key: egui::Key::Z,
+                            physical_key: Option::None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                        }]
+                    } else if frame == 2 {
+                        vec![egui::Event::Text("caption".into())]
+                    } else {
+                        vec![]
+                    };
+                    let _ = ctx.run_ui(
+                        egui::RawInput {
+                            time: Some(frame as f64),
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(400.0, 100.0),
+                            )),
+                            modifiers,
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            // Match the app: dispatch before drawing the editor.
+                            let mut actions = pressed(ui.ctx(), false, true);
+                            assert!(!actions.contains(&Action::Undo));
+                            assert!(!actions.contains(&Action::Redo));
+                            if source != 0 {
+                                actions.extend(action);
+                            }
+                            route_text_history(ui.ctx(), &mut actions);
+                            assert!(actions.is_empty(), "text edit reached photograph history");
+                            if action.is_some() {
+                                assert_eq!(
+                                    ui.input(|i| i
+                                        .events
+                                        .iter()
+                                        .filter(|e| matches!(
+                                            e,
+                                            egui::Event::Key {
+                                                key: egui::Key::Z,
+                                                pressed: true,
+                                                ..
+                                            }
+                                        ))
+                                        .count()),
+                                    1
+                                );
+                            }
+                            ui.text_edit_singleline(&mut text).request_focus();
+                        },
+                    );
+                    match frame {
+                        3 | 5 => {
+                            assert_eq!(text, "caption", "mac={mac}, source={source}, frame={frame}")
+                        }
+                        1 | 4 => assert_eq!(text, "", "mac={mac}, source={source}"),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn photograph_history_remains_available_without_text_focus() {
+        let ctx = egui::Context::default();
+        let mut actions = vec![Action::Undo, Action::Redo];
+        route_text_history(&ctx, &mut actions);
+        assert_eq!(actions, vec![Action::Undo, Action::Redo]);
+        for (shift, action) in [(false, Action::Undo), (true, Action::Redo)] {
+            assert!(
+                press(
+                    egui::Key::Z,
+                    egui::Modifiers {
+                        command: true,
+                        shift,
+                        ..Default::default()
+                    },
+                    false
+                )
+                .contains(&action)
+            );
+        }
+    }
 
     /// Draw a widget, give it focus, press `key`, and report what `pressed` made of
     /// it. Two passes because egui applies a focus request on the frame after it.

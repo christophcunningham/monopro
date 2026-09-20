@@ -1010,6 +1010,8 @@ pub struct Tab {
     pub luma: Option<Arc<LumaImage>>,
     /// Bumped every time luminance is re-derived, so the histogram knows to refresh.
     pub luma_gen: u64,
+    /// Changes only when decoded CFA data is replaced, not for luminance edits.
+    pub scene_gen: u64,
     /// Inputs of the resident luminance image, not the currently edited controls.
     pub luma_params: Option<raw_core::LuminanceParams>,
     pub histogram: Histogram,
@@ -1170,6 +1172,7 @@ impl Tab {
             image: None,
             luma: None,
             luma_gen: 0,
+            scene_gen: 0,
             luma_params: None,
             histogram: Histogram::default(),
             render: None,
@@ -1548,6 +1551,7 @@ impl Tab {
     /// jump back to fit the way they do on a load.
     pub fn decoded(&mut self, decoded: Arc<Decoded>) {
         let Some(img) = &mut self.image else { return };
+        self.scene_gen += 1;
         img.decoded = decoded;
         self.luma = None;
         self.luma_params = None;

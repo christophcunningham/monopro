@@ -38,11 +38,28 @@ const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MIN_COOLDOWN: Duration = Duration::from_millis(50);
 const MAX_COOLDOWN: Duration = Duration::from_millis(250);
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct GpuKey {
     params: Arc<Params>,
     frame: raw_core::Frame,
     luma_gen: u64,
+}
+
+impl PartialEq for GpuKey {
+    fn eq(&self, other: &Self) -> bool {
+        let (a, b) = (&self.params, &other.params);
+        self.frame == other.frame
+            && self.luma_gen == other.luma_gen
+            && a.exposure == b.exposure
+            && a.contrast_mask == b.contrast_mask
+            && a.dodgeburn == b.dodgeburn
+            && a.curve.same_render(&b.curve)
+            && a.display.tone_map == b.display.tone_map
+            && a.display.gamma == b.display.gamma
+            && a.toning == b.toning
+        // Dither and output-only settings never enter these bins. Decode and
+        // luminance changes arrive as a new prepared-source generation.
+    }
 }
 
 struct PendingGpuHistogram {
@@ -167,6 +184,35 @@ impl Mode {
     }
 }
 
+#[derive(Clone)]
+struct MappingKey {
+    ev: f32,
+    black: f32,
+    curve: raw_core::CurveStack,
+    tone_map: raw_core::ToneMap,
+    gamma: f32,
+}
+impl MappingKey {
+    fn of(p: &Params) -> Self {
+        Self {
+            ev: p.exposure.ev,
+            black: p.exposure.black,
+            curve: p.curve.clone(),
+            tone_map: p.display.tone_map,
+            gamma: p.display.gamma,
+        }
+    }
+}
+impl PartialEq for MappingKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ev == other.ev
+            && self.black == other.black
+            && self.curve.same_render(&other.curve)
+            && self.tone_map == other.tone_map
+            && self.gamma == other.gamma
+    }
+}
+
 pub struct Histogram {
     pub mode: Mode,
     pub tonal: [u32; BINS],
@@ -185,17 +231,14 @@ pub struct Histogram {
     curve_samples: Vec<f32>,
     curve_cache: Option<(raw_core::CurveStack, usize, [u32; BINS], Option<f32>)>,
     pub rgb: [[u32; BINS]; 3],
-    /// Change detection: the params that affect the mapping, plus a luma generation
-    /// counter. `Params` compares structurally, which is what makes this a clone
-    /// rather than a hand-maintained tuple of bit patterns.
-    key: Option<(Params, u64)>,
-    /// The mapping the bins were built with, **kept** rather than dropped.
-    ///
-    /// This is what the footer readout samples through, and keeping it is the whole
-    /// reason the readout and the histogram cannot disagree: they are not two
-    /// models of the display chain that have to be maintained in step, they are one
-    /// model asked two questions. It also means the 65536-entry LUT is baked on the
-    /// same schedule as the bins — when the curve changes — rather than per frame.
+    sample_key: Option<(f32, f32, u64, Option<raw_core::Frame>)>,
+    rgb_key: Option<(MappingKey, u64)>,
+    map_key: Option<MappingKey>,
+    #[cfg(test)]
+    key: Option<(MappingKey, u64, raw_core::Frame)>,
+    /// Shared CPU mapping for the CFA diagnostic, sampling references and visual
+    /// centering. Finished tonal bins come only from the GPU. The LUT survives
+    /// exposure/display changes and is baked only when the curve itself changes.
     map: Option<Mapping>,
 }
 
@@ -208,6 +251,10 @@ impl Default for Histogram {
             curve_samples: Vec::new(),
             curve_cache: None,
             rgb: [[0; BINS]; 3],
+            sample_key: None,
+            rgb_key: None,
+            map_key: None,
+            #[cfg(test)]
             key: None,
             map: None,
         }
@@ -215,7 +262,75 @@ impl Default for Histogram {
 }
 
 impl Histogram {
-    /// Recompute if any input changed. Cheap no-op otherwise.
+    /// Refresh the inexpensive tone-chain description used by readouts and
+    /// visual centering. Bake a LUT only when the rendered curve changes.
+    pub fn refresh_mapping(&mut self, params: &Params) {
+        let key = MappingKey::of(params);
+        if self.map_key.as_ref() == Some(&key) {
+            return;
+        }
+        if let Some(map) = &mut self.map {
+            if !map.curve.same_render(&params.curve) {
+                map.lut = params.curve.bake();
+                map.identity = params.curve.is_identity();
+                map.curve = params.curve.clone();
+            }
+            map.ev = params.exposure.ev;
+            map.black = params.exposure.black;
+            map.display = params.display;
+        } else {
+            self.map = Some(Mapping::new(params));
+        }
+        self.map_key = Some(key);
+    }
+
+    /// Called by the visible CFA RGB panel. Crop and luminance reconstruction do
+    /// not affect this source-space diagnostic; decode generation does.
+    pub fn refresh_rgb(&mut self, scene: &SceneImage, params: &Params, scene_gen: u64) {
+        let key = (MappingKey::of(params), scene_gen);
+        if self.rgb_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.refresh_mapping(params);
+        self.rgb = rgb_bins(scene, self.map.as_ref().expect("mapping prepared"));
+        self.rgb_key = Some(key);
+    }
+
+    /// Called only when the curve editor needs its input distribution. These
+    /// samples precede the curve and display transform, so neither invalidates it.
+    pub fn refresh_curve_samples(
+        &mut self,
+        luma: &raw_core::LumaImage,
+        params: &Params,
+        luma_gen: u64,
+        frame: &raw_core::Frame,
+    ) {
+        let key = (
+            params.exposure.ev,
+            params.exposure.black,
+            luma_gen,
+            (!frame.is_uncropped()).then_some(*frame),
+        );
+        if self.sample_key == Some(key) {
+            return;
+        }
+        self.curve_samples.clear();
+        self.curve_in = [0; BINS];
+        let gain = params.exposure.ev.exp2();
+        for_each_tonal_sample(luma, frame, |v| {
+            let scene = (v - params.exposure.black) * gain;
+            self.curve_samples.push(scene);
+            let bin = ((raw_core::Curve::to_normalized(scene) * (BINS - 1) as f32) as usize)
+                .min(BINS - 1);
+            self.curve_in[bin] += 1;
+        });
+        self.curve_cache = None;
+        self.sample_key = Some(key);
+    }
+
+    // Legacy CPU reference used by sampling tests. Production tonal bins are GPU
+    // results and must never be replaced with this pre-spatial estimate.
+    #[cfg(test)]
     pub fn refresh(
         &mut self,
         luma: &raw_core::LumaImage,
@@ -224,26 +339,15 @@ impl Histogram {
         luma_gen: u64,
         frame: &raw_core::Frame,
     ) {
-        // `params` carries the composition, so the crop is already in the key and a
-        // handle drag invalidates this the way a slider does. The frame is not added
-        // separately: it is a function of the params plus the file's EXIF tag, and
-        // the tag cannot change under a live tab.
-        let key = (params.clone(), luma_gen);
+        let key = (MappingKey::of(params), luma_gen, *frame);
         if self.key.as_ref() == Some(&key) {
             return;
         }
+        self.refresh_mapping(params);
+        self.refresh_curve_samples(luma, params, luma_gen, frame);
+        self.refresh_rgb(scene, params, luma_gen);
+        self.tonal = tonal_bins(luma, frame, self.map.as_ref().unwrap()).0;
         self.key = Some(key);
-
-        let map = Mapping::new(params);
-        (self.tonal, self.curve_in) = tonal_bins(luma, frame, &map);
-        self.curve_samples.clear();
-        let gain = map.ev.exp2();
-        for_each_tonal_sample(luma, frame, |v| {
-            self.curve_samples.push((v - map.black) * gain);
-        });
-        self.curve_cache = None;
-        self.rgb = rgb_bins(scene, &map);
-        self.map = Some(map);
     }
 
     pub fn accept_finished(&mut self, bins: [u32; BINS]) {
@@ -253,8 +357,10 @@ impl Histogram {
     /// Bin individual samples at the selected layer's input, before quantization.
     /// Cache between UI frames; refresh invalidates it when the source changes.
     pub fn curve_input(&mut self, stack: &raw_core::CurveStack, stop: usize) -> [u32; BINS] {
+        let mut prefix = stack.clone();
+        prefix.instances.truncate(stop.saturating_add(1));
         if let Some((previous, layer, bins, _)) = &self.curve_cache
-            && previous == stack
+            && previous.same_render(&prefix)
             && *layer == stop
         {
             return *bins;
@@ -278,7 +384,7 @@ impl Histogram {
             }
         }
         let average = (count > 0).then(|| (total_ev / count as f64) as f32);
-        self.curve_cache = Some((stack.clone(), stop, bins, average));
+        self.curve_cache = Some((prefix, stop, bins, average));
         bins
     }
 
@@ -389,6 +495,7 @@ impl Mapping {
     /// *of*: binning its own output would draw a histogram that moves every time
     /// you drag a point, which tells you nothing about where the tones you are
     /// trying to move actually are.
+    #[cfg(test)]
     fn curve_bin(&self, v: f32) -> usize {
         use raw_core::curve::{HI_EV, LO_EV};
         let scene = (v - self.black) * self.ev.exp2();
@@ -424,6 +531,7 @@ fn odd_stride(len: usize, budget: usize) -> usize {
 /// orientation is a permutation of the pixels and a permutation cannot change a
 /// histogram. Only a crop changes the *set*, and only then does it walk the frame
 /// and map each sample back through the composition.
+#[cfg(test)]
 fn tonal_bins(
     luma: &raw_core::LumaImage,
     frame: &raw_core::Frame,
@@ -565,6 +673,106 @@ mod tests {
     use raw_core::geometry::CfaColor::{Blue, Green, Red};
     use raw_core::sensor::Gains;
     use raw_core::{CfaGeometry, Dims};
+
+    #[test]
+    fn hidden_distributions_do_no_sampling_and_preserve_finished_bins() {
+        let mut h = Histogram::default();
+        let bins = [3; BINS];
+        h.accept_finished(bins);
+        let mut p = Params::default();
+        h.refresh_mapping(&p);
+        let lut = h.map.as_ref().unwrap().lut.as_ptr();
+        p.exposure.ev = 1.0;
+        p.display.gamma = 1.8;
+        h.refresh_mapping(&p);
+        assert_eq!(h.map.as_ref().unwrap().lut.as_ptr(), lut);
+        assert!(h.curve_samples.is_empty());
+        assert_eq!(h.rgb, [[0; BINS]; 3]);
+        assert_eq!(h.tonal, bins);
+        p.curve.add(0.5, 0.7);
+        h.refresh_mapping(&p);
+        assert_ne!(h.map.as_ref().unwrap().lut.as_ptr(), lut);
+        assert_eq!(h.tonal, bins);
+    }
+
+    #[test]
+    fn cpu_distributions_follow_only_their_inputs() {
+        let scene = leica_like(32, 24);
+        let (luma, frame) = upright(&[0.18; 32 * 24], 32);
+        let mut p = Params::default();
+        let mut h = Histogram::default();
+        h.refresh_curve_samples(&luma, &p, 1, &frame);
+        h.refresh_rgb(&scene, &p, 1);
+        let expected_rgb = h.rgb;
+        let expected_samples = h.curve_samples.clone();
+        h.rgb = [[77; BINS]; 3];
+        h.curve_samples = vec![77.0];
+        p.contrast_mask.enabled = true;
+        p.contrast_mask.spacer = 5.0;
+        p.grain.enabled = !p.grain.enabled;
+        p.toning.enabled = !p.toning.enabled;
+        p.display.dither = !p.display.dither;
+        h.refresh_curve_samples(&luma, &p, 1, &frame);
+        h.refresh_rgb(&scene, &p, 1);
+        assert_eq!(h.rgb, [[77; BINS]; 3]);
+        assert_eq!(h.curve_samples, vec![77.0]);
+        h.refresh_curve_samples(&luma, &p, 2, &frame);
+        h.refresh_rgb(&scene, &p, 1);
+        assert_eq!(h.curve_samples, expected_samples);
+        assert_eq!(h.rgb, [[77; BINS]; 3]);
+        h.refresh_rgb(&scene, &p, 2);
+        assert_eq!(h.rgb, expected_rgb);
+        h.curve_samples = vec![77.0];
+        p.curve.add(0.5, 0.7);
+        p.display.gamma = 1.8;
+        h.refresh_curve_samples(&luma, &p, 2, &frame);
+        h.refresh_rgb(&scene, &p, 2);
+        assert_eq!(h.curve_samples, vec![77.0]);
+        assert_eq!(h.rgb, rgb_bins(&scene, &Mapping::new(&p)));
+        p.exposure.ev = 1.0;
+        h.refresh_curve_samples(&luma, &p, 2, &frame);
+        assert!(h.curve_samples.iter().all(|v| (*v - 0.36).abs() < 1e-6));
+        let mut crop = frame;
+        crop.crop.w /= 2;
+        h.refresh_curve_samples(&luma, &p, 2, &crop);
+        assert_eq!(h.curve_in, tonal_bins(&luma, &crop, &Mapping::new(&p)).1);
+        assert!(h.curve_samples.len() < expected_samples.len());
+    }
+
+    #[test]
+    fn later_curve_layers_do_not_invalidate_earlier_distributions() {
+        let mut h = Histogram {
+            curve_samples: vec![0.18, 0.5],
+            ..Default::default()
+        };
+        let mut stack = raw_core::CurveStack::default();
+        stack.add_instance();
+        h.curve_input(&stack, 0);
+        h.curve_cache.as_mut().unwrap().2 = [77; BINS];
+        stack.instances[1].curve.add(0.5, 0.7);
+        assert_eq!(h.curve_input(&stack, 0), [77; BINS]);
+        stack.instances[0].opacity = 0.5;
+        assert_ne!(h.curve_input(&stack, 0), [77; BINS]);
+    }
+
+    #[test]
+    fn output_only_edits_preserve_ready_and_inflight_gpu_histograms() {
+        let (_, frame) = upright(&[0.18; 4], 2);
+        let mut h = GpuHistogram::default();
+        let mut p = Params::default();
+        h.prepare(Arc::new(p.clone()), frame, 1);
+        let in_flight = h.wanted.clone().unwrap();
+        p.grain.enabled = !p.grain.enabled;
+        p.display.dither = !p.display.dither;
+        h.prepare(Arc::new(p.clone()), frame, 1);
+        assert!(h.store(&in_flight, [3; BINS]));
+        h.prepare(Arc::new(p.clone()), frame, 1);
+        assert_eq!(h.bins(), Some(&[3; BINS]));
+        p.contrast_mask.enabled = true;
+        h.prepare(Arc::new(p), frame, 1);
+        assert!(h.bins().is_none());
+        assert!(!h.store(&in_flight, [3; BINS]));
+    }
 
     #[test]
     fn stale_gpu_histograms_cannot_replace_the_latest_request() {

@@ -54,6 +54,9 @@ pub enum Command {
     Show(Pane),
     /// Show a Lightbox pane, and switch to Lightbox if it is not up.
     ShowLightbox(crate::lightbox::Pane),
+    /// The manual update check (macOS). Menu-only: it has no chord and so no
+    /// row in `hotkeys::TABLE`, whose bindings all carry a key.
+    CheckForUpdates,
 }
 
 /// The installed menu bar, and what it took.
@@ -241,6 +244,15 @@ impl Menus {
         if let Some(i) = index_of(Action::Settings) {
             let _ = app.append(&item(i, &mut claimed));
         }
+        // The manual update check, under Settings by the same platform convention.
+        // A fixed id, not a `k` index — this command has no binding row to point at.
+        #[cfg(target_os = "macos")]
+        let _ = app.append(&MenuItem::with_id(
+            MenuId::new("updates-check"),
+            "Check for Updates…",
+            true,
+            None,
+        ));
         let _ = app.append(&PredefinedMenuItem::separator());
         let _ = app.append(&PredefinedMenuItem::services(None));
         let _ = app.append(&PredefinedMenuItem::hide(None));
@@ -373,6 +385,8 @@ impl Menus {
                     .find(|p| p.label() == name)
             {
                 out.push(Command::ShowLightbox(p));
+            } else if id == "updates-check" {
+                out.push(Command::CheckForUpdates);
             }
         }
         out

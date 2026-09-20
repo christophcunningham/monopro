@@ -6,6 +6,9 @@ members = [
     "crates/raw-gpu",
     "crates/raw-app",
 ]
+# Vendored, not a member: it stays out of `cargo test --workspace` (its native
+# harness wants an AppKit run loop) and off non-macOS builds.
+exclude = ["vendor/sparkle-updater"]
 
 # catalog/ is deliberately absent — lightbox comes after tabs.
 #
@@ -63,6 +66,14 @@ toml = "0.9"
 roxmltree = "0.21"
 thiserror = "2"
 pollster = "0.4"
+
+# `sparkle-updater` 0.1.0, vendored, for one binding the release lacks:
+# `skip_current_update`, which answers Sparkle's pending update alert with Skip
+# so a staged install is canceled rather than run at quit. The single delta and
+# provenance are in vendor/sparkle-updater/LOCAL-PATCH.md; the private APIs it
+# touches are pinned by the Sparkle 2.9.6 framework in packaging/macos/Sparkle.
+[patch.crates-io]
+sparkle-updater = { path = "vendor/sparkle-updater" }
 
 [profile.dev]
 opt-level = 1 # decoding a 100MP RAF in a debug build is otherwise unusable

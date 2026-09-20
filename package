@@ -42,10 +42,47 @@ dist="$here/dist"
 app="$dist/$app_name.app"
 dmg="$dist/$app_name-$version.dmg"
 
+# ── The update feed ───────────────────────────────────────────────────────────
+#
+# Sparkle needs three packaging inputs: the framework embedded in
+# Contents/Frameworks, a stable unversioned feed URL, and the EdDSA public key
+# whose signature every appcast must carry. The URL and key are baked into the
+# bundle at package time and cannot change for that build's lifetime, so the URL
+# is the *latest-release* alias — never a per-tag URL — and the key comes from
+# the environment or from packaging/macos/sparkle-ed25519-pub.txt. --signed
+# fails closed without a key: a feed nobody can verify is worse than no feed.
+sparkle="$here/packaging/macos/Sparkle"
+if [[ ! -d "$sparkle/Sparkle.framework" || ! -x "$sparkle/sparkle-bin/sign_update" ]]; then
+  echo "packaging/macos/Sparkle is missing or incomplete — see packaging/README.md" >&2
+  exit 1
+fi
+feed_url=${MONOPRO_UPDATE_FEED_URL:-https://github.com/christophcunningham/monopro/releases/latest/download/appcast.xml}
+ed_key=${MONOPRO_SPARKLE_ED_PUBLIC_KEY:-}
+if [[ -z "$ed_key" && -s "$here/packaging/macos/sparkle-ed25519-pub.txt" ]]; then
+  ed_key=$(<"$here/packaging/macos/sparkle-ed25519-pub.txt" | tr -d '[:space:]')
+fi
+if (( signed )) && [[ -z "$ed_key" ]]; then
+  echo "MONOPRO_SPARKLE_ED_PUBLIC_KEY (or packaging/macos/sparkle-ed25519-pub.txt) is required by --signed" >&2
+  exit 1
+fi
+if [[ -n "$ed_key" ]]; then
+  sparkle_plist="    <key>SUFeedURL</key><string>$feed_url</string>
+    <key>SUPublicEDKey</key><string>$ed_key</string>
+    <key>SUEnableAutomaticChecks</key><true/>
+    <key>SUScheduledCheckInterval</key><integer>86400</integer>"
+else
+  # No key, no verified feed: local bundles keep automatic checks off. The
+  # Settings toggle can still enable one for a deliberate local test.
+  sparkle_plist="    <key>SUEnableAutomaticChecks</key><false/>"
+  echo "no EdDSA public key — packaging without a live update feed" >&2
+fi
+
 mkdir -p "$dist"
 rm -rf \
   "$app" \
   "$dmg" \
+  "$dist/$app_name-$version-macos.zip" \
+  "$dist/$app_name-$version-macos.zip.ed.sig" \
   "$dist/READ ME FIRST.txt" \
   "$dist/LICENSE.txt" \
   "$dist/stage" \
@@ -119,6 +156,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key><string>$version</string>
     <key>CFBundleVersion</key><string>$version</string>
 $icon_line
+$sparkle_plist
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSRemovableVolumesUsageDescription</key>
@@ -138,8 +176,22 @@ cp "$here/icons/LICENSE-Phosphor.txt" "$here/icons/LICENSE-Lucide.txt" "$notices
 cp "$here/profiles/LICENSE" "$notices/profiles/monostar-CC0.txt"
 cp "$here/profiles/eciRGB_v2_license.rtf" "$here/profiles/licensing-iccorg.txt" "$notices/profiles/"
 
+# ── The Sparkle framework ─────────────────────────────────────────────────────
+#
+# Embedded, not linked from outside: the updater is part of the application.
+# `ditto` because a framework is a tree of symlinks (Versions/Current and
+# friends) that a flattening copy would turn into dead files — and a dead
+# framework is a launch failure, not a degraded feature.
+mkdir -p "$app/Contents/Frameworks"
+ditto "$sparkle/Sparkle.framework" "$app/Contents/Frameworks/Sparkle.framework"
+
 # ── Application signature ────────────────────────────────────────────────────
 if (( signed )); then
+  # The framework is signed explicitly first, so its hardened-runtime signature
+  # is a deliberate artifact rather than a --deep side effect; the outer pass
+  # then seals the bundle around it.
+  codesign --force --options runtime --timestamp \
+    --sign "$MONOPRO_MAC_SIGNING_IDENTITY" "$app/Contents/Frameworks/Sparkle.framework"
   codesign --force --deep --options runtime --timestamp \
     --sign "$MONOPRO_MAC_SIGNING_IDENTITY" "$app"
   codesign --verify --deep --strict --verbose=2 "$app"
@@ -207,6 +259,21 @@ if (( signed )); then
   xcrun notarytool submit "$dmg" --keychain-profile "$MONOPRO_NOTARY_PROFILE" --wait
   xcrun stapler staple "$dmg"
   xcrun stapler validate "$dmg"
+
+  # ── The update enclosure ──────────────────────────────────────────────────
+  #
+  # The ZIP of the signed app is what Sparkle downloads and installs — tighter
+  # than a DMG, no mount step, and the substrate for delta updates later. The
+  # DMG remains for humans and first installs. Notarized like the DMG, so a
+  # staged update is as trustworthy as a first download, then signed with the
+  # EdDSA key over the ZIP bytes; that signature is the appcast's
+  # sparkle:edSignature and fails the build if the key is unavailable.
+  zip="$dist/$app_name-$version-macos.zip"
+  ditto -c -k --sequesterRsrc --keepParent "$app" "$zip"
+  xcrun notarytool submit "$zip" --keychain-profile "$MONOPRO_NOTARY_PROFILE" --wait
+  key_args=()
+  [[ -n "${MONOPRO_SPARKLE_KEY_FILE:-}" ]] && key_args=(--ed-key-file "$MONOPRO_SPARKLE_KEY_FILE")
+  "$sparkle/sparkle-bin/sign_update" "${key_args[@]}" "$zip" > "$zip.ed.sig"
 fi
 
 verify_args=()

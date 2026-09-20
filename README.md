@@ -24,6 +24,12 @@ history to undo or redo changes.
 
 Press `,` for Settings and `.` for the hotkey reference.
 
+On macOS the app checks the stable release feed once a day, quietly: nothing
+appears while it is current, a badge appears at the right of the title strip
+when an update exists, and clicking it offers *Update on quit* (default),
+*Restart now*, or *Skip this version*. Settings → About has the preference and
+the manual check.
+
 ## Lightbox
 
 A folder-based browser with thumbnails, ratings, color labels, sorting, filtering,

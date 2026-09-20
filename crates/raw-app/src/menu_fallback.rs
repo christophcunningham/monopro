@@ -9,6 +9,9 @@ pub enum Command {
     Key(Action),
     Show(Pane),
     ShowLightbox(crate::lightbox::Pane),
+    /// Never produced here — no attached menu can carry the item — but kept so
+    /// the dispatch in `main.rs` reads identically on both sides of the boundary.
+    CheckForUpdates,
 }
 
 #[derive(Default)]

@@ -33,6 +33,291 @@ fn flat(value: f32, w: usize, h: usize) -> LumaImage {
     }
 }
 
+#[test]
+fn a_mask_cache_survives_downstream_edits_and_rebuilds_for_its_inputs() {
+    let Some((device, queue)) = headless_device() else {
+        return;
+    };
+    let mut ctx = GpuContext::new(&device);
+    let luma = ramp(577, 385);
+    let frame = upright(&luma);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let mut p = masked(48.0, 0.35, luma.output_dims);
+    let mut view = ONE_TO_ONE;
+    let draw = |vp: &mut Viewport, ctx: &mut GpuContext, p: &Params, view| {
+        vp.render(ctx, &device, &queue, 256, 192, view, p, &frame);
+        vp.read_back(&device, &queue).unwrap().2
+    };
+    let original = draw(&mut vp, &mut ctx, &p, view);
+    assert_eq!(vp.contrast_mask_rebuilds(), 1);
+    p.display.gamma = 1.8;
+    let downstream = draw(&mut vp, &mut ctx, &p, view);
+    assert_ne!(original, downstream);
+    assert_eq!(vp.contrast_mask_rebuilds(), 1, "gamma rebuilt the mask");
+
+    // Auxiliary renders must not corrupt a cached prefix's pixels or uniforms.
+    vp.patch(&mut ctx, &device, &queue, &p, &frame, 220, 150, 5, 5)
+        .unwrap();
+    assert_eq!(draw(&mut vp, &mut ctx, &p, view), downstream);
+    assert_eq!(vp.contrast_mask_rebuilds(), 1);
+
+    p.exposure.ev = 0.25;
+    draw(&mut vp, &mut ctx, &p, view);
+    assert_eq!(vp.contrast_mask_rebuilds(), 2);
+    p.contrast_mask.spacer *= 1.2;
+    draw(&mut vp, &mut ctx, &p, view);
+    assert_eq!(vp.contrast_mask_rebuilds(), 3);
+    p.contrast_mask.offset = (7.0, -3.0);
+    draw(&mut vp, &mut ctx, &p, view);
+    assert_eq!(vp.contrast_mask_rebuilds(), 4);
+    view.off_x = 32.25;
+    draw(&mut vp, &mut ctx, &p, view);
+    assert_eq!(vp.contrast_mask_rebuilds(), 5);
+    let replacement = flat(0.18, 577, 385);
+    vp.set_image(&device, &queue, &replacement);
+    let replaced = draw(&mut vp, &mut ctx, &p, view);
+    assert_eq!(vp.contrast_mask_rebuilds(), 6);
+    let mut fresh = Viewport::new(&device, &queue, &replacement);
+    assert_eq!(replaced, draw(&mut fresh, &mut ctx, &p, view));
+}
+
+#[test]
+fn excessive_render_requests_allocate_nothing_and_recover() {
+    let Some((device, queue)) = headless_device() else {
+        return;
+    };
+    let mut ctx = GpuContext::new(&device);
+    let luma = flat(0.18, 64, 64);
+    let frame = upright(&luma);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let p = Params::default();
+    for (w, h, scale) in [(u32::MAX, 64, 1.0), (8192, 8192, 256.0), (64, 64, f32::NAN)] {
+        let allocations = ctx.pool().allocations();
+        assert!(!vp.render(
+            &mut ctx,
+            &device,
+            &queue,
+            w,
+            h,
+            ViewGeometry {
+                scale,
+                ..ONE_TO_ONE
+            },
+            &p,
+            &frame
+        ));
+        assert!(vp.render_error().is_some());
+        assert!(vp.target_view().is_none());
+        assert_eq!(ctx.pool().allocations(), allocations);
+    }
+    assert!(vp.render(&mut ctx, &device, &queue, 64, 64, ONE_TO_ONE, &p, &frame));
+    assert!(vp.render_error().is_none());
+    let before = vp.read_back(&device, &queue).unwrap();
+    assert!(!vp.render(
+        &mut ctx,
+        &device,
+        &queue,
+        u32::MAX,
+        64,
+        ONE_TO_ONE,
+        &p,
+        &frame
+    ));
+    assert_eq!(before, vp.read_back(&device, &queue).unwrap());
+    vp.render(&mut ctx, &device, &queue, 64, 64, ONE_TO_ONE, &p, &frame);
+    assert!(vp.render_error().is_none());
+}
+
+#[test]
+fn high_zoom_masks_keep_native_detail_and_reuse_bounded_buffers() {
+    let Some((device, queue)) = headless_device() else {
+        return;
+    };
+    let mut ctx = GpuContext::new(&device);
+    let luma = ramp_with_texture(1025, 769, 5, 4.0, 0.2);
+    let frame = upright(&luma);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let mut p = masked(80.0, 0.35, luma.output_dims);
+    p.display.dither = false;
+    let view = ViewGeometry {
+        off_x: 320.0,
+        off_y: 220.0,
+        ..ONE_TO_ONE
+    };
+    vp.render(&mut ctx, &device, &queue, 256, 192, view, &p, &frame);
+    let native = vp.read_back(&device, &queue).unwrap().2;
+    for scale in [4.0, 16.0] {
+        let zoomed = ViewGeometry { scale, ..view };
+        assert!(vp.render(&mut ctx, &device, &queue, 256, 192, zoomed, &p, &frame));
+        assert!(vp.render_error().is_none());
+        let pixels = vp.read_back(&device, &queue).unwrap().2;
+        let stride = scale as usize;
+        for y in 0..192 / stride {
+            for x in 0..256 / stride {
+                let i = ((y * stride + stride / 2) * 256 + x * stride + stride / 2) * 4;
+                let j = (y * 256 + x) * 4;
+                assert!((i32::from(pixels[i]) - i32::from(native[j])).abs() <= 1);
+            }
+        }
+        // Changed exposure forces a mask rebuild; fixed geometry should retain
+        // its working set instead of throwing oversized textures away each frame.
+        let allocations = ctx.pool().allocations();
+        p.exposure.ev += 0.01;
+        vp.render(&mut ctx, &device, &queue, 256, 192, zoomed, &p, &frame);
+        vp.read_back(&device, &queue).unwrap();
+        assert_eq!(ctx.pool().allocations(), allocations);
+        p.exposure.ev -= 0.01;
+    }
+}
+
+#[test]
+fn auxiliary_targets_do_not_invalidate_the_live_image() {
+    let Some((device, queue)) = headless_device() else {
+        return;
+    };
+    let mut ctx = GpuContext::new(&device);
+    let luma = ramp(193, 129);
+    let frame = upright(&luma);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let mut live = masked(24.0, 0.35, luma.output_dims);
+    live.display.dither = false;
+    let view = ViewGeometry {
+        off_x: 17.25,
+        off_y: 12.5,
+        scale: 1.25,
+        ..ONE_TO_ONE
+    };
+    assert!(vp.render(&mut ctx, &device, &queue, 128, 96, view, &live, &frame));
+    let pixels = vp.read_back(&device, &queue).unwrap();
+    assert!(vp.target_changed);
+    let mut other = live.clone();
+    other.exposure.ev = 0.7;
+    other.curve.add(0.5, 0.7);
+    other.toning.enabled = true;
+    other.toning.process = raw_core::Process::Albumen;
+    other.toning.apply("gold-gp1", 0.85);
+    for params in [&live, &other] {
+        for kind in 0..5 {
+            let changed = vp.target_changed;
+            let builds = vp.contrast_mask_rebuilds();
+            match kind {
+                0 => {
+                    vp.patch(&mut ctx, &device, &queue, params, &frame, 20, 15, 3, 3)
+                        .unwrap();
+                }
+                1 => {
+                    let mut pending = vp
+                        .begin_patch(&mut ctx, &device, &queue, params, &frame, 30, 25, 1, 1)
+                        .unwrap();
+                    // An in-flight readback must not demand a live redraw either.
+                    assert!(!vp.render(&mut ctx, &device, &queue, 128, 96, view, &live, &frame));
+                    device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: None,
+                        })
+                        .unwrap();
+                    assert!(pending.poll(&device, &mut ctx).unwrap().is_ok());
+                }
+                2 => {
+                    let mut pending = vp
+                        .begin_histogram(&mut ctx, &device, &queue, params, &frame)
+                        .unwrap();
+                    device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: None,
+                        })
+                        .unwrap();
+                    assert!(pending.poll(&device).unwrap().is_ok());
+                }
+                3 => {
+                    vp.export(&mut ctx, &device, &queue, params, &frame, |_, _| {})
+                        .unwrap();
+                }
+                _ => {
+                    let mut cell = raw_gpu::Cell::default();
+                    vp.render_into(
+                        &mut cell, &mut ctx, &device, &queue, 64, 64, ONE_TO_ONE, params, &frame,
+                    );
+                    assert!(cell.view().is_some());
+                }
+            }
+            if kind != 1 {
+                assert_eq!(vp.target_changed, changed);
+            }
+            if kind != 4 {
+                assert_eq!(vp.contrast_mask_rebuilds(), builds);
+            }
+            let allocations = ctx.pool().allocations();
+            assert!(
+                !vp.render(&mut ctx, &device, &queue, 128, 96, view, &live, &frame),
+                "auxiliary kind {kind} forced a redraw"
+            );
+            assert_eq!(ctx.pool().allocations(), allocations);
+            assert_eq!(vp.read_back(&device, &queue).unwrap(), pixels);
+        }
+    }
+    // Restoring shared GPU resources must also work when a real edit DOES draw.
+    live.display.gamma = 1.7;
+    assert!(vp.render(&mut ctx, &device, &queue, 128, 96, view, &live, &frame));
+    let mut fresh = Viewport::new(&device, &queue, &luma);
+    fresh.render(&mut ctx, &device, &queue, 128, 96, view, &live, &frame);
+    assert_eq!(
+        vp.read_back(&device, &queue),
+        fresh.read_back(&device, &queue)
+    );
+}
+
+#[test]
+fn sampling_preserves_pending_source_changes_and_live_errors() {
+    let Some((device, queue)) = headless_device() else {
+        return;
+    };
+    let mut ctx = GpuContext::new(&device);
+    let luma = flat(0.18, 64, 64);
+    let frame = upright(&luma);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let p = no_dither();
+    vp.render(&mut ctx, &device, &queue, 64, 64, ONE_TO_ONE, &p, &frame);
+    let before = vp.read_back(&device, &queue).unwrap();
+    vp.set_image(&device, &queue, &flat(0.5, 64, 64));
+    vp.patch(&mut ctx, &device, &queue, &p, &frame, 0, 0, 1, 1)
+        .unwrap();
+    assert!(vp.render(&mut ctx, &device, &queue, 64, 64, ONE_TO_ONE, &p, &frame));
+    assert_ne!(vp.read_back(&device, &queue).unwrap(), before);
+    vp.render(
+        &mut ctx,
+        &device,
+        &queue,
+        u32::MAX,
+        64,
+        ONE_TO_ONE,
+        &p,
+        &frame,
+    );
+    let error = vp.render_error().unwrap().to_owned();
+    vp.patch(&mut ctx, &device, &queue, &p, &frame, 0, 0, 1, 1)
+        .unwrap();
+    assert_eq!(vp.render_error(), Some(error.as_str()));
+    assert!(!vp.render(&mut ctx, &device, &queue, 64, 64, ONE_TO_ONE, &p, &frame));
+    assert!(vp.render_error().is_none());
+    // A changed view still dispatches after sampling.
+    assert!(vp.render(
+        &mut ctx,
+        &device,
+        &queue,
+        64,
+        64,
+        ViewGeometry {
+            off_x: 1.0,
+            ..ONE_TO_ONE
+        },
+        &p,
+        &frame
+    ));
+}
+
 /// A horizontal ramp across the scene range, including above 1.0.
 fn ramp(w: usize, h: usize) -> LumaImage {
     let data = (0..w * h)
@@ -802,9 +1087,9 @@ fn export_reports_progress_once_per_tile() {
 }
 
 #[test]
-fn the_viewport_recovers_after_an_export() {
-    // Export leaves the target tile-sized and holding tile content. The next
-    // interactive frame must not short-circuit onto it.
+fn export_preserves_the_live_viewport_without_a_redraw() {
+    // Export owns a separate target; its tiles must not replace the live view
+    // or invalidate the live render key.
     let (device, queue) = gpu!(headless_device());
     let mut ctx = GpuContext::new(&device);
     let luma = flat(0.5, 64, 64);
@@ -824,7 +1109,7 @@ fn the_viewport_recovers_after_an_export() {
     vp.export(&mut ctx, &device, &queue, &p, &upright(&luma), |_, _| {})
         .expect("export");
     assert!(
-        vp.render(
+        !vp.render(
             &mut ctx,
             &device,
             &queue,
@@ -834,7 +1119,7 @@ fn the_viewport_recovers_after_an_export() {
             &p,
             &upright(&luma)
         ),
-        "viewport did not re-render"
+        "export unnecessarily invalidated the live view"
     );
 
     let (w, h, _) = vp.read_back(&device, &queue).expect("readback");
@@ -1171,6 +1456,64 @@ fn masked(sigma_px: f32, contrast: f32, dims: Dims) -> Params {
     p.contrast_mask.spacer = pct_for(sigma_px, dims);
     p.contrast_mask.contrast = contrast;
     p
+}
+
+#[test]
+fn a_reduced_mask_preserves_an_odd_sized_log_ramp_at_every_border() {
+    let (device, queue) = gpu!(headless_device());
+    let mut ctx = GpuContext::new(&device);
+    let (w, h) = (513, 257);
+    let mut luma = flat(0.18, w, h);
+    for (i, v) in luma.data.iter_mut().enumerate() {
+        *v *= (3.0 * (i % w) as f32 / (w - 1) as f32 + 2.0 * (i / w) as f32 / (h - 1) as f32 - 2.5)
+            .exp2();
+    }
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let p = masked(48.0, 0.35, luma.output_dims);
+    let (_, _, result) = vp
+        .export(&mut ctx, &device, &queue, &p, &upright(&luma), |_, _| {})
+        .unwrap();
+    for (i, (&before, &after)) in luma.data.iter().zip(&result).enumerate() {
+        let expected = (1.0 - p.contrast_mask.contrast) * before.log2()
+            + p.contrast_mask.contrast * 0.18f32.log2();
+        assert!(
+            (after.log2() - expected).abs() < 0.002,
+            "mask introduced an edge/partial-cell ramp error at ({}, {})",
+            i % w,
+            i / w
+        );
+    }
+}
+
+#[test]
+fn a_wide_reduced_mask_agrees_across_export_tiles_and_unaligned_patches() {
+    let (device, queue) = gpu!(headless_device());
+    let mut ctx = GpuContext::new(&device);
+    let luma = ramp_with_texture(2305, 257, 5, 4.0, 0.2);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let mut p = masked(128.0, 0.4, luma.output_dims);
+    p.contrast_mask.offset = (7.0, -3.0);
+    let frame = upright(&luma);
+    let (w, _, full) = vp
+        .export(&mut ctx, &device, &queue, &p, &frame, |_, _| {})
+        .unwrap();
+    for x in [13, 2035, 2258] {
+        let (pw, ph, tile) = vp
+            .patch(&mut ctx, &device, &queue, &p, &frame, x, 19, 47, 71)
+            .unwrap();
+        for y in 0..ph as usize {
+            for col in 0..pw as usize {
+                let reference = full[(y + 19) * w as usize + x as usize + col];
+                let delta = (tile[y * pw as usize + col].log2() - reference.log2()).abs();
+                assert!(
+                    delta < 0.0001,
+                    "reduced-grid seam at ({}, {}): {delta} EV",
+                    x as usize + col,
+                    y + 19
+                );
+            }
+        }
+    }
 }
 
 /// The spacer percentage that yields a `sigma_px` sigma on a `dims` frame — the
@@ -3056,6 +3399,99 @@ fn a_dab_is_round_in_pixels_on_a_landscape_frame() {
 }
 
 #[test]
+fn contrast_mask_zone_basis_matches_gpu_and_selects_middle_grey() {
+    let (device, queue) = gpu!(headless_device());
+    let mut ctx = GpuContext::new(&device);
+    for contrast in [0.05, 0.35, 0.60] {
+        for exposure in [-2.0, 0.0, 1.5] {
+            let luma = flat(0.19, 64, 48);
+            let frame = upright(&luma);
+            let mut vp = Viewport::new(&device, &queue, &luma);
+            let mut p = masked(3.0, contrast, luma.output_dims);
+            p.exposure.ev = exposure;
+            p.exposure.black = 0.01;
+            let basis = raw_core::zone::Basis::build(&luma, &p.exposure, &p.contrast_mask);
+            let (_, _, pixels) = vp
+                .export(&mut ctx, &device, &queue, &p, &frame, |_, _| {})
+                .unwrap();
+            for (&cpu, &pixel) in basis.ev.iter().zip(&pixels) {
+                let gpu = (pixel / 0.18).log2();
+                assert!(
+                    (cpu - gpu).abs() < 2e-5,
+                    "contrast={contrast}, exposure={exposure}: CPU {cpu}, GPU {gpu}"
+                );
+            }
+            // A narrow selection around the actual incoming tone must admit a
+            // burn. At zero exposure this is exactly the original grey failure.
+            let center = exposure * (1.0 - contrast);
+            p.dodgeburn = DodgeBurnParams {
+                enabled: true,
+                instances: vec![Instance {
+                    mask: ZoneMask {
+                        enabled: true,
+                        lo: center - 0.1,
+                        hi: center + 0.1,
+                        f_lo: 0.05,
+                        f_hi: 0.05,
+                        ..Default::default()
+                    },
+                    ..instance(
+                        Sign::Burn,
+                        vec![Gesture::new(vec![dab(0.5, 0.5, 0.9, 0.0, -1.0)])],
+                    )
+                }],
+            };
+            let (_, _, burned) = vp
+                .export(&mut ctx, &device, &queue, &p, &frame, |_, _| {})
+                .unwrap();
+            let center_pixel = 24 * 64 + 32;
+            assert!(
+                (burned[center_pixel] / pixels[center_pixel] - 0.5).abs() < 1e-4,
+                "tonal mask missed its intended tone at contrast={contrast}, exposure={exposure}"
+            );
+        }
+    }
+}
+
+#[test]
+fn contrast_mask_zone_basis_matches_gpu_across_dark_and_bright_regions() {
+    let (device, queue) = gpu!(headless_device());
+    let mut ctx = GpuContext::new(&device);
+    let mut luma = flat(0.18, 96, 64);
+    for (i, value) in luma.data.iter_mut().enumerate() {
+        let x = i % 96;
+        *value = match x {
+            0..24 => -0.01,
+            24..48 => 0.0,
+            48..72 => 0.18,
+            _ => 0.72,
+        };
+    }
+    let frame = upright(&luma);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    for contrast in [0.35, 0.60] {
+        let p = masked(3.0, contrast, luma.output_dims);
+        let basis = raw_core::zone::Basis::build(&luma, &p.exposure, &p.contrast_mask);
+        let (_, _, pixels) = vp
+            .export(&mut ctx, &device, &queue, &p, &frame, |_, _| {})
+            .unwrap();
+        // Exclude the physical image edge: proxy blur clamps there while the
+        // renderer samples an apron. Interior region transitions must agree.
+        for y in 12..52 {
+            for x in 12..84 {
+                let i = y * 96 + x;
+                let gpu = (pixels[i] / 0.18).log2();
+                assert!(
+                    (basis.ev[i] - gpu).abs() < 2e-4,
+                    "contrast={contrast}, ({x}, {y}): CPU {}, GPU {gpu}",
+                    basis.ev[i]
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_zone_mask_holds_a_burn_to_its_own_tones() {
     // The mask, end to end: proxy, guided filter, trapezoid, strip upload,
     // bilinear read in the shader. A frame that is dark on the left and bright on
@@ -3951,12 +4387,19 @@ fn export_only_edits_do_not_dispatch_the_viewport() {
 }
 
 #[test]
-fn curve_and_target_changes_do_not_rebuild_the_zone_basis() {
+fn unmasked_edits_and_source_changes_do_not_prepare_zones() {
     let (device, queue) = gpu!(headless_device());
     let mut ctx = GpuContext::new(&device);
     let luma = flat(0.5, 128, 128);
     let mut vp = Viewport::new(&device, &queue, &luma);
     let mut p = no_dither();
+    p.dodgeburn = DodgeBurnParams {
+        enabled: true,
+        instances: vec![instance(
+            Sign::Burn,
+            vec![Gesture::new(vec![dab(0.5, 0.5, 0.9, 0.0, -1.0)])],
+        )],
+    };
     vp.render(
         &mut ctx,
         &device,
@@ -3968,6 +4411,9 @@ fn curve_and_target_changes_do_not_rebuild_the_zone_basis() {
         &upright(&luma),
     );
     let warm = vp.basis_rebuilds();
+    assert_eq!(warm, 0);
+    p.contrast_mask.enabled = true;
+    p.contrast_mask.spacer = 5.0;
     p.curve.add(0.5, 0.7);
     vp.render(
         &mut ctx,
@@ -3991,7 +4437,7 @@ fn curve_and_target_changes_do_not_rebuild_the_zone_basis() {
         &p,
         &upright(&luma),
     );
-    assert_eq!(vp.basis_rebuilds(), warm + 1);
+    assert_eq!(vp.basis_rebuilds(), warm);
     vp.set_image(&device, &queue, &luma);
     vp.render(
         &mut ctx,
@@ -4003,7 +4449,100 @@ fn curve_and_target_changes_do_not_rebuild_the_zone_basis() {
         &p,
         &upright(&luma),
     );
-    assert_eq!(vp.basis_rebuilds(), warm + 2);
+    assert_eq!(vp.basis_rebuilds(), warm);
+}
+
+#[test]
+fn interactive_zone_jobs_preserve_the_previous_frame_and_match_blocking_results() {
+    let (device, queue) = gpu!(headless_device());
+    let mut ctx = GpuContext::new(&device);
+    let luma = ramp(193, 129);
+    let frame = upright(&luma);
+    let mut p = masked(24.0, 0.35, luma.output_dims);
+    p.display.dither = false;
+    p.dodgeburn = DodgeBurnParams {
+        enabled: true,
+        instances: vec![Instance {
+            mask: ZoneMask {
+                enabled: true,
+                hi: 0.0,
+                ..Default::default()
+            },
+            ..instance(
+                Sign::Burn,
+                vec![Gesture::new(vec![dab(0.5, 0.5, 0.9, 0.0, -2.0)])],
+            )
+        }],
+    };
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    vp.set_interactive_zones(true);
+    assert!(!vp.render(&mut ctx, &device, &queue, 128, 96, ONE_TO_ONE, &p, &frame));
+    assert!(vp.zone_render_pending());
+    assert!(vp.target_view().is_none());
+    let finish = |vp: &mut Viewport, ctx: &mut GpuContext, p: &Params| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let drawn = vp.render(ctx, &device, &queue, 128, 96, ONE_TO_ONE, p, &frame);
+            if !vp.zone_render_pending() {
+                assert!(drawn);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    finish(&mut vp, &mut ctx, &p);
+    let before = vp.read_back(&device, &queue).unwrap();
+    p.exposure.ev = 0.5;
+    assert!(!vp.render(&mut ctx, &device, &queue, 128, 96, ONE_TO_ONE, &p, &frame));
+    assert!(vp.zone_render_pending());
+    assert_eq!(before, vp.read_back(&device, &queue).unwrap());
+    // Replacing the source while a job runs must not install its obsolete masks.
+    let replacement = flat(0.12, 193, 129);
+    vp.set_image(&device, &queue, &replacement);
+    finish(&mut vp, &mut ctx, &p);
+    let mut fresh = Viewport::new(&device, &queue, &replacement);
+    fresh.render(&mut ctx, &device, &queue, 128, 96, ONE_TO_ONE, &p, &frame);
+    assert_eq!(
+        vp.read_back(&device, &queue),
+        fresh.read_back(&device, &queue)
+    );
+    let builds = vp.basis_rebuilds();
+    p.dodgeburn.instances[0].mask.hi = 1.0;
+    finish(&mut vp, &mut ctx, &p);
+    assert_eq!(
+        vp.basis_rebuilds(),
+        builds,
+        "zone bounds rebuilt the exposure/mask basis"
+    );
+    // Explicit panel demand obtains a current histogram from the same basis.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(hist) = vp.request_zone_histogram(&p) {
+            assert_eq!(hist.len(), Viewport::ZONE_BINS);
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(vp.basis_rebuilds(), builds);
+    // Asynchronous sampling retries, while the explicitly blocking patch API
+    // waits for the same correct result and restores interactive mode afterward.
+    p.exposure.ev += 0.25;
+    assert!(
+        vp.begin_patch(&mut ctx, &device, &queue, &p, &frame, 0, 0, 3, 3)
+            .is_none()
+    );
+    let patch = vp
+        .patch(&mut ctx, &device, &queue, &p, &frame, 0, 0, 3, 3)
+        .unwrap();
+    let expected = fresh
+        .patch(&mut ctx, &device, &queue, &p, &frame, 0, 0, 3, 3)
+        .unwrap();
+    assert_eq!(patch, expected);
+    p.exposure.ev += 0.25;
+    assert!(!vp.render(&mut ctx, &device, &queue, 128, 96, ONE_TO_ONE, &p, &frame));
+    assert!(vp.zone_render_pending());
 }
 
 #[test]

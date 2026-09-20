@@ -38,7 +38,9 @@
 //! than a branch in the executor.
 
 pub mod exec;
+mod limits;
 pub mod pool;
+mod zones;
 
 pub use exec::{GpuContext, Resources};
 pub use pool::{Lease, TexDesc, TexturePool};
@@ -191,8 +193,8 @@ pub struct NodeParams {
     toning: u32,
     /// Accumulate final display luminance into the histogram buffer.
     histogram: u32,
-    _pad2: f32,
-    _pad3: f32,
+    input_scale: f32,
+    mask_scale: f32,
     _pad4: f32,
 }
 
@@ -524,8 +526,8 @@ struct Params {
     // NodeParams.
     toning: u32,
     histogram: u32,
-    _pad2: f32,
-    _pad3: f32,
+    input_scale: f32,
+    mask_scale: f32,
     _pad4: f32,
 };
 
@@ -590,6 +592,10 @@ fn source_coord(gid: vec2<u32>) -> vec2<f32> {
 // a cull comes to disagree with the thing it is culling for.
 fn source_at(gx: f32, gy: f32) -> vec2<f32> {
     let f = vec2<f32>((gx + p.sub_x + 0.5) / p.scale, (gy + p.sub_y + 0.5) / p.scale);
+    return source_from_frame(f);
+}
+
+fn source_from_frame(f: vec2<f32>) -> vec2<f32> {
     let raw_w = p.comp6 * f.x + p.comp7 * f.y + p.comp8;
     let signed_floor = select(-1.0e-6, 1.0e-6, raw_w >= 0.0);
     let w = select(signed_floor, raw_w, abs(raw_w) >= 1.0e-6);
@@ -629,6 +635,7 @@ struct Target {
 #[derive(Default)]
 pub struct Cell {
     target: Option<Target>,
+    render_error: Option<String>,
     /// The texture was reallocated and the host must re-register it. Per cell, not per
     /// viewport: a cell that reported its reallocation somewhere else would be drawn
     /// from a `TextureId` that no longer refers to it.
@@ -636,6 +643,10 @@ pub struct Cell {
 }
 
 impl Cell {
+    pub fn render_error(&self) -> Option<&str> {
+        self.render_error.as_deref()
+    }
+
     pub fn view(&self) -> Option<&wgpu::TextureView> {
         self.target.as_ref().map(|t| &t.view)
     }
@@ -660,12 +671,24 @@ impl Cell {
     }
 }
 
-/// One image's GPU state: its source texture, its curve LUT, its target, and the
-/// change detection that keeps an idle window free.
-///
-/// Pipelines and intermediates are **not** here — they live in `GpuContext` and
-/// are shared with every other tab.
+#[derive(PartialEq)]
+struct MaskCacheKey {
+    steps: Vec<raw_graph::Step>,
+    subpixel: (f32, f32),
+    exposure: raw_core::ExposureParams,
+    frame: Frame,
+}
+
+// One viewport-sized scene-linear result, not the much larger blur apron. Keep
+// the live cache bounded independently of the shared idle pool.
+const MASK_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// One image's source, targets and bounded Contrast Mask result cache.
+/// Compiled pipelines and reusable transient textures live in `GpuContext`.
 pub struct Viewport {
+    mask_cache: Option<(MaskCacheKey, Lease)>,
+    mask_rebuilds: u64,
+    render_error: Option<String>,
     uniforms: wgpu::Buffer,
     lut: wgpu::Buffer,
     tone_lut: wgpu::Buffer,
@@ -687,21 +710,13 @@ pub struct Viewport {
     live_instances: u32,
     /// The luminance downsample the zone masks are computed from. Rebuilt with the
     /// source image and with nothing else; see `raw_core::zone::Proxy`.
-    proxy: Proxy,
-    /// The pre-D&B EV image the masks read, and its distribution.
-    ///
-    /// Rebuilt when the proxy, exposure or Contrast Mask changes — not when a
-    /// stroke lands, because it is **feed-forward** and a stroke cannot reach it.
-    /// Held rather than recomputed per use because two things want it: evaluating
-    /// the masks, and the ghost behind the zone ruler, which the panel asks for on
-    /// every frame it draws.
-    basis: raw_core::Basis,
-    zone_hist: Vec<f32>,
-    basis_rebuilds: u64,
+    proxy: Arc<Proxy>,
+    zones: zones::Zones,
+    interactive_zones: bool,
+    zone_render_pending: bool,
     // These describe actual resident resources, independently of the target's
     // last frame: comparison cells and exports share these resources.
     resource_params: Option<Arc<Params>>,
-    basis_inputs: Option<(raw_core::ExposureParams, raw_core::ContrastMaskParams)>,
     source: wgpu::Texture,
     source_view: wgpu::TextureView,
     /// Per-working-pixel sensor clipping count, `0..=4`, stored in an R8 texture.
@@ -908,6 +923,9 @@ impl Viewport {
         let (masks, masks_view) = Self::make_masks(device, 1, 1, 1);
 
         Self {
+            mask_cache: None,
+            mask_rebuilds: 0,
+            render_error: None,
             uniforms,
             lut,
             tone_lut,
@@ -919,12 +937,11 @@ impl Viewport {
             mask_rows: 1,
             live_dabs: 0,
             live_instances: 0,
-            basis: proxy.basis(&Default::default(), &Default::default()),
-            zone_hist: Vec::new(),
-            basis_rebuilds: 0,
+            zones: zones::Zones::default(),
+            interactive_zones: false,
+            zone_render_pending: false,
             resource_params: None,
-            basis_inputs: None,
-            proxy,
+            proxy: Arc::new(proxy),
             source,
             source_view,
             clipping,
@@ -987,34 +1004,63 @@ impl Viewport {
     /// The pre-D&B EV distribution over the zone ruler's window, normalised to its
     /// own peak. See [`Viewport::ZONE_BINS`].
     pub fn basis_rebuilds(&self) -> u64 {
-        self.basis_rebuilds
+        self.zones.rebuilds
     }
 
-    pub fn zone_histogram(&self) -> &[f32] {
-        &self.zone_hist
+    /// Enable nonblocking zone preparation for an interactive host. Blocking
+    /// clients (export workers and headless tools) retain synchronous results.
+    pub fn set_interactive_zones(&mut self, enabled: bool) {
+        self.interactive_zones = enabled;
+    }
+
+    pub fn zone_render_pending(&self) -> bool {
+        self.zone_render_pending
+    }
+
+    pub fn request_zone_histogram(&mut self, params: &Params) -> Option<Vec<f32>> {
+        self.zones
+            .request(&self.proxy, params, true, false)
+            .map(|p| p.histogram.clone())
+    }
+
+    pub fn zones_ready(&mut self, params: &Params) -> bool {
+        !Self::needs_zones(params)
+            || self
+                .zones
+                .request(&self.proxy, params, false, false)
+                .is_some()
+    }
+
+    fn needs_zones(params: &Params) -> bool {
+        params.dodgeburn.is_active() && params.dodgeburn.active().any(|i| !i.mask.is_identity())
     }
 
     /// Repack and upload the stroke buffers and the zone-mask strip.
     ///
     /// Called only when `dodgeburn` changed, or when the two modules the masks are
     /// computed *from* changed — exposure and Contrast Mask. Not every frame: this
-    /// walks every dab and, when any mask is bounded, runs a guided filter over the
-    /// proxy. Cheap, but not free, and a pan must not pay for it.
+    /// packs dabs and uploads masks already prepared by the CPU worker. Filtering
+    /// is never performed here, and a pan must not repack unchanged strokes.
     ///
     /// Masks are resolved before instances because packing an instance needs to
     /// know which strip row it was given, and an instance whose mask is the
     /// identity is given none at all.
-    fn write_strokes(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, params: &Params) {
+    fn write_strokes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        params: &Params,
+        prepared: Option<&zones::Prepared>,
+    ) {
         let db: &DodgeBurnParams = &params.dodgeburn;
-        let basis = &self.basis;
 
         let mut mask_data: Vec<f32> = Vec::new();
         let mut instances: Vec<GpuInstance> = Vec::new();
-        for inst in db.active() {
-            let mask_row = match basis.evaluate(&inst.mask) {
+        for (index, inst) in db.active().enumerate() {
+            let mask_row = match prepared.and_then(|p| p.masks[index].as_ref()) {
                 Some(m) => {
                     let row = (mask_data.len() / self.proxy.w) as i32;
-                    mask_data.extend_from_slice(&m);
+                    mask_data.extend_from_slice(m);
                     row
                 }
                 None => -1,
@@ -1216,6 +1262,7 @@ impl Viewport {
     /// Replace the working image without rebuilding pipelines. Used when the
     /// sampling or weighting mode changes and luminance is re-derived on the CPU.
     pub fn set_image(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, luma: &LumaImage) {
+        self.mask_cache = None;
         let (w, h) = (luma.output_dims.w as u32, luma.output_dims.h as u32);
         if (w, h) == self.source_dims {
             queue.write_texture(
@@ -1263,11 +1310,12 @@ impl Viewport {
             self.source_dims = (w, h);
         }
         // The zone masks are computed from this. Rebuilding here is what makes
-        // `Proxy` depend on the luminance image and on nothing else. The basis is
-        // left stale on purpose: `render` rebuilds it, and it needs params this
-        // function is not given.
-        self.proxy = Proxy::of(luma);
-        self.basis_inputs = None;
+        // `Proxy` depends on the luminance image and nothing else. Prepared zones
+        // are invalidated; running jobs from this source cannot satisfy the next
+        // generation's requests.
+        self.proxy = Arc::new(Proxy::of(luma));
+        self.zones.invalidate();
+        self.resource_params = None;
         // The params can be identical across a source change, so change detection
         // cannot see this. Say so explicitly.
         self.dirty = true;
@@ -1275,6 +1323,18 @@ impl Viewport {
 
     pub fn source_dims(&self) -> (u32, u32) {
         self.source_dims
+    }
+
+    /// Number of live-view Contrast Mask prefixes actually computed. Useful for
+    /// checking that downstream edits reuse the expensive spatial result.
+    pub fn contrast_mask_rebuilds(&self) -> u64 {
+        self.mask_rebuilds
+    }
+
+    /// A rejected render leaves the previous target intact. The host should show
+    /// this message instead of presenting that stale image as the requested view.
+    pub fn render_error(&self) -> Option<&str> {
+        self.render_error.as_deref()
     }
 
     pub fn target_view(&self) -> Option<&wgpu::TextureView> {
@@ -1309,6 +1369,8 @@ impl Viewport {
     ) -> bool {
         std::mem::swap(&mut self.target, &mut cell.target);
         let live = self.last.take();
+        let live_dirty = self.dirty;
+        let live_error = self.render_error.take();
         let was_changed = self.target_changed;
         self.target_changed = false;
         // Forced: `last` is gone, but `dirty` is what `run` reads to bypass the
@@ -1316,12 +1378,13 @@ impl Viewport {
         // must still be drawn — it is a different picture.
         self.dirty = true;
         let ok = self.render(ctx, device, queue, out_w, out_h, view, params, frame);
+        cell.render_error = self.render_error.take();
+        self.render_error = live_error;
         cell.changed = self.target_changed;
         self.target_changed = was_changed;
         self.last = live;
-        // The live target is coming back and the graph last ran against a cell, so the
-        // next live render must not be skipped by a stale comparison either.
-        self.dirty = true;
+        // The live target's pixels survived this cell render unchanged.
+        self.dirty = live_dirty;
         std::mem::swap(&mut self.target, &mut cell.target);
         ok
     }
@@ -1422,8 +1485,8 @@ impl Viewport {
             // reads it, and a per-node exception is a thing to forget.
             toning: u32::from(params.toning.is_active()),
             histogram: u32::from(histogram),
-            _pad2: 0.0,
-            _pad3: 0.0,
+            input_scale: plan.sink().out.scale,
+            mask_scale: plan.sink().out.scale,
             _pad4: 0.0,
         };
 
@@ -1435,6 +1498,7 @@ impl Viewport {
                     out_y: step.out.y,
                     out_w: step.out.w,
                     out_h: step.out.h,
+                    scale: step.out.scale,
                     ..common
                 };
                 // The source node reads the stored image, whose "region" is the
@@ -1448,12 +1512,23 @@ impl Viewport {
                     np.in_y = r.y;
                     np.in_w = r.w;
                     np.in_h = r.h;
+                    np.input_scale = r.scale;
                 }
                 if let Some((_, r)) = step.inputs.get(1) {
                     np.in2_x = r.x;
                     np.in2_y = r.y;
                     np.in2_w = r.w;
                     np.in2_h = r.h;
+                    np.mask_scale = r.scale;
+                }
+                if matches!(step.kind, NodeKind::MaskInput { .. }) {
+                    np.input_scale = view.scale.min(1.0);
+                    let full =
+                        Roi::grid_for((frame.frame.w as u32, frame.frame.h as u32), np.input_scale);
+                    np.in_w = full.0;
+                    np.in_h = full.1;
+                    np.sub_x *= np.input_scale / view.scale;
+                    np.sub_y *= np.input_scale / view.scale;
                 }
                 let scale = step.out.scale;
                 match step.kind {
@@ -1533,7 +1608,14 @@ impl Viewport {
     ) -> Plan {
         let f = frame.frame;
         let c = frame.crop;
-        raw_graph::build(params, self.source_dims)
+        // A small fitted frame already bounds the entire shared apron. Reuse
+        // its sampled log image instead of sampling the same source twice.
+        let grid = Roi::grid_for((f.w as u32, f.h as u32), view.scale);
+        let share_mask = view.scale < 1.0
+            && grid.0 <= out_w
+            && grid.1 <= out_h
+            && u64::from(grid.0) * u64::from(grid.1) <= 4 * 1024 * 1024;
+        raw_graph::build_with_mask_source(params, self.source_dims, !share_mask)
             .resolve(
                 (f.w as u32, f.h as u32),
                 View {
@@ -1606,8 +1688,75 @@ impl Viewport {
         tap: bool,
         histogram: bool,
     ) -> Option<Option<(Lease, Roi)>> {
+        if !tap && !histogram {
+            return self.run_inner(
+                ctx, device, queue, out_w, out_h, view, params, frame, tap, histogram,
+            );
+        }
+        // Auxiliary targets share GPU resources, never live-target validity or
+        // presentation metadata. Restore these even when preflight rejects work.
+        let changed = self.target_changed;
+        let error = self.render_error.take();
+        let result = self.run_inner(
+            ctx, device, queue, out_w, out_h, view, params, frame, tap, histogram,
+        );
+        self.target_changed = changed;
+        self.render_error = error;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_inner(
+        &mut self,
+        ctx: &mut GpuContext,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        out_w: u32,
+        out_h: u32,
+        view: ViewGeometry,
+        params: &Params,
+        frame: &Frame,
+        tap: bool,
+        histogram: bool,
+    ) -> Option<Option<(Lease, Roi)>> {
         let (out_w, out_h) = (out_w.max(1), out_h.max(1));
         self.target_changed = false;
+        self.zone_render_pending = false;
+
+        // Validate before allocating targets, preparing CPU resources or touching
+        // live-view validity. The plan's budget includes rounded texture storage.
+        self.render_error = None;
+        let max_dim = device.limits().max_texture_dimension_2d;
+        let valid_view = view.scale.is_finite()
+            && view.scale > 0.0
+            && [view.off_x, view.off_y]
+                .iter()
+                .all(|x| x.is_finite() && (x * view.scale).abs() < 1.0e8)
+            && (frame.frame.w.max(frame.frame.h) as f32 * view.scale) < 1.0e8;
+        if !valid_view || out_w > max_dim || out_h > max_dim {
+            self.render_error = Some("This view exceeds the renderer's supported dimensions. Reduce the window size or zoom.".into());
+            return None;
+        }
+        let plan = self.plan(out_w, out_h, view, params, frame);
+        if let Err(message) = limits::validate_plan(&plan, max_dim) {
+            self.render_error = Some(message);
+            return None;
+        }
+
+        let prepared = if Self::needs_zones(params) {
+            match self
+                .zones
+                .request(&self.proxy, params, false, !self.interactive_zones)
+            {
+                Some(ready) => Some(ready),
+                None => {
+                    self.zone_render_pending = true;
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
 
         let (alloc_w, alloc_h) = (quantize(out_w), quantize(out_h));
         if histogram {
@@ -1629,8 +1778,6 @@ impl Viewport {
             t.used_h = out_h;
         }
 
-        let plan = self.plan(out_w, out_h, view, params, frame);
-
         // Re-bake the LUT only when the curve itself changed. A 256 KB upload is
         // cheap but not free, and it must not happen on every exposure frame.
         let curve_changed = self
@@ -1639,7 +1786,6 @@ impl Viewport {
             .is_none_or(|p| !p.curve.same_render(&params.curve));
         if curve_changed {
             queue.write_buffer(&self.lut, 0, bytemuck::cast_slice(&params.curve.bake()));
-            self.dirty = true;
         }
 
         // The toning table, on the same rule and for the same reason. The chemistry
@@ -1654,29 +1800,29 @@ impl Viewport {
                 0,
                 bytemuck::cast_slice(&params.toning.bake_flat(raw_core::toning::LUT_ENTRIES)),
             );
-            self.dirty = true;
         }
 
-        // Only the source, exposure and Contrast Mask feed the zone basis.
-        // Target changes and LUT uploads do not change that signal.
-        let basis_inputs = (params.exposure, params.contrast_mask);
-        let basis_changed = self.basis_inputs != Some(basis_inputs);
-        if basis_changed {
-            self.basis_rebuilds += 1;
-            self.basis_inputs = Some(basis_inputs);
-            self.basis = self.proxy.basis(&params.exposure, &params.contrast_mask);
-            self.zone_hist = self.basis.histogram(Self::ZONE_BINS);
-        }
-        let strokes_changed = basis_changed
-            || self
-                .resource_params
-                .as_ref()
-                .is_none_or(|p| p.dodgeburn != params.dodgeburn);
+        let strokes_changed = self.resource_params.as_ref().is_none_or(|p| {
+            p.dodgeburn != params.dodgeburn
+                || (Self::needs_zones(params)
+                    && (p.exposure != params.exposure || p.contrast_mask != params.contrast_mask))
+        });
         if strokes_changed {
-            self.write_strokes(device, queue, params);
-            self.dirty = true;
+            self.write_strokes(device, queue, params, prepared.as_deref());
         }
 
+        // Record restored resources even if the live target is already valid.
+        // Otherwise every idle frame after a different auxiliary look would
+        // upload the same tables and strokes again.
+        let snapshot =
+            (curve_changed || toning_changed || strokes_changed).then(|| Arc::new(params.clone()));
+        if let Some(snapshot) = &snapshot {
+            self.resource_params = Some(Arc::clone(snapshot));
+        }
+
+        // Resource uploads above do not invalidate pixels already rendered into
+        // the live target. They may restore resources changed by an auxiliary
+        // request; only source/target changes and this live key require a redraw.
         // Params::diff owns the render tier, excluding export-only settings.
         // Compare before cloning; idle frames should not copy brush histories.
         if !self.dirty
@@ -1694,10 +1840,12 @@ impl Viewport {
         {
             return None;
         }
-        let snapshot = Arc::new(params.clone());
+        let snapshot = snapshot.unwrap_or_else(|| Arc::new(params.clone()));
         self.resource_params = Some(Arc::clone(&snapshot));
-        self.last = Some((plan.clone(), snapshot, view, *frame));
-        self.dirty = false;
+        if !tap && !histogram {
+            self.last = Some((plan.clone(), snapshot, view, *frame));
+            self.dirty = false;
+        }
 
         let blocks = self.node_params(&plan, params, view, frame, histogram);
         self.write_uniforms(device, queue, &blocks);
@@ -1729,7 +1877,54 @@ impl Viewport {
             instances: &self.instances,
             masks: &self.masks_view,
         };
-        let lease = ctx.execute(device, queue, &plan, &res, tap_edge.map(|(id, _)| id));
+        let cache_key = (!tap && !histogram)
+            .then(|| {
+                plan.steps
+                    .iter()
+                    .position(|step| step.kind == NodeKind::Exp2)
+                    .filter(|&i| {
+                        let roi = plan.steps[i].out;
+                        u64::from(quantize(roi.w)) * u64::from(quantize(roi.h)) * 8
+                            <= MASK_CACHE_BYTES
+                    })
+                    .map(|i| {
+                        (
+                            plan.steps[i].id,
+                            MaskCacheKey {
+                                steps: plan.steps[..=i].to_vec(),
+                                subpixel: plan.subpixel,
+                                exposure: params.exposure,
+                                frame: *frame,
+                            },
+                        )
+                    })
+            })
+            .flatten();
+        let lease = if let Some((id, key)) = cache_key {
+            let old = self.mask_cache.take().and_then(|(previous, lease)| {
+                if previous == key {
+                    Some(lease)
+                } else {
+                    ctx.pool_mut().release(lease);
+                    None
+                }
+            });
+            if old.is_none() {
+                self.mask_rebuilds += 1;
+            }
+            let (tap_lease, cached) =
+                ctx.execute_cached(device, queue, &plan, &res, None, Some((id, old)));
+            self.mask_cache = cached.map(|lease| (key, lease));
+            tap_lease
+        } else {
+            if !tap
+                && !histogram
+                && let Some((_, lease)) = self.mask_cache.take()
+            {
+                ctx.pool_mut().release(lease);
+            }
+            ctx.execute(device, queue, &plan, &res, tap_edge.map(|(id, _)| id))
+        };
         Some(lease.map(|l| (l, tap_edge.expect("a lease is only retained when tapped").1)))
     }
 
@@ -1933,12 +2128,12 @@ impl Viewport {
                     off_y: fy as f32,
                     ..Default::default()
                 };
-                // Force the dispatch: consecutive tiles differ only in `off`, but
-                // a one-tile image would otherwise hit the idle-frame short
-                // circuit.
-                self.dirty = true;
-                let (lease, region) =
-                    self.run(ctx, device, queue, tw, th, view, params, frame, true, false)??;
+                // Tapped requests always dispatch, including one-tile exports.
+                let interactive = self.interactive_zones;
+                self.interactive_zones = false;
+                let result = self.run(ctx, device, queue, tw, th, view, params, frame, true, false);
+                self.interactive_zones = interactive;
+                let (lease, region) = result??;
                 let (rw, rh, values) =
                     self.read_working(device, queue, &lease, region, fx, fy, tw, th)?;
                 ctx.pool_mut().release(lease);
@@ -1953,9 +2148,6 @@ impl Viewport {
                 on_tile(done, total);
             }
         }
-        // The target now holds tile content; the next interactive frame must not
-        // reuse it.
-        self.dirty = true;
         Some((w, h, out))
     }
 
@@ -1996,23 +2188,14 @@ impl Viewport {
             off_y: y as f32,
             ..Default::default()
         };
-        // **No `self.dirty = true` before the run, and that is deliberate.** The
-        // obvious worry is the idle-frame short circuit: a stationary loupe over a
-        // moved grain slider differs in nothing the plan can see, because
-        // `Params::diff` keeps grain out of the render tier — so it looks like the
-        // second call would hand back the first tile for ever. It cannot: `run`'s
-        // short circuit is guarded on `!tap`, and every tapped call is a request for
-        // a buffer rather than for a screen, so it always dispatches. Setting the
-        // flag anyway would be harmless but would also rebuild the zone-mask basis on
-        // every loupe render for nothing. Written down because it was tried the other
-        // way, and the test for it passed either way — which is what says the
-        // reasoning, not the code, was what needed fixing.
-        let (lease, region) =
-            self.run(ctx, device, queue, w, h, view, params, frame, true, false)??;
+        // Taps always dispatch and write their own target; live validity is untouched.
+        let interactive = self.interactive_zones;
+        self.interactive_zones = false;
+        let result = self.run(ctx, device, queue, w, h, view, params, frame, true, false);
+        self.interactive_zones = interactive;
+        let (lease, region) = result??;
         let read = self.read_working(device, queue, &lease, region, x, y, w, h);
         ctx.pool_mut().release(lease);
-        // The target now holds tile content, exactly as after an export.
-        self.dirty = true;
         read
     }
 
@@ -2051,7 +2234,6 @@ impl Viewport {
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send(result);
             });
-        self.dirty = true;
         Some(PendingHistogram { buffer, ready })
     }
 
@@ -2110,7 +2292,6 @@ impl Viewport {
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send(result);
             });
-        self.dirty = true;
         Some(PendingPatch {
             buffer,
             ready,

@@ -40,8 +40,74 @@ architectures, metadata and checksum. `--arm64` may be added for a local
 single-architecture build; public releases are universal. Each successful run writes a
 `.sha256` file beside the DMG.
 
-Installation is drag-to-Applications. Replacing the application upgrades it; moving it
-to Trash uninstalls it. User settings and caches are intentionally retained.
+### Auto-update (Sparkle, stable channel)
+
+macOS builds carry a [Sparkle](https://sparkle-project.org) 2 updater with a
+Mole-like surface: a silent daily background check that shows nothing when up to
+date, a badge at the right end of the title strip when an update exists, and a
+sheet offering *Update on quit* (default), *Restart now* (idle only) and *Skip
+this version*. The binding is [`sparkle-updater`
+0.1.0](https://crates.io/crates/sparkle-updater), chosen over
+`slint-ui/sparklers` because it registers as the user-driver delegate and can
+keep Sparkle's own alerts off scheduled checks. It is vendored at
+`vendor/sparkle-updater` with one local addition — `skip_current_update`, which
+answers Sparkle's pending alert with its own Skip choice so a skipped update
+that was already staged for install-on-quit is canceled. Upstream 0.1.0 cannot
+reach that reply; `vendor/sparkle-updater/LOCAL-PATCH.md` records the delta and
+the private APIs it depends on. Feed hosting is a single stable, unversioned URL
+— the `releases/latest/download/appcast.xml` alias of the release assets —
+because the URL is baked into each shipped bundle.
+
+Everything Sparkle needs is vendored and pinned in `packaging/macos/Sparkle/`:
+
+- `Sparkle.framework` — 2.9.6, from `Sparkle-2.9.6.tar.xz`, SHA-256
+  `52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192`. `./package`
+  embeds it in `Contents/Frameworks` (preserving its symlink tree with `ditto`)
+  and signs it explicitly before the outer bundle pass.
+- `sparkle-bin/` — `sign_update`, `generate_appcast`, `generate_keys` and
+  `BinaryDelta` from the same archive, used by `./package` and
+  `packaging/macos/appcast`.
+- `LICENSE` — Sparkle's MIT licence text.
+
+Sparkle 2.10 and later require macOS 12; 2.9.6 keeps the macOS 11.0 baseline.
+
+Key setup, once per maintainer:
+
+```sh
+packaging/macos/Sparkle/sparkle-bin/generate_keys   # EdDSA key into the login keychain
+```
+
+The public key it prints goes into `packaging/macos/sparkle-ed25519-pub.txt`
+(one line, no whitespace) or the `MONOPRO_SPARKLE_ED_PUBLIC_KEY` environment
+variable; the private key stays in the keychain (export it with
+`generate_keys -x` only to move machines, and pass that file as
+`MONOPRO_SPARKLE_KEY_FILE` on machines where it is imported). `--signed` fails
+closed when no public key is available. Local ad-hoc packages without a key
+embed `SUEnableAutomaticChecks=false` and never check; the Settings toggle can
+still enable a deliberate local test.
+
+Publishing a release:
+
+1. `./package --signed` produces the DMG (for humans) and the notarized ZIP of
+   the signed app (the enclosure Sparkle downloads), plus
+   `monopro-<version>-macos.zip.ed.sig` — the EdDSA signature over the ZIP
+   bytes from `sign_update`.
+2. Publish both assets on the GitHub release, together with release notes as a
+   plain-text file named after the ZIP (`monopro-<version>-macos.txt`).
+3. Extend the feed with `packaging/macos/appcast <archives-dir>
+   [--ed-key-file <key>]`: a staging directory holding the new ZIP, its notes
+   file, and the previous release's `appcast.xml`. The tool embeds the notes
+   into each item, signs enclosures, and prunes versions older than the newest;
+   upload the resulting `appcast.xml` as a release asset so the stable alias
+   always serves the newest feed. **Every release must be generated with the
+   same key and embedded notes** — an item's notes are only embedded when its
+   entry is first written.
+
+Installation remains drag-to-Applications from the DMG. Sparkle updates replace
+the running application in place after a clean quit; a staged installer never
+touches a live session, and a relaunch Sparkle asks for while an export writes
+is postponed until the export drains. User settings and caches are intentionally
+retained.
 
 ## Windows
 

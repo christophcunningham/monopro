@@ -1,5 +1,8 @@
 # Rebuildable output and local scratch files.
 /target/
+# The vendored crate has its own workspace table, so `cargo` inside it writes a
+# second target tree here instead of the root's.
+/vendor/sparkle-updater/target/
 /dist/
 /tmp/
 .DS_Store

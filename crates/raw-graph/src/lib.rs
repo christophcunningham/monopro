@@ -18,14 +18,15 @@
 //!   backward (roi_in)    sink -> source   what region does each node need?
 //! ```
 //!
-//! Forward is identity for every node that exists today, because nothing changes
-//! scale yet. Backward is where the work is: each node converts its output
+//! Forward resolves each grid, including the reduced Contrast Mask branch.
+//! Backward converts each node's output
 //! request into a request on each input, expanding by its reach, clamping to the
 //! image, and **unioning** with whatever other consumers already asked for.
 //!
 //! The union is the part a linear chain never needed. Contrast Mask consumes the
-//! log signal twice — once directly, once blurred and therefore wider — and the
-//! shared producer has to satisfy both.
+//! log signal through direct and blurred branches for small kernels. Wide masks
+//! instead read the source on a separate bounded grid, so their aprons do not
+//! inflate the full-resolution negative.
 
 pub mod node;
 pub mod roi;
@@ -237,12 +238,17 @@ impl Graph {
 
         let root = (Roi::grid_for(source, view.scale), view.scale);
 
-        // Forward: what grid does each node produce on? Identity throughout
-        // today; the pass exists so a scale-changing node has somewhere to live.
+        // Forward: what grid does each node produce on?
         let mut grids: Vec<((u32, u32), f32)> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let upstream = node.inputs.first().map(|p| grids[p.0]);
-            grids.push(node.kind.out_grid(upstream, root));
+            let node_root = if matches!(node.kind, NodeKind::MaskInput { .. }) {
+                let scale = view.scale.min(1.0);
+                (Roi::grid_for(source, scale), scale)
+            } else {
+                root
+            };
+            grids.push(node.kind.out_grid(upstream, node_root));
         }
 
         // The sink's request. Split the fractional pan into an integral region
@@ -305,18 +311,7 @@ impl Graph {
             };
             for (k, &p) in node.inputs.iter().enumerate() {
                 let (pfull, pscale) = grids[p.0];
-                debug_assert_eq!(
-                    (pfull, pscale),
-                    (out.full, out.scale),
-                    "a node that changes grid must rescale the request here"
-                );
-                let want = Roi {
-                    full: pfull,
-                    scale: pscale,
-                    ..out
-                }
-                .expand(node.kind.apron(k, out.scale))
-                .clamp_to_full();
+                let want = input_region(node.kind, k, out, pfull, pscale);
                 req[p.0] = Some(match req[p.0] {
                     Some(existing) => existing.union(want),
                     None => want,
@@ -370,13 +365,7 @@ impl Graph {
                     _ => s.out,
                 };
                 s.inputs.iter().enumerate().all(|(k, (_, got))| {
-                    let needed = Roi {
-                        full: got.full,
-                        scale: got.scale,
-                        ..out
-                    }
-                    .expand(s.kind.apron(k, out.scale))
-                    .clamp_to_full();
+                    let needed = input_region(s.kind, k, out, got.full, got.scale);
                     got.contains(needed)
                 })
             }),
@@ -387,6 +376,17 @@ impl Graph {
     }
 }
 
+fn input_region(kind: NodeKind, index: usize, out: Roi, full: (u32, u32), scale: f32) -> Roi {
+    let mut want = out
+        .expand(kind.apron(index, out.scale))
+        .on_grid(full, scale);
+    if matches!(kind, NodeKind::ContrastMask { .. }) && index == 1 && scale != out.scale {
+        // Bilinear reconstruction reads the neighbouring reduced-grid texels.
+        want = want.expand(Apron::uniform(1));
+    }
+    want.clamp_to_full()
+}
+
 /// Turn parameters into a pipeline. A module that is off is not emitted at all,
 /// rather than emitted and skipped.
 ///
@@ -395,6 +395,17 @@ impl Graph {
 /// Two modules read it now. **Do not widen this argument again** — a third would be
 /// the moment to reconsider the shape instead.
 pub fn build(params: &Params, source_dims: (u32, u32)) -> Graph {
+    build_with_mask_source(params, source_dims, true)
+}
+
+/// Small fitted previews can share the negative's already sampled log signal.
+/// Larger views must use the independent mask source to avoid expanded buffers.
+/// Allocation preflight remains required for either choice.
+pub fn build_with_mask_source(
+    params: &Params,
+    source_dims: (u32, u32),
+    independent: bool,
+) -> Graph {
     let mut g = Graph::new();
     let mut n = g.add(NodeKind::Input, &[]);
     n = g.add(NodeKind::Exposure, &[n]);
@@ -407,20 +418,24 @@ pub fn build(params: &Params, source_dims: (u32, u32)) -> Graph {
     //                     └─ blur.x ─► blur.y ────►
     let cm = params.contrast_mask;
     if cm.is_active() {
-        // 3 sigma: past that a Gaussian contributes under 0.3% and the apron pays for
-        // nothing. Costs measured at the top of SPACER_RANGE are in `docs/decisions.md`;
-        // if the mask ever feels slow, a downsampled blur through `out_grid` is the
-        // first thing to try.
+        // Keep the Gaussian's physical radius. Wide masks sample exposed log
+        // luminance directly on a bounded grid, without allocating the expanded
+        // negative first. Small masks retain the ordinary shared-log branch.
         let sigma = cm.spacer_px(source_dims);
         let support = 3.0 * sigma;
         let log = g.add(NodeKind::Log2, &[n]);
+        let mask_input = if independent && sigma > 16.0 {
+            g.add(NodeKind::MaskInput { sigma }, &[])
+        } else {
+            log
+        };
         let bx = g.add(
             NodeKind::Blur {
                 axis: Axis::X,
                 sigma,
                 support,
             },
-            &[log],
+            &[mask_input],
         );
         let by = g.add(
             NodeKind::Blur {
@@ -491,6 +506,63 @@ pub fn build(params: &Params, source_dims: (u32, u32)) -> Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_mask_blurs_a_reduced_grid_without_reducing_the_negative() {
+        let mut p = Params::default();
+        p.contrast_mask.enabled = true;
+        p.contrast_mask.spacer = 5.0;
+        let source = (11648, 8736);
+        let plan = build(&p, source)
+            .resolve(source, view(1.0, 4000.0, 3000.0, 2560, 1600))
+            .unwrap();
+        let join = plan
+            .steps
+            .iter()
+            .find(|s| matches!(s.kind, NodeKind::ContrastMask { .. }))
+            .unwrap();
+        assert_eq!(join.out.scale, 1.0);
+        assert_eq!(join.inputs[0].1.scale, 1.0);
+        assert_eq!(join.inputs[1].1.scale, 1.0 / 32.0);
+        for blur in plan
+            .steps
+            .iter()
+            .filter(|s| matches!(s.kind, NodeKind::Blur { .. }))
+        {
+            assert!(
+                blur.out.area() < 100_000,
+                "wide blur still runs at viewport resolution"
+            );
+        }
+        let preview = build(&p, source)
+            .resolve(source, view(0.183, 0.0, 0.0, 2560, 1600))
+            .unwrap();
+        assert!(
+            preview.steps.iter().all(|s| s.out.scale == 0.183),
+            "fit preview must retain its already-filtered boundary samples"
+        );
+    }
+
+    #[test]
+    fn a_reduced_mask_resolves_small_tiles_crops_and_fractional_pans() {
+        let mut p = Params::default();
+        p.contrast_mask.enabled = true;
+        p.contrast_mask.spacer = 5.0;
+        let source = (11649, 8737);
+        for scale in [0.07, 0.183, 1.0, 2.0] {
+            for (x, y) in [(0.0, 0.0), (5001.25, 3701.75), (11648.0, 8736.0)] {
+                let mut v = view(scale, x, y, 1, 1);
+                v.crop = Some((200, 200, 10000, 7000));
+                let plan = build(&p, source).resolve(source, v).unwrap();
+                for step in plan.steps.iter().filter(|s| s.kind != NodeKind::Display) {
+                    // A view wholly outside the crop may request an empty region.
+                    assert!(step.out.x >= 0 && step.out.y >= 0);
+                    assert!(step.out.right() <= step.out.full.0 as i32);
+                    assert!(step.out.bottom() <= step.out.full.1 as i32);
+                }
+            }
+        }
+    }
 
     /// Frame size for `build`. Only Contrast Mask reads it, and only to turn its
     /// percentage spacer into pixels — the diagonal is exactly 1000, so 1% is

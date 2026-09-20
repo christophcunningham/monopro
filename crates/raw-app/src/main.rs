@@ -57,6 +57,11 @@ mod snapshot;
 mod tabs;
 mod theme;
 mod toning;
+#[cfg(target_os = "macos")]
+mod updater;
+#[cfg(not(target_os = "macos"))]
+#[path = "updater_stub.rs"]
+mod updater;
 mod widgets;
 
 use std::path::{Path, PathBuf};
@@ -563,6 +568,13 @@ struct App {
     /// without one, or a muda that refuses, runs exactly as the app did before.
     menus: menu::Menus,
     menus_installed: bool,
+    /// The macOS auto-updater, installed on the first frame next to the menus —
+    /// the earliest point at which the AppKit pieces it drive exist. `None`
+    /// until then, and inert off macOS and outside a bundle; see `updater`.
+    updates: Option<updater::Updates>,
+    /// The update sheet (badge click, menu route, About button). View state, not
+    /// a preference — nothing here is written to `settings.toml`.
+    update_sheet_open: bool,
     /// A one-line message from a key whose feature is not built yet. Shown in the
     /// footer so an unbuilt binding reports itself rather than doing nothing.
     pending_note: Option<String>,
@@ -605,6 +617,8 @@ impl App {
             cache_bytes: None,
             menus: menu::Menus::default(),
             menus_installed: false,
+            updates: None,
+            update_sheet_open: false,
             tabs: Tabs::new(),
             lightbox: lightbox::Lightbox::new(),
             queue: decode::Queue::new(decode::WORKERS),
@@ -1173,6 +1187,7 @@ impl App {
         if let Some(tab) = self.tabs.by_id_mut(id) {
             tab.opening_path = None;
             tab.image = Some(image);
+            tab.scene_gen += 1;
             tab.luma = None; // forces a re-derive against the new scene
             tab.luma_params = None;
             tab.view = tabs::View::default();
@@ -1204,6 +1219,7 @@ impl App {
                     let redecode = decoded.opts != tab.params.decode;
                     self.cache.put_decoded(key, &decoded);
                     tab.opening_path = None;
+                    tab.scene_gen += 1;
                     tab.image = Some(Image {
                         sensor,
                         decoded,
@@ -1251,6 +1267,11 @@ impl App {
             let _ = worker.join();
         }
         self.export_rx = None;
+        // The machine is idle again as far as an install is concerned. If Sparkle
+        // postponed a relaunch for this export, it resumes here — see `updater`.
+        if let Some(updates) = &mut self.updates {
+            updates.export_settled();
+        }
         let (status, error) = match msg {
             Ok(path) => (format!("exported {}", file_name(&path)), None),
             Err(e) => (
@@ -1565,6 +1586,12 @@ impl App {
         let (tx, rx) = channel();
         self.export_rx = Some(rx);
         self.export_owner = Some(tab.id);
+        // An update must not install (or relaunch) over a file still being
+        // written. The badge's install buttons stand down and Sparkle's own
+        // relaunch defers until `poll_export` settles this — see `updater`.
+        if let Some(updates) = &self.updates {
+            updates.set_busy(true);
+        }
         let ctx = ctx.clone();
         self.export_thread = Some(std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1805,7 +1832,11 @@ impl App {
         let Some(render) = tab.render.as_mut() else {
             return;
         };
-        if render.viewport.render_into(
+        // This one-shot save already performs a blocking GPU readback and may
+        // immediately close the tab. Finish its zone work rather than losing the
+        // thumbnail when there will be no later frame to retry it.
+        render.viewport.set_interactive_zones(false);
+        let submitted = render.viewport.render_into(
             &mut render.edited_tile,
             gpu,
             &rs.device,
@@ -1815,7 +1846,9 @@ impl App {
             view,
             &params,
             &frame,
-        ) && let Some((w, h, rgba)) = render.edited_tile.read_back(&rs.device, &rs.queue)
+        );
+        render.viewport.set_interactive_zones(true);
+        if submitted && let Some((w, h, rgba)) = render.edited_tile.read_back(&rs.device, &rs.queue)
         {
             lightbox::store_edited_tile(&path, &stamp, w, h, &rgba);
         }
@@ -1881,11 +1914,13 @@ fn warm_up(tab: &mut Tab, rs: &egui_wgpu::RenderState) {
         return;
     }
     let Some(luma) = tab.luma.clone() else { return };
+    let mut viewport = Viewport::new(&rs.device, &rs.queue, &luma);
+    viewport.set_interactive_zones(true);
     tab.render = Some(Render {
         cells: Vec::new(),
         edited_tile: Default::default(),
         snapshot: Default::default(),
-        viewport: Viewport::new(&rs.device, &rs.queue, &luma),
+        viewport,
         samples: Default::default(),
         histogram: Default::default(),
         texture: None,
@@ -1977,6 +2012,15 @@ impl App {
         };
         let params = tab.params.effective();
         let frame = tab.stored_frame();
+        if tab
+            .render
+            .as_mut()
+            .is_some_and(|r| !r.viewport.zones_ready(&params))
+        {
+            self.capture_requested = Some(owner);
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
         let thumb = if tab.has_current_luma() {
             self.gpu
                 .as_mut()
@@ -2949,7 +2993,7 @@ impl eframe::App for App {
         }
         // Sampling is shared by every panel, including Toning and the Inspector.
         if let Some(tab) = self.tabs.active_mut() {
-            refresh_tab_histogram(tab);
+            refresh_tab_mapping(tab);
         }
         let ctx = ui.ctx().clone();
 
@@ -3014,6 +3058,23 @@ impl eframe::App for App {
             self.menus_installed = true;
             self.menus = menu::Menus::install("monopro");
         }
+        // The updater follows the same rule as the menus above: first frame, when
+        // the AppKit pieces it drives exist. It runs silent scheduled checks on
+        // the stable feed and turns into a badge when it finds something; see
+        // `updater`. A failed install is not fatal — the app updates by hand.
+        if self.updates.is_none() {
+            self.updates = Some(updater::Updates::install(&self.settings, &ctx));
+        }
+        // Sparkle's events drain once per frame, next to the export worker's.
+        // A one-line note goes to the footer; the badge and the sheet state
+        // update inside `updates`.
+        let update_note = self
+            .updates
+            .as_mut()
+            .and_then(|updates| updates.poll(&mut self.settings));
+        if let Some(note) = update_note {
+            self.pending_note = Some(note);
+        }
         let mut actions = hotkeys::pressed(&ctx, modal, self.settings.hotkeys_enabled);
         // **A chord the menu owns must not also fire from the keyboard.** On macOS
         // AppKit consumes it before egui sees it, so this normally removes nothing —
@@ -3039,6 +3100,14 @@ impl eframe::App for App {
                     }
                     self.lightbox.reveal_pane(p);
                 }
+                // The manual check opens the sheet with it, so the result —
+                // including "up to date" and any failure — has somewhere to land.
+                menu::Command::CheckForUpdates => {
+                    if let Some(updates) = &mut self.updates {
+                        updates.check_now(&mut self.settings);
+                        self.update_sheet_open = true;
+                    }
+                }
             }
         }
         // The HUD is modal while it is visible: shortcuts are being read, not used.
@@ -3053,6 +3122,9 @@ impl eframe::App for App {
                 self.hotkey_hud = false;
             }
         }
+        // After the HUD has discarded commands, but before any editor is drawn:
+        // menu Undo/Redo belongs to focused text just like keyboard Undo/Redo.
+        hotkeys::route_text_history(&ctx, &mut actions);
         // Any keypress clears the last "not built yet" note, so it reads as a reply
         // to what was just pressed rather than lingering over unrelated work.
         if !actions.is_empty() {
@@ -3540,7 +3612,27 @@ impl eframe::App for App {
                         .map(|img| exposure_line(&img.sensor.meta))
                         .unwrap_or_default()
                 };
-                widgets::title_strip(ui, platform::strip_title(self.lightbox.active), &exposure);
+                // **The right end of the strip is the update badge's slot.** It
+                // exists only while the updater has something to say, and the
+                // centre readout stays centred on the window whether or not it
+                // is up. A click opens the update sheet.
+                let badge = self
+                    .updates
+                    .as_ref()
+                    .and_then(|updates| updates.badge())
+                    .map(|b| widgets::UpdateBadge {
+                        text: b.text,
+                        detail: b.detail,
+                        failed: b.failed,
+                    });
+                if widgets::title_strip(
+                    ui,
+                    platform::strip_title(self.lightbox.active),
+                    &exposure,
+                    badge.as_ref(),
+                ) {
+                    self.update_sheet_open = true;
+                }
             });
 
         // **The tab strip is Develop's**, so it goes with the rest of it. A strip of
@@ -4051,6 +4143,7 @@ impl eframe::App for App {
         }
 
         self.quit_sheet(&ctx);
+        self.update_sheet(&ctx);
         let developed_previews_before = self.settings.lightbox_xmp_thumbnails;
         if self.settings_open {
             self.settings_window(&ctx);
@@ -4505,10 +4598,18 @@ impl App {
         // The distribution behind the ramp is the print's, which lives on the viewport
         // because that is where the proxy it is computed from lives. Copied out before
         // the borrows below, for the reason the curve editor's is.
-        let hist: Vec<f32> = tab
+        let zone_params = tab.params.effective();
+        let hist = tab
             .render
-            .as_ref()
-            .map(|r| r.viewport.zone_histogram().to_vec())
+            .as_mut()
+            .and_then(|r| {
+                let ready = r.viewport.request_zone_histogram(&zone_params);
+                if ready.is_none() {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(16));
+                }
+                ready
+            })
             .unwrap_or_default();
 
         let (next, act) = crate::toning::body(
@@ -4596,10 +4697,18 @@ impl App {
         // The ruler's ghost is the pre-D&B distribution, which lives on the viewport
         // because that is where the proxy it is computed from lives. Copied out
         // before the borrows below for the reason the curve editor's is.
-        let zone_hist: Vec<f32> = tab
+        let zone_params = tab.params.effective();
+        let zone_hist = tab
             .render
-            .as_ref()
-            .map(|r| r.viewport.zone_histogram().to_vec())
+            .as_mut()
+            .and_then(|r| {
+                let ready = r.viewport.request_zone_histogram(&zone_params);
+                if ready.is_none() {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(16));
+                }
+                ready
+            })
             .unwrap_or_default();
 
         let mut select: Option<Option<usize>> = None;
@@ -5031,7 +5140,7 @@ impl App {
                 ui.add_sized(
                     [52.0, 16.0],
                     egui::DragValue::new(&mut inst.opacity)
-                        .speed(0.005)
+                        .speed(0.01)
                         .range(0.0..=1.0)
                         .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
                         .custom_parser(|t| {
@@ -6102,11 +6211,17 @@ impl App {
             tab.params = Params::default();
         }
 
-        refresh_tab_histogram(tab);
+        refresh_tab_mapping(tab);
         widgets::Plain::new("TONAL DISTRIBUTION")
             .open_on_start(true)
             .show(ui, |ui| {
                 if tab.luma.is_some() {
+                    if tab.histogram.mode == histogram::Mode::Rgb {
+                        let shown = tab.render_params();
+                        if let Some(img) = &tab.image {
+                            tab.histogram.refresh_rgb(&img.decoded.scene, &shown, tab.scene_gen);
+                        }
+                    }
                     let h = &tab.histogram;
                     let resp = match h.mode {
                         histogram::Mode::Tonal => {
@@ -6459,9 +6574,6 @@ impl App {
         tab.curve_active = tab
             .curve_active
             .min(tab.params.curve.instances.len().saturating_sub(1));
-        let curve_ghost = tab
-            .histogram
-            .curve_input(&tab.params.curve, tab.curve_active);
         let ev_span = raw_core::curve::HI_EV - raw_core::curve::LO_EV;
         let resettable = tab
             .params
@@ -6484,6 +6596,8 @@ impl App {
             .resettable(resettable)
             .switch(tab.params.curve.enabled)
             .show(ui, |ui| {
+                refresh_tab_curve_samples(tab);
+                let curve_ghost = tab.histogram.curve_input(&tab.params.curve, tab.curve_active);
                 ui.horizontal(|ui| {
                     theme::tracked_at(ui, "INSTANCES", theme::DIM, theme::size::SECTION - 2.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -6642,7 +6756,7 @@ impl App {
                             ui.add_sized(
                                 [52.0, 16.0],
                                 egui::DragValue::new(&mut instance.opacity)
-                                    .speed(0.005)
+                                    .speed(0.01)
                                     .range(0.0..=1.0)
                                     .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
                                     .custom_parser(|t| {
@@ -8847,7 +8961,7 @@ impl App {
                 pan,
             };
             if cell.key.as_ref() != Some(&key) {
-                render.viewport.render_into(
+                let submitted = render.viewport.render_into(
                     &mut cell.gpu,
                     gpu,
                     &rs.device,
@@ -8858,7 +8972,12 @@ impl App {
                     look,
                     &frame,
                 );
-                cell.key = Some(key);
+                if submitted || cell.gpu.render_error().is_some() {
+                    cell.key = Some(key);
+                } else {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(16));
+                }
             }
             if (cell.gpu.changed || cell.texture.is_none())
                 && let Some(tv) = cell.gpu.view().cloned()
@@ -8873,7 +8992,15 @@ impl App {
                     wgpu::FilterMode::Nearest,
                 ));
             }
-            if let Some(id) = cell.texture {
+            if let Some(message) = cell.gpu.render_error() {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    message,
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::from_rgb(220, 120, 120),
+                );
+            } else if let Some(id) = cell.texture {
                 let uv = cell.gpu.uv_rect();
                 ui.painter().image(
                     id,
@@ -9256,6 +9383,39 @@ impl App {
             &render_params,
             &frame,
         );
+
+        if vp.zone_render_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            if let Some(id) = render.texture {
+                let uv = vp.uv_rect();
+                ui.painter().image(
+                    id,
+                    rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(uv[0], uv[1])),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Preparing tonal masks…",
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::GRAY,
+                );
+            }
+            return;
+        }
+
+        if let Some(message) = vp.render_error() {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                message,
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_rgb(220, 120, 120),
+            );
+            return;
+        }
 
         if vp.target_changed || render.texture.is_none() {
             let view = vp.target_view().expect("rendered").clone();
@@ -11559,33 +11719,17 @@ fn inspector_section(tab: &mut Tab, ui: &mut egui::Ui, env: InfoEnv, icons: &ico
     });
 }
 
-fn refresh_tab_histogram(tab: &mut Tab) {
-    // `render_params`, not `params`: the histogram describes what is on screen,
-    // so it has to follow module bypass and preview-original the way the
-    // viewport does. Reading `params` here made it describe an image nobody was
-    // looking at the moment either was used.
-    //
-    // **Not while a crop handle is held.** The bins are budgeted, so recomputing
-    // them is cheap rather than free — but it is a full pass on every frame of a
-    // drag, for a readout nobody is looking at while they are looking at the
-    // picture. It catches up the moment the handle is let go, which is when the
-    // question "what did that do to my highlights" is actually asked.
-    let dragging_crop = matches!(
-        tab.mode,
-        tabs::Mode::Crop {
-            grabbed: Some(_),
-            ..
-        } | tabs::Mode::Keystone {
-            grabbed: Some(_),
-            ..
-        }
-    );
-    if let (Some(luma), Some(img), Some(frame)) = (&tab.luma, &tab.image, tab.frame())
-        && !dragging_crop
-    {
-        let shown = tab.render_params();
+fn refresh_tab_mapping(tab: &mut Tab) {
+    if tab.luma.is_some() {
+        tab.histogram.refresh_mapping(&tab.render_params());
+    }
+}
+
+fn refresh_tab_curve_samples(tab: &mut Tab) {
+    let shown = tab.render_params();
+    if let (Some(luma), Some(frame)) = (&tab.luma, tab.frame()) {
         tab.histogram
-            .refresh(luma, &img.decoded.scene, &shown, tab.luma_gen, &frame);
+            .refresh_curve_samples(luma, &shown, tab.luma_gen, &frame);
     }
 }
 
@@ -12193,6 +12337,158 @@ impl App {
         }
     }
 
+    /// The update sheet, reached from the badge, the menu route or Settings → About.
+    ///
+    /// **Three choices, in order of caution.** *Update on quit* is the default and
+    /// the safest — the staged installer completes after a clean quit, never under
+    /// a live session. *Restart now* runs Sparkle's user-initiated install and is
+    /// offered only when the update is staged and the machine idle. *Skip this
+    /// version* is remembered and shown in Settings → About until the feed moves
+    /// past it.
+    ///
+    /// While an export writes, or the quit confirmation is still unanswered, both
+    /// install routes stand down: an install must never race a file being written
+    /// or a quit that has not been resolved yet. Skipping stays available — it
+    /// writes nothing but preferences.
+    fn update_sheet(&mut self, ctx: &egui::Context) {
+        if !self.update_sheet_open {
+            return;
+        }
+        // The sheet has a reason to exist while the badge is up or there is a
+        // status to report ("up to date", a failure). Otherwise it closes itself.
+        let Some(updates) = &self.updates else {
+            self.update_sheet_open = false;
+            return;
+        };
+        if !updates.sheet_ready() {
+            self.update_sheet_open = false;
+            return;
+        }
+        let (version_line, notes, date, status, failed) = {
+            let u = self.updates.as_ref().expect("checked above");
+            (
+                u.sheet_version_line(),
+                u.sheet_notes().to_owned(),
+                u.sheet_date().map(str::to_owned),
+                u.sheet_status().map(str::to_owned),
+                u.badge().is_some_and(|b| b.failed),
+            )
+        };
+        // **Busy is the export thread or an unresolved quit confirmation.** A
+        // sidecar write needs no gate here: it is synchronous, settled before the
+        // sheet can be interacted with. See `guard_quit` for the quit-time pair.
+        let busy = self.export_rx.is_some() || self.confirm_quit.is_some();
+        let restart_ready = self
+            .updates
+            .as_ref()
+            .is_some_and(|u| u.restart_now_ready());
+        let skipped = updater::Updates::skipped_version(&self.settings).map(str::to_owned);
+
+        let mut close = false;
+        let mut update_on_quit = false;
+        let mut restart_now = false;
+        let mut skip = false;
+        let response = egui::Modal::new(egui::Id::new("update-sheet")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            theme::tracked(ui, "SOFTWARE UPDATE", theme::AMBER);
+            ui.add_space(6.0);
+            ui.label(theme::readout(version_line.clone()));
+            if let Some(d) = &date {
+                ui.label(theme::caption(d.clone()));
+            }
+            if !notes.is_empty() {
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.label(theme::label(notes.clone()));
+                    });
+            }
+            if let Some(line) = &status {
+                ui.add_space(6.0);
+                ui.label(if failed {
+                    theme::caption(line.clone()).color(theme::RUBY)
+                } else {
+                    theme::caption(line.clone())
+                });
+            }
+            if busy {
+                ui.add_space(6.0);
+                ui.label(theme::caption(
+                    "Wait for the export to finish — and answer the quit prompt if one is \
+                     open — before installing.",
+                ));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                // The default choice, first and safest. Installs after a clean
+                // quit — Sparkle's staged installer does the swap at termination.
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Update on quit"))
+                    .clicked()
+                {
+                    update_on_quit = true;
+                }
+                if ui
+                    .add_enabled(
+                        restart_ready && !busy,
+                        egui::Button::new("Restart now"),
+                    )
+                    .on_disabled_hover_text(if busy {
+                        "an export is still being written"
+                    } else {
+                        "still downloading — it can restart once it is staged"
+                    })
+                    .clicked()
+                {
+                    restart_now = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Skip this version").clicked() {
+                        skip = true;
+                    }
+                });
+            });
+            if let Some(v) = &skipped {
+                ui.add_space(4.0);
+                ui.label(theme::caption(format!("skipping monopro {v}")));
+            }
+        });
+        if response.should_close() {
+            close = true;
+        }
+
+        let mut note = None;
+        if update_on_quit {
+            if let Some(updates) = &mut self.updates {
+                updates.choose_update_on_quit();
+                note = updates.sheet_status().map(str::to_owned);
+            }
+            close = true;
+        }
+        if restart_now {
+            close = true;
+            if let Some(updates) = &mut self.updates
+                && let Some(why) = updates.check_now(&mut self.settings)
+            {
+                note = Some(why);
+            }
+        }
+        if skip {
+            if let Some(updates) = &mut self.updates {
+                updates.skip_this_version(&mut self.settings);
+                note = updates.sheet_status().map(str::to_owned);
+            }
+            close = true;
+        }
+        if let Some(note) = note {
+            self.pending_note = Some(note);
+        }
+        if close {
+            self.update_sheet_open = false;
+        }
+    }
+
     /// The Settings window.
     ///
     /// **A real OS window**, not an egui window inside the frame. It was the latter
@@ -12306,6 +12602,8 @@ impl App {
         let mut cancel_reset = false;
         let mut reset_all = false;
         let mut reveal_data = false;
+        let mut check_updates_now = false;
+        let mut stop_skipping = false;
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("monopro-settings"),
@@ -13166,8 +13464,44 @@ impl App {
                 if sheet.shows(
                     ui,
                     settings::Section::About,
-                    "ACKNOWLEDGMENTS credits licences licenses typeface fonts jetbrains icons phosphor lucide",
+                    "ACKNOWLEDGMENTS credits licences licenses typeface fonts jetbrains icons phosphor lucide software update",
                 ) {
+                    // **Software update lives in About** (macOS): the auto-check
+                    // preference with its toggle, the manual check, and the skip
+                    // the badge is honouring. Every persisted key has working UI;
+                    // these two keys are that pair's UI.
+                    if cfg!(target_os = "macos") {
+                        settings::heading(ui, "SOFTWARE UPDATE");
+                        settings::check(
+                            ui,
+                            &mut s.check_for_updates,
+                            d.check_for_updates,
+                            "Check for updates daily",
+                        );
+                        // The toggle's whole effect: Sparkle re-reads it the moment
+                        // the settings change. Idempotent, so it may run per frame.
+                        if s.check_for_updates != before.check_for_updates
+                            && let Some(updates) = &self.updates
+                        {
+                            updates.set_auto_check(s.check_for_updates);
+                        }
+                        let skipped = updater::Updates::skipped_version(s).map(str::to_owned);
+                        settings::note(ui, match &skipped {
+                            Some(v) => format!("skipping monopro {v}"),
+                            None => "The check is silent; an update announces itself \
+                                as a badge in the title strip."
+                                .to_owned(),
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Check for Updates…").clicked() {
+                                check_updates_now = true;
+                            }
+                            if skipped.is_some() && ui.button("Stop skipping").clicked() {
+                                stop_skipping = true;
+                            }
+                        });
+                        settings::rule(ui);
+                    }
                     settings::heading(ui, "ACKNOWLEDGMENTS");
                     for line in ACKNOWLEDGMENTS {
                         ui.label(egui::RichText::new(*line).size(theme::size::CAPTION));
@@ -13212,6 +13546,24 @@ impl App {
             && let Err(e) = platform::reveal(&dir)
         {
             self.status = format!("could not show application data: {e}");
+        }
+        // The manual check and the un-skip, acted on out here for the same reason
+        // `reveal_data` is: the panel body holds the settings borrow, and both
+        // routes write through the updater (which persists its own skip copy).
+        // The sheet opens with the check so its result has somewhere to land.
+        if check_updates_now {
+            if let Some(updates) = &mut self.updates
+                && let Some(why) = updates.check_now(&mut self.settings)
+            {
+                self.pending_note = Some(why);
+            }
+            self.update_sheet_open = true;
+        }
+        if stop_skipping
+            && let Some(updates) = &mut self.updates
+        {
+            updates.stop_skipping(&mut self.settings);
+            self.pending_note = Some("stopped skipping — the next check offers the feed again".into());
         }
         // Acted on out here, because the panel that asked was holding the borrow the
         // purge needs — and because deleting ten thousand files in the middle of laying

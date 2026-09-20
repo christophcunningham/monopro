@@ -6,6 +6,43 @@ use raw_core::{Curve, ZoneMask};
 
 use crate::theme::{self, DIM, RUBY};
 
+/// Numeric fields must clamp keyboard edits too: egui 0.35 only clamps the old
+/// value before applying an arrow step, allowing a one-frame out-of-range value.
+pub fn bounded_number<Num: egui::emath::Numeric>(
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+    speed: f64,
+) -> egui::DragValue<'_> {
+    let lo = range.start().to_f64();
+    let hi = range.end().to_f64();
+    let field = egui::DragValue::from_get_set(move |new| {
+        if let Some(new) = new {
+            *value = Num::from_f64(new.clamp(lo, hi));
+        }
+        value.to_f64()
+    })
+    .range(lo..=hi)
+    .speed(speed);
+    if Num::INTEGRAL {
+        field.fixed_decimals(0)
+    } else {
+        field
+    }
+}
+
+fn slider_number(
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    decimals: usize,
+) -> egui::DragValue<'_> {
+    let unit = 10.0_f64.powf(-(decimals as f64));
+    // Keep the established drag sensitivity, but use whole displayed units so
+    // every arrow press survives rounding, including zero-decimal controls.
+    let nominal = f64::from(*range.end() - *range.start()) / 300.0;
+    let speed = (nominal / unit).round().max(1.0) * unit;
+    bounded_number(value, range, speed).fixed_decimals(decimals)
+}
+
 /// One develop module: a hairline container, a header of dot + name + reset, and a
 /// body that collapses away.
 ///
@@ -531,7 +568,6 @@ impl<'a> Row<'a> {
             // middle of it. What it must not do is *overflow* the cell, which is what
             // `VALUE_W` is measured to prevent — an eight-character readout in a column
             // sized for six moved that row's track and nothing else's.
-            let speed = ((hi - lo) / 300.0).max(1e-4);
             // The number and its label are one typographic level. Scope the style
             // to this DragValue so non-slider number fields elsewhere keep their
             // own scale.
@@ -543,11 +579,7 @@ impl<'a> Row<'a> {
                 ui.style_mut().drag_value_text_style = egui::TextStyle::Button;
                 ui.add_sized(
                     [Self::VALUE_W, h],
-                    egui::DragValue::new(self.value)
-                        .speed(speed)
-                        .range(lo..=hi)
-                        .fixed_decimals(self.decimals)
-                        .suffix(self.suffix),
+                    slider_number(self.value, lo..=hi, self.decimals).suffix(self.suffix),
                 );
             });
 
@@ -1608,6 +1640,20 @@ pub fn histogram(
     response
 }
 
+/// The update badge, as the title strip draws it at its right end.
+///
+/// A pill with the offered version in it — Mole's manner: the update announces
+/// itself in the chrome and waits, it does not open a window over your work.
+pub struct UpdateBadge {
+    /// The pill's text, e.g. `0.2.1 ready`.
+    pub text: String,
+    /// The one-line status behind it, shown as the hover tooltip.
+    pub detail: String,
+    /// The last attempt failed. The pill borrows ruby, which elsewhere marks
+    /// states that want attention, rather than the amber of a waiting offer.
+    pub failed: bool,
+}
+
 /// Paint the window's app strip on macOS and its mode/status strip elsewhere.
 ///
 /// The window is created with `fullsize_content_view` and a hidden titlebar so the
@@ -1627,7 +1673,17 @@ pub fn histogram(
 /// The undo/redo depth used to sit at the right of this strip. It came out because
 /// it is *state*, not identity — a number that changes as you work and tells you
 /// nothing about the image — and a title bar is the wrong place to watch it.
-pub fn title_strip(ui: &mut egui::Ui, title: &str, centre: &str) {
+///
+/// `update` is the badge that occupies the strip's right end when the updater has
+/// something to say. The centre readout stays centred on the *window* whether or
+/// not the badge is up; a badge appearing never displaces it. Returns whether the
+/// badge was clicked this frame.
+pub fn title_strip(
+    ui: &mut egui::Ui,
+    title: &str,
+    centre: &str,
+    update: Option<&UpdateBadge>,
+) -> bool {
     let h = crate::theme::TITLE_STRIP;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -1651,6 +1707,43 @@ pub fn title_strip(ui: &mut egui::Ui, title: &str, centre: &str) {
             RUBY,
         );
     }
+
+    let Some(badge) = update else {
+        return false;
+    };
+    // The pill is sized to its own text and pinned to the right end, clear of the
+    // edge by the same inset the strip uses at the top. Click opens the update
+    // sheet — the only interaction the pill has.
+    let font = egui::FontId::proportional(crate::theme::size::CAPTION);
+    let galley = painter.layout_no_wrap(badge.text.clone(), font.clone(), Color32::WHITE);
+    let pad_x = 8.0;
+    let pill = Rect::from_center_size(
+        pos2(
+            rect.right() - crate::theme::TITLE_INSET.min(16.0) - galley.size().x / 2.0 - pad_x,
+            rect.center().y,
+        ),
+        vec2(galley.size().x + pad_x * 2.0, h - 8.0),
+    );
+    let clicked = ui
+        .interact(pill, ui.id().with("update-badge"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(if badge.detail.is_empty() {
+            "An update is available — click for details".to_owned()
+        } else {
+            badge.detail.clone()
+        })
+        .clicked();
+    // Amber is the strip's "there is something waiting" ink — the loupe's
+    // argument: ruby would put this in the class of marks that change the
+    // picture. A failed check is the exception, and borrows ruby's pair.
+    let (ground, ink) = if badge.failed {
+        (crate::theme::RUBY_FILL_DIM, RUBY)
+    } else {
+        (crate::theme::AMBER.linear_multiply(0.22), crate::theme::AMBER)
+    };
+    painter.rect_filled(pill, pill.height() / 2.0, ground);
+    painter.text(pill.center(), egui::Align2::CENTER_CENTER, &badge.text, font, ink);
+    clicked
 }
 
 /// The toning placement curve: **strength against print tone**.
@@ -1840,6 +1933,128 @@ pub fn placement_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn number_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        mut field: impl FnMut(&mut egui::Ui) -> egui::Response,
+    ) -> bool {
+        let mut changed = false;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 100.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let response = field(ui);
+                response.request_focus();
+                changed = response.changed();
+            },
+        );
+        changed
+    }
+
+    fn arrow(key: egui::Key, repeat: bool) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    #[test]
+    fn numeric_slider_arrows_survive_display_rounding() {
+        // Actual egui key events, including held-key repeats, for the controls
+        // reproduced in the bug review. Focus itself enters text-edit mode.
+        for (initial, lo, hi, decimals, step) in [
+            (0.0, -6.0, 6.0, 2, 0.04),
+            (0.25, 0.05, 0.60, 2, 0.01),
+            (0.5, 0.0, 1.0, 2, 0.01),
+            (5.0, 1.0, 20.0, 0, 1.0),
+            (20.0, 5.0, 60.0, 0, 1.0),
+            (0.3, 0.05, 0.75, 2, 0.01),
+            (80.0, 0.0, 100.0, 0, 1.0),
+            (5.0, 1.0, 12.0, 1, 0.1),
+            (2.2, 1.0, 3.0, 2, 0.01),
+        ] {
+            let ctx = egui::Context::default();
+            let mut value = initial;
+            number_frame(&ctx, vec![], |ui| {
+                ui.add(slider_number(&mut value, lo..=hi, decimals))
+            });
+            for n in 1..=3 {
+                assert!(number_frame(&ctx, arrow(egui::Key::ArrowUp, n > 1), |ui| {
+                    ui.add(slider_number(&mut value, lo..=hi, decimals))
+                }));
+                assert!((value - (initial + step * n as f32)).abs() < 1e-5);
+            }
+            for n in (0..3).rev() {
+                assert!(number_frame(
+                    &ctx,
+                    arrow(egui::Key::ArrowDown, n < 2),
+                    |ui| { ui.add(slider_number(&mut value, lo..=hi, decimals)) }
+                ));
+                assert!((value - (initial + step * n as f32)).abs() < 1e-5);
+            }
+            for (limit, key) in [(lo, egui::Key::ArrowDown), (hi, egui::Key::ArrowUp)] {
+                value = limit;
+                number_frame(&ctx, arrow(key, false), |ui| {
+                    ui.add(slider_number(&mut value, lo..=hi, decimals))
+                });
+                assert_eq!(value, limit);
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_integer_arrows_typing_and_limits() {
+        let ctx = egui::Context::default();
+        let mut value = 4_u32;
+        number_frame(&ctx, vec![], |ui| {
+            ui.add(bounded_number(&mut value, 1..=12, 1.0))
+        });
+        for expected in 5..=12 {
+            assert!(number_frame(&ctx, arrow(egui::Key::ArrowUp, true), |ui| {
+                ui.add(bounded_number(&mut value, 1..=12, 1.0))
+            }));
+            assert_eq!(value, expected);
+        }
+        assert!(!number_frame(&ctx, arrow(egui::Key::ArrowUp, true), |ui| {
+            ui.add(bounded_number(&mut value, 1..=12, 1.0))
+        }));
+        assert_eq!(value, 12);
+        // Replace the focused text, then nudge the typed value.
+        let select_all = egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        };
+        assert!(number_frame(
+            &ctx,
+            vec![select_all, egui::Event::Text("1".into())],
+            |ui| { ui.add(bounded_number(&mut value, 1..=12, 1.0)) }
+        ));
+        assert_eq!(value, 1);
+        assert!(!number_frame(
+            &ctx,
+            arrow(egui::Key::ArrowDown, false),
+            |ui| { ui.add(bounded_number(&mut value, 1..=12, 1.0)) }
+        ));
+        assert_eq!(value, 1);
+        assert!(number_frame(&ctx, arrow(egui::Key::ArrowUp, false), |ui| {
+            ui.add(bounded_number(&mut value, 1..=12, 1.0))
+        }));
+        assert_eq!(value, 2);
+    }
 
     #[test]
     fn settings_and_lightbox_slider_tracks_double_click_to_default() {

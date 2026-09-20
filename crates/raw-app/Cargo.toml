@@ -50,3 +50,14 @@ libc = "0.2"
 # The native menu bar. Its Linux defaults are GTK and libxdo, but non-macOS builds
 # deliberately keep their shortcuts in egui until a native shell can attach a menu.
 muda = { version = "0.19", default-features = false }
+# Sparkle auto-updates, stable channel. Chosen over slint-ui/sparklers because it
+# registers as the user-driver delegate too: `GentleReminders` is what keeps a
+# scheduled update silent (the badge is ours, not Sparkle's alert) and
+# `RelaunchHandler` is what defers a relaunch until an export has drained.
+# hankbao/sparkle-updater was rejected — abandoned since 2023 on Sparkle 1.x.
+# The framework itself is vendored and pinned in packaging/macos/Sparkle; see
+# `.cargo/config.toml` for how the build finds it.
+sparkle-updater = "0.1.0"
+# Direct so `updater.rs` can write Sparkle's own `SUSkippedVersion` user default,
+# keeping our skip choice and Sparkle's skip machinery in agreement.
+objc2-foundation = { version = "0.3", features = ["NSUserDefaults"] }

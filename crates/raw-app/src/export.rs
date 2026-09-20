@@ -963,7 +963,7 @@ pub fn write(path: &Path, w: u32, h: u32, scene: &[f32], spec: &Spec) -> std::io
             (Container::Png, _) => write_png(file, w, h, &print, spec, xmp.as_deref()),
             // Depth is not consulted: `Container::depths` has already settled it at 8, and
             // a `match` arm that pretended otherwise would be a second place to be wrong.
-            (Container::Jpeg, _) => write_jpeg(file, w, h, &print, spec),
+            (Container::Jpeg, _) => write_jpeg(file, w, h, &print, spec, xmp.as_deref()),
         }
     })
 }
@@ -1241,6 +1241,7 @@ fn write_jpeg(
     h: u32,
     print: &Print,
     spec: &Spec,
+    xmp: Option<&str>,
 ) -> std::io::Result<()> {
     use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 
@@ -1267,6 +1268,20 @@ fn write_jpeg(
     // **Always.** A proof is the file that leaves, and the profile is what the next
     // application looks for. See `Space::channels`.
     enc.add_icc_profile(space.icc()).map_err(io)?;
+    if let Some(packet) = xmp {
+        // Standard XMP APP1: NUL-terminated identifier followed by UTF-8 XML.
+        // Do not truncate metadata or split it into unrelated APP1 packets.
+        // Extended XMP is not supported by this writer.
+        if packet.len() > 65_502 {
+            return Err(std::io::Error::other(
+                "JPEG metadata exceeds the supported 65,502-byte XMP limit. \
+                 Shorten the metadata or export as PNG or TIFF.",
+            ));
+        }
+        let mut segment = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+        segment.extend_from_slice(packet.as_bytes());
+        enc.add_app_segment(1, segment).map_err(io)?;
+    }
     // Dithered, like every other 8-bit path here: TPDF breaks up the truncation
     // banding on extended gradients. It runs *before* the DCT, so the encoder sees the
     // noise as signal and preserves some of it — which is the intent.
@@ -1484,9 +1499,9 @@ fn write_png(
         chunk.compressed = false;
         info.utf8_text.push(chunk);
     }
-    // PNG has no Artist or Copyright chunk, so the ASCII mirrors are tEXt under the
-    // keywords the spec does register. Author and Description are two of PNG's
-    // suggested keywords; Copyright is the third.
+    // Mirror common metadata under PNG's suggested keywords. Values are user
+    // text, so use UTF-8 iTXt: Latin-1 tEXt rejects punctuation such as an em dash
+    // and non-Latin names, failing the entire image export.
     if let Some(m) = &spec.metadata {
         for (key, val) in [
             ("Author", &m.creator),
@@ -1494,8 +1509,9 @@ fn write_png(
             ("Description", &m.description),
         ] {
             if let Some(v) = val {
-                info.uncompressed_latin1_text
-                    .push(png::text_metadata::TEXtChunk::new(key, v));
+                let mut chunk = png::text_metadata::ITXtChunk::new(key, v);
+                chunk.compressed = false;
+                info.utf8_text.push(chunk);
             }
         }
     }
@@ -3280,6 +3296,91 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_metadata_round_trips_unicode_and_can_be_omitted() {
+        use image::ImageDecoder;
+        let scene = ramp(16, 8);
+        let mut metadata = sample_metadata();
+        metadata.creator = Some("Zoë 山田 — نور".into());
+        metadata.rights = Some("© 2026 “作者” 📷".into());
+        metadata.description = Some("Café & 雪 <winter>\nA caption — here".into());
+        for space in [Space::Monostar, Space::Srgb] {
+            let mut decoded = Vec::new();
+            for mode in 0..3 {
+                let empty = Metadata::default();
+                let selected = match mode {
+                    0 => None,
+                    1 => Some(&metadata),
+                    _ => Some(&empty),
+                };
+                let path = tmp(&format!("jpeg-meta-{space:?}-{mode}.jpg"));
+                write(
+                    &path,
+                    16,
+                    8,
+                    &scene,
+                    &Spec::new(
+                        ts(Container::Jpeg, Depth::Eight, space),
+                        ToneMap::Clip,
+                        OutputParams::default(),
+                        Tail::default(),
+                        selected,
+                    ),
+                )
+                .unwrap();
+                let bytes = std::fs::read(&path).unwrap();
+                let mut decoder =
+                    image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(&bytes)).unwrap();
+                let packet = decoder.xmp_metadata().unwrap();
+                if mode == 1 {
+                    let packet = String::from_utf8(packet.expect("missing JPEG XMP")).unwrap();
+                    assert_eq!(packet, sidecar::metadata_packet(&metadata).unwrap());
+                    let sidecar::Loaded::Ok(parsed) = sidecar::from_xml(&packet) else {
+                        panic!("JPEG XMP was not valid metadata");
+                    };
+                    assert_eq!(parsed.metadata, metadata);
+                    assert!(!packet.contains("monopro:"));
+                } else {
+                    assert!(packet.is_none());
+                }
+                assert_eq!(decoder.icc_profile().unwrap().unwrap(), space.icc());
+                let mut pixels = vec![0; decoder.total_bytes() as usize];
+                decoder.read_image(&mut pixels).unwrap();
+                decoded.push(pixels);
+                std::fs::remove_file(path).unwrap();
+            }
+            assert_eq!(decoded[0], decoded[1]);
+            assert_eq!(decoded[0], decoded[2]);
+        }
+    }
+
+    #[test]
+    fn oversized_jpeg_metadata_reports_an_error_and_preserves_the_existing_file() {
+        let path = tmp("jpeg-large-metadata.jpg");
+        let metadata = Metadata {
+            description: Some("雪".repeat(30_000)),
+            ..Default::default()
+        };
+        std::fs::write(&path, b"existing export").unwrap();
+        let err = write(
+            &path,
+            8,
+            4,
+            &ramp(8, 4),
+            &Spec::new(
+                ts(Container::Jpeg, Depth::Eight, Space::Srgb),
+                ToneMap::Clip,
+                OutputParams::default(),
+                Tail::default(),
+                Some(&metadata),
+            ),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("65,502-byte XMP limit"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing export");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn a_tiff_carries_both_the_xmp_packet_and_the_ascii_tags() {
         // Two records of the same thing, and both are needed: the packet is the only
         // one that can hold keywords and a rating, and the tags are what the software
@@ -3373,20 +3474,93 @@ mod tests {
         assert!(!packet.compressed, "the XMP chunk was compressed");
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("xmp:Rating=\"4\""));
-        // And the tEXt mirrors, since PNG has no Artist chunk.
+        // And the UTF-8 mirrors, since PNG has no Artist chunk.
         let keys: Vec<&str> = reader
             .info()
-            .uncompressed_latin1_text
+            .utf8_text
             .iter()
             .map(|c| c.keyword.as_str())
             .collect();
         for k in ["Author", "Copyright", "Description"] {
             assert!(
                 keys.contains(&k),
-                "PNG is missing the {k} tEXt chunk: {keys:?}"
+                "PNG is missing the {k} iTXt chunk: {keys:?}"
             );
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn png_unicode_metadata_round_trips_without_changing_pixels() {
+        let scene = ramp(8, 4);
+        let metadata = Metadata {
+            creator: Some("Zoë 山田 — نور".into()),
+            rights: Some("© 2026 “作者” 📷".into()),
+            description: Some("An em dash — in a caption\nCafé & 雪 <winter>".into()),
+            ..Default::default()
+        };
+        for depth in [Depth::Eight, Depth::Sixteen] {
+            for space in [Space::Monostar, Space::Srgb] {
+                let mut decoded = Vec::new();
+                for include in [false, true] {
+                    let path = tmp(&format!("unicode-{depth:?}-{space:?}-{include}.png"));
+                    write(
+                        &path,
+                        8,
+                        4,
+                        &scene,
+                        &Spec::new(
+                            ts(Container::Png, depth, space),
+                            ToneMap::Clip,
+                            OutputParams::default(),
+                            Tail::default(),
+                            include.then_some(&metadata),
+                        ),
+                    )
+                    .unwrap();
+                    let bytes = std::fs::read(&path).unwrap();
+                    let mut reader = png::Decoder::new(std::io::Cursor::new(&bytes))
+                        .read_info()
+                        .unwrap();
+                    let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+                    let frame = reader.next_frame(&mut pixels).unwrap();
+                    pixels.truncate(frame.buffer_size());
+                    decoded.push(pixels);
+                    let info = reader.info();
+                    assert!(info.uncompressed_latin1_text.is_empty());
+                    assert!(info.compressed_latin1_text.is_empty());
+                    if include {
+                        for (key, value) in [
+                            ("Author", metadata.creator.as_ref().unwrap()),
+                            ("Copyright", metadata.rights.as_ref().unwrap()),
+                            ("Description", metadata.description.as_ref().unwrap()),
+                        ] {
+                            let chunks: Vec<_> =
+                                info.utf8_text.iter().filter(|c| c.keyword == key).collect();
+                            assert_eq!(chunks.len(), 1);
+                            assert!(!chunks[0].compressed);
+                            assert_eq!(chunks[0].get_text().unwrap(), *value);
+                        }
+                        let packet = info
+                            .utf8_text
+                            .iter()
+                            .find(|c| c.keyword == "XML:com.adobe.xmp")
+                            .unwrap();
+                        assert!(!packet.compressed);
+                        let xmp = packet.get_text().unwrap();
+                        assert!(xmp.contains("Zoë 山田 — نور"));
+                        assert!(xmp.contains("Café &amp; 雪 &lt;winter&gt;"));
+                    } else {
+                        assert!(info.utf8_text.is_empty());
+                    }
+                    std::fs::remove_file(path).unwrap();
+                }
+                assert_eq!(
+                    decoded[0], decoded[1],
+                    "metadata changed {depth:?} {space:?} pixels"
+                );
+            }
+        }
     }
 
     #[test]

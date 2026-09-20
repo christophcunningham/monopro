@@ -75,6 +75,9 @@ Use copies, never the only copy of a photograph:
 - [ ] **A4** The launcher, application icon, window title and OS app switcher identity all say `monopro`.
 - [ ] **A5** Install the previous public version, change a preference, then upgrade in place. The preference and edits survive and only one application entry remains.
 - [ ] **A6** Uninstall/delete the application. Program files disappear; settings, cache and photo sidecars remain. Reinstall and confirm settings are recovered.
+- [ ] **A7** (macOS only) With a staged update, quit the app. The install completes after termination and the relaunched app reports the new version. Quitting while an export writes is refused with a clear note, and no install touches the running bundle.
+- [ ] **A8** (macOS only) The update sheet's release notes render as plain text, survive an offline relaunch from cache, and "Skip this version" sticks across restarts until Settings → About clears it. **Test the staged case**: let the badge say the update is ready, then skip, quit, and confirm the skipped version is not installed — the skip has to cancel the installer Sparkle staged, not just darken the badge.
+- [ ] **A9** (macOS only) A corrupted or mismatched update signature reports a one-line failure and leaves the running application untouched.
 
 For macOS, test drag-to-Applications. For Windows, test the default per-user install,
 Apps & Features uninstall, and one administrator-approved all-users install. For Linux,

@@ -590,9 +590,17 @@ impl Dialog {
             unit,
         );
         row(ui, "Grid", |ui| {
-            ui.add(egui::DragValue::new(&mut self.settings.columns).range(1..=12));
+            ui.add(crate::widgets::bounded_number(
+                &mut self.settings.columns,
+                1..=12,
+                1.0,
+            ));
             ui.label("×");
-            ui.add(egui::DragValue::new(&mut self.settings.rows).range(1..=12));
+            ui.add(crate::widgets::bounded_number(
+                &mut self.settings.rows,
+                1..=12,
+                1.0,
+            ));
         });
         let cell = PageLayout::new(&self.settings, self.settings.page_points()).cell_size();
         row(ui, "Cell size", |ui| {
@@ -642,9 +650,17 @@ impl Dialog {
             CaptionSource::Sequence | CaptionSource::Custom
         ) {
             row(ui, "Sequence", |ui| {
-                ui.add(egui::DragValue::new(&mut self.settings.sequence_start).range(0..=999_999));
+                ui.add(crate::widgets::bounded_number(
+                    &mut self.settings.sequence_start,
+                    0..=999_999,
+                    1.0,
+                ));
                 ui.label("start");
-                ui.add(egui::DragValue::new(&mut self.settings.sequence_digits).range(1..=8));
+                ui.add(crate::widgets::bounded_number(
+                    &mut self.settings.sequence_digits,
+                    1..=8,
+                    1.0,
+                ));
                 ui.label("digits");
             });
         }
@@ -900,7 +916,11 @@ impl Dialog {
             }
         });
         row(ui, "Resolution", |ui| {
-            ui.add(egui::DragValue::new(&mut self.settings.resolution).range(72..=600));
+            ui.add(crate::widgets::bounded_number(
+                &mut self.settings.resolution,
+                72..=600,
+                1.0,
+            ));
             ui.label("ppi");
         });
         if self.iptc_templates.templates.is_empty() {

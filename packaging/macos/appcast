@@ -1,0 +1,88 @@
+#!/bin/zsh
+# Assemble appcast.xml for a release, with Sparkle's generate_appcast.
+#
+#   packaging/macos/appcast <archives-dir> [--ed-key-file <key>]
+#
+# <archives-dir> holds the notarized ZIP enclosures to publish, the previous
+# appcast.xml when extending an existing feed, and release notes as sibling
+# text files named after each archive:
+#
+#   monopro-0.2.1-macos.zip
+#   monopro-0.2.1-macos.txt      <- release notes (plain text) for that item
+#
+# generate_appcast reuses an appcast already in the directory, embeds or links
+# the notes, signs new entries with the EdDSA key — the Keychain account
+# "ed25519" by default, or the file given to --ed-key-file — and prunes
+# versions older than the newest into old_updates/. Delta updates are produced
+# automatically against the previous ZIPs when they are present.
+#
+# The resulting appcast.xml is the one asset to publish per release, uploaded
+# beside the ZIPs; GitHub's stable /releases/latest/download/appcast.xml alias
+# — the URL baked into every shipped bundle — then always serves the newest
+# feed. Release notes rendered in the update sheet come from those entries.
+
+set -e
+here=${0:A:h}
+sparkle="$here/Sparkle"
+
+archives=
+key_args=()
+while (( $# )); do
+  case "$1" in
+    --ed-key-file)
+      [[ -n "$2" ]] || { echo "appcast: --ed-key-file needs a path" >&2; exit 2; }
+      key_args=(--ed-key-file "$2")
+      shift 2
+      ;;
+    -*) echo "usage: packaging/macos/appcast <archives-dir> [--ed-key-file <key>]" >&2; exit 2 ;;
+    *)
+      if [[ -n "$archives" ]]; then
+        echo "appcast: one archives directory, please" >&2
+        exit 2
+      fi
+      archives="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$archives" ]]; then
+  echo "usage: packaging/macos/appcast <archives-dir> [--ed-key-file <key>]" >&2
+  exit 2
+fi
+[[ -d "$archives" ]] || { echo "appcast: $archives is not a directory" >&2; exit 1 }
+[[ -x "$sparkle/sparkle-bin/generate_appcast" ]] || {
+  echo "appcast: packaging/macos/Sparkle is missing — see packaging/README.md" >&2
+  exit 1
+}
+
+# generate_appcast writes appcast.xml (and delta files) into the archives
+# directory and reuses whatever is already there. Notes are embedded into the
+# items rather than linked: the update sheet renders them as plain text from
+# the appcast itself and caches them, so an offline launch still shows what
+# the release changed.
+"$sparkle/sparkle-bin/generate_appcast" --embed-release-notes "${key_args[@]}" "$archives"
+
+cast="$archives/appcast.xml"
+[[ -s "$cast" ]] || { echo "appcast: generate_appcast produced no $cast" >&2; exit 1 }
+
+# Sanity before anything is uploaded: the elements a Sparkle 2 item cannot be
+# published without, checked on the file just written rather than trusted from
+# an exit code. minimumSystemVersion is inferred from the bundle inside the
+# archive, which this repository pins at 11.0.
+for tag in 'sparkle:version' 'sparkle:shortVersionString' 'pubDate' \
+  'sparkle:minimumSystemVersion' 'sparkle:edSignature'; do
+  grep -q "$tag" "$cast" || {
+    echo "appcast: $cast is missing a $tag element" >&2
+    exit 1
+  }
+done
+grep -q 'minimumSystemVersion>11' "$cast" || {
+  echo "appcast: minimumSystemVersion is not the 11.0 baseline" >&2
+  exit 1
+}
+xmllint --noout "$cast" || {
+  echo "appcast: $cast is not well-formed XML" >&2
+  exit 1
+}
+print -r -- "wrote $cast"

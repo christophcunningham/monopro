@@ -21,6 +21,7 @@ pub enum PassKey {
     Exposure,
     Log2,
     Exp2,
+    MaskInput,
     Blur,
     ContrastMask,
     DodgeBurn,
@@ -35,6 +36,7 @@ impl PassKey {
             NodeKind::Exposure => Self::Exposure,
             NodeKind::Log2 => Self::Log2,
             NodeKind::Exp2 => Self::Exp2,
+            NodeKind::MaskInput { .. } => Self::MaskInput,
             // One pipeline for both axes: the axis is a uniform, so a slider
             // drag does not recompile anything.
             NodeKind::Blur { .. } => Self::Blur,
@@ -91,6 +93,7 @@ impl Spec {
             PassKey::Exposure => Spec::plain(1),
             PassKey::Log2 => Spec::plain(1),
             PassKey::Exp2 => Spec::plain(1),
+            PassKey::MaskInput => Spec::plain(1),
             PassKey::Blur => Spec::plain(1),
             // The join: negative and mask.
             PassKey::ContrastMask => Spec::plain(2),
@@ -193,13 +196,19 @@ impl GpuContext {
             (PassKey::Exposure, include_str!("exposure.wgsl")),
             (PassKey::Log2, include_str!("log2.wgsl")),
             (PassKey::Exp2, include_str!("exp2.wgsl")),
+            (PassKey::MaskInput, include_str!("mask_input.wgsl")),
             (PassKey::Blur, include_str!("blur.wgsl")),
             (PassKey::ContrastMask, include_str!("contrast_mask.wgsl")),
             (PassKey::DodgeBurn, include_str!("dodge_burn.wgsl")),
             (PassKey::Curve, include_str!("curve.wgsl")),
             (PassKey::Display, include_str!("display.wgsl")),
         ] {
-            passes.insert(key, Pass::new(device, key, body));
+            let body = if matches!(key, PassKey::Input | PassKey::MaskInput) {
+                format!("{}\n{body}", include_str!("sample_common.wgsl"))
+            } else {
+                body.to_owned()
+            };
+            passes.insert(key, Pass::new(device, key, &body));
         }
         Self {
             passes,
@@ -231,6 +240,26 @@ impl GpuContext {
         res: &Resources<'_>,
         retain: Option<NodeId>,
     ) -> Option<Lease> {
+        self.execute_cached(device, queue, plan, res, retain, None)
+            .0
+    }
+
+    /// Reuse or retain one complete upstream prefix. The cache belongs to the
+    /// viewport; the executor only owns it for this submission. Export taps use
+    /// the uncached route, so a retained readback can never steal this texture.
+    pub(crate) fn execute_cached(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        plan: &Plan,
+        res: &Resources<'_>,
+        retain: Option<NodeId>,
+        cached: Option<(NodeId, Option<Lease>)>,
+    ) -> (Option<Lease>, Option<Lease>) {
+        // Also protect direct executor callers, before any pooled allocation.
+        if crate::limits::validate_plan(plan, device.limits().max_texture_dimension_2d).is_err() {
+            return (None, None);
+        }
         let n = plan.steps.len();
 
         // Buffers currently live, indexed by node. `None` means either not yet
@@ -240,8 +269,16 @@ impl GpuContext {
         // collected first and the dispatches recorded afterwards.
         let mut recorded: Vec<(PassKey, wgpu::BindGroup, (u32, u32))> = Vec::with_capacity(n);
         let mut retained: Option<Lease> = None;
+        let cache_id = cached.as_ref().map(|(id, _)| *id);
+        let mut cache_result = None;
+        let start = if let Some((id, Some(lease))) = cached {
+            live[id.0] = Some(lease);
+            id.0 + 1
+        } else {
+            0
+        };
 
-        for (i, step) in plan.steps.iter().enumerate() {
+        for (i, step) in plan.steps.iter().enumerate().skip(start) {
             let key = PassKey::of(step.kind);
             let is_sink = i + 1 == n;
 
@@ -300,6 +337,10 @@ impl GpuContext {
             // boundary orders that after this node's read. It is the same
             // ping-pong the hardcoded chain did with two fixed buffers.
             for id in &step.release {
+                if cache_id == Some(*id) {
+                    cache_result = live[id.0].take();
+                    continue;
+                }
                 if retain == Some(*id) {
                     retained = live[id.0].take();
                     continue;
@@ -329,7 +370,7 @@ impl GpuContext {
         for slot in live.into_iter().flatten() {
             self.pool.release(slot);
         }
-        retained
+        (retained, cache_result)
     }
 }
 

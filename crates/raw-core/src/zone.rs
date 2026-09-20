@@ -120,10 +120,14 @@ impl Proxy {
             // different physical spacers.
             let sigma = cm.spacer_px((self.src.0 as u32, self.src.1 as u32))
                 * (w as f32 / self.src.0 as f32);
-            let log: Vec<f32> = v.iter().map(|p| p.max(1e-9).log2()).collect();
+            // Match log2.wgsl and mask_input.wgsl. The floor participates in
+            // the blur, so a different floor shifts nearby shadow selections.
+            const LOG_FLOOR: f32 = 6.103_515_6e-5;
+            let log: Vec<f32> = v.iter().map(|p| p.max(LOG_FLOOR).log2()).collect();
             let blurred = gaussian(&log, w, h, sigma);
             for (p, (l, b)) in v.iter_mut().zip(log.iter().zip(&blurred)) {
-                *p = (l - b * cm.contrast).exp2();
+                // Match contrast_mask.wgsl: compress around 18% grey, not 1.0.
+                *p = (l - (b - MID_GREY.log2()) * cm.contrast).exp2();
             }
         }
 
@@ -480,6 +484,35 @@ mod tests {
         );
         for e in &b.ev {
             assert!(e.abs() < 1e-5, "0.18 must be Zone V: {e}");
+        }
+    }
+
+    #[test]
+    fn contrast_mask_keeps_grey_at_zero_and_compresses_exposed_flat_tones() {
+        for contrast in [0.05, 0.35, 0.60] {
+            for ev in [-3.0_f32, 0.0, 2.0] {
+                let l = luma(32, 24, vec![MID_GREY + 0.01; 32 * 24]);
+                let b = Basis::build(
+                    &l,
+                    &ExposureParams {
+                        ev,
+                        black: 0.01,
+                        ..Default::default()
+                    },
+                    &ContrastMaskParams {
+                        enabled: true,
+                        contrast,
+                        ..Default::default()
+                    },
+                );
+                let expected = ev * (1.0 - contrast);
+                for &got in &b.ev {
+                    assert!(
+                        (got - expected).abs() < 1e-5,
+                        "contrast={contrast}, exposure={ev}: {got} vs {expected}"
+                    );
+                }
+            }
         }
     }
 

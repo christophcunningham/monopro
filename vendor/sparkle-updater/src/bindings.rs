@@ -1,0 +1,219 @@
+use objc2::rc::Retained;
+use objc2::runtime::NSObject;
+use objc2::{extern_class, extern_methods, MainThreadOnly};
+use objc2_foundation::{NSDate, NSDictionary, NSError, NSNumber, NSString, NSURL};
+
+extern_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SPUStandardUpdaterController"]
+    #[derive(Debug)]
+    pub struct SPUStandardUpdaterController;
+);
+
+impl SPUStandardUpdaterController {
+    extern_methods!(
+        #[unsafe(method(initWithStartingUpdater:updaterDelegate:userDriverDelegate:))]
+        pub fn init_with_starting_updater(
+            this: objc2::rc::Allocated<Self>,
+            starting_updater: bool,
+            updater_delegate: Option<&NSObject>,
+            user_driver_delegate: Option<&NSObject>,
+        ) -> Retained<Self>;
+
+        #[unsafe(method(updater))]
+        pub fn updater(&self) -> Retained<SPUUpdater>;
+
+        #[unsafe(method(checkForUpdates:))]
+        pub fn check_for_updates(&self, sender: Option<&NSObject>);
+    );
+}
+
+extern_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SPUUpdater"]
+    #[derive(Debug)]
+    pub struct SPUUpdater;
+);
+
+impl SPUUpdater {
+    extern_methods!(
+        #[unsafe(method(canCheckForUpdates))]
+        pub fn can_check_for_updates(&self) -> bool;
+
+        #[unsafe(method(checkForUpdates))]
+        pub fn check_for_updates(&self);
+
+        #[unsafe(method(checkForUpdatesInBackground))]
+        pub fn check_for_updates_in_background(&self);
+
+        #[unsafe(method(feedURL))]
+        pub fn feed_url(&self) -> Option<Retained<NSURL>>;
+
+        #[unsafe(method(setFeedURL:))]
+        pub fn set_feed_url(&self, url: Option<&NSURL>);
+
+        #[unsafe(method(automaticallyChecksForUpdates))]
+        pub fn automatically_checks_for_updates(&self) -> bool;
+
+        #[unsafe(method(setAutomaticallyChecksForUpdates:))]
+        pub fn set_automatically_checks_for_updates(&self, enabled: bool);
+
+        #[unsafe(method(automaticallyDownloadsUpdates))]
+        pub fn automatically_downloads_updates(&self) -> bool;
+
+        #[unsafe(method(setAutomaticallyDownloadsUpdates:))]
+        pub fn set_automatically_downloads_updates(&self, enabled: bool);
+
+        #[unsafe(method(lastUpdateCheckDate))]
+        pub fn last_update_check_date(&self) -> Option<Retained<NSDate>>;
+
+        #[unsafe(method(resetUpdateCycle))]
+        pub fn reset_update_cycle(&self);
+
+        #[unsafe(method(updateCheckInterval))]
+        pub fn update_check_interval(&self) -> f64;
+
+        #[unsafe(method(setUpdateCheckInterval:))]
+        pub fn set_update_check_interval(&self, interval: f64);
+
+        #[unsafe(method(checkForUpdateInformation))]
+        pub fn check_for_update_information(&self);
+
+        #[unsafe(method(sessionInProgress))]
+        pub fn session_in_progress(&self) -> bool;
+
+        #[unsafe(method(httpHeaders))]
+        pub fn http_headers(&self) -> Option<Retained<NSDictionary<NSString, NSString>>>;
+
+        #[unsafe(method(setHttpHeaders:))]
+        pub fn set_http_headers(&self, headers: Option<&NSDictionary<NSString, NSString>>);
+
+        #[unsafe(method(userAgentString))]
+        pub fn user_agent_string(&self) -> Retained<NSString>;
+
+        #[unsafe(method(setUserAgentString:))]
+        pub fn set_user_agent_string(&self, user_agent: &NSString);
+
+        #[unsafe(method(sendsSystemProfile))]
+        pub fn sends_system_profile(&self) -> bool;
+
+        #[unsafe(method(setSendsSystemProfile:))]
+        pub fn set_sends_system_profile(&self, sends: bool);
+
+        #[unsafe(method(clearFeedURLFromUserDefaults))]
+        pub fn clear_feed_url_from_user_defaults(&self) -> Option<Retained<NSURL>>;
+
+        #[unsafe(method(resetUpdateCycleAfterShortDelay))]
+        pub fn reset_update_cycle_after_short_delay(&self);
+
+        #[unsafe(method(startUpdater:))]
+        pub fn start_updater(&self, error: *mut *mut NSError) -> bool;
+
+        #[unsafe(method(setDelegate:))]
+        pub fn set_delegate(&self, delegate: Option<&NSObject>);
+    );
+}
+
+extern_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SUAppcastItem"]
+    #[derive(Debug)]
+    pub struct SPUAppcastItem;
+);
+
+impl SPUAppcastItem {
+    extern_methods!(
+        #[unsafe(method(displayVersionString))]
+        pub fn display_version_string(&self) -> Retained<NSString>;
+
+        #[unsafe(method(versionString))]
+        pub fn version_string(&self) -> Retained<NSString>;
+
+        #[unsafe(method(itemDescription))]
+        pub fn item_description(&self) -> Option<Retained<NSString>>;
+
+        #[unsafe(method(fileURL))]
+        pub fn file_url(&self) -> Option<Retained<NSURL>>;
+
+        #[unsafe(method(contentLength))]
+        pub fn content_length(&self) -> u64;
+
+        #[unsafe(method(title))]
+        pub fn title(&self) -> Option<Retained<NSString>>;
+
+        #[unsafe(method(releaseNotesURL))]
+        pub fn release_notes_url(&self) -> Option<Retained<NSURL>>;
+
+        #[unsafe(method(infoURL))]
+        pub fn info_url(&self) -> Option<Retained<NSURL>>;
+
+        #[unsafe(method(minimumSystemVersion))]
+        pub fn minimum_system_version(&self) -> Option<Retained<NSString>>;
+
+        #[unsafe(method(isCriticalUpdate))]
+        pub fn is_critical_update(&self) -> bool;
+
+        #[unsafe(method(isMajorUpgrade))]
+        pub fn is_major_upgrade(&self) -> bool;
+
+        #[unsafe(method(channel))]
+        pub fn channel(&self) -> Option<Retained<NSString>>;
+
+        #[unsafe(method(isInformationOnlyUpdate))]
+        pub fn is_information_only_update(&self) -> bool;
+
+        #[unsafe(method(date))]
+        pub fn date(&self) -> Option<Retained<NSDate>>;
+
+        #[unsafe(method(maximumSystemVersion))]
+        pub fn maximum_system_version(&self) -> Option<Retained<NSString>>;
+
+        #[unsafe(method(minimumOperatingSystemVersionIsOK))]
+        pub fn minimum_operating_system_version_is_ok(&self) -> bool;
+
+        #[unsafe(method(maximumOperatingSystemVersionIsOK))]
+        pub fn maximum_operating_system_version_is_ok(&self) -> bool;
+
+        #[unsafe(method(installationType))]
+        pub fn installation_type(&self) -> Retained<NSString>;
+
+        #[unsafe(method(phasedRolloutInterval))]
+        pub fn phased_rollout_interval(&self) -> Option<Retained<NSNumber>>;
+
+        #[unsafe(method(fullReleaseNotesURL))]
+        pub fn full_release_notes_url(&self) -> Option<Retained<NSURL>>;
+
+        #[unsafe(method(minimumAutoupdateVersion))]
+        pub fn minimum_autoupdate_version(&self) -> Option<Retained<NSString>>;
+
+        #[unsafe(method(ignoreSkippedUpgradesBelowVersion))]
+        pub fn ignore_skipped_upgrades_below_version(&self) -> Option<Retained<NSString>>;
+
+        #[unsafe(method(dateString))]
+        pub fn date_string(&self) -> Option<Retained<NSString>>;
+
+        #[unsafe(method(itemDescriptionFormat))]
+        pub fn item_description_format(&self) -> Option<Retained<NSString>>;
+    );
+}
+
+extern_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SPUUserUpdateState"]
+    #[derive(Debug)]
+    pub struct SPUUserUpdateState;
+);
+
+impl SPUUserUpdateState {
+    extern_methods!(
+        #[unsafe(method(stage))]
+        pub fn stage(&self) -> isize;
+
+        #[unsafe(method(userInitiated))]
+        pub fn user_initiated(&self) -> bool;
+    );
+}
