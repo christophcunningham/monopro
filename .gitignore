@@ -56,6 +56,9 @@ thumbcache/
 .claude/
 .codex/
 .agents/
+opencode.jsonc
+.opencode/
+OPENCODE-AGENT-SETUP.md
 PUBLICATION-PLAN.local.md
 
 # Only the embedded font faces and their license notices are distributed.
