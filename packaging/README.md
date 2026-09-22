@@ -128,7 +128,9 @@ version an in-place upgrade. Packaging verifies the x86-64 payload, installer ve
 expected signature state and checksum. Each successful run writes a `.sha256` file
 beside the installer.
 
-The installer also includes font, icon, and profile notices under `licenses/`.
+The installer includes font, icon, profile, Sparkle framework, and
+`sparkle-updater` notices under `licenses/`.
+
 Windows package builds remap source and user-directory paths before compilation;
 the validator rejects executables that still contain those build-machine paths.
 

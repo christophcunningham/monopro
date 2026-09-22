@@ -24,7 +24,8 @@ test -x "$app/Contents/MacOS/monopro"
 test -f "$app/Contents/Resources/monopro.icns"
 for notice in monopro-GPL-3.0.txt fonts/OFL.txt fonts/AUTHORS.txt \
   icons/LICENSE-Phosphor.txt icons/LICENSE-Lucide.txt profiles/monostar-CC0.txt \
-  profiles/eciRGB_v2_license.rtf profiles/licensing-iccorg.txt; do
+  profiles/eciRGB_v2_license.rtf profiles/licensing-iccorg.txt \
+  sparkle/Sparkle-LICENSE.txt sparkle/sparkle-updater-LICENSE-MIT.txt; do
   test -s "$app/Contents/Resources/licenses/$notice"
 done
 test -f "$dmg"

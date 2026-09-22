@@ -169,12 +169,14 @@ PLIST
 
 # Bundle redistribution notices with the installed application.
 notices="$app/Contents/Resources/licenses"
-mkdir -p "$notices/fonts" "$notices/icons" "$notices/profiles"
+mkdir -p "$notices/fonts" "$notices/icons" "$notices/profiles" "$notices/sparkle"
 cp "$here/LICENSE" "$notices/monopro-GPL-3.0.txt"
 cp "$here/fonts/JetBrainsMono/OFL.txt" "$here/fonts/JetBrainsMono/AUTHORS.txt" "$notices/fonts/"
 cp "$here/icons/LICENSE-Phosphor.txt" "$here/icons/LICENSE-Lucide.txt" "$notices/icons/"
 cp "$here/profiles/LICENSE" "$notices/profiles/monostar-CC0.txt"
 cp "$here/profiles/eciRGB_v2_license.rtf" "$here/profiles/licensing-iccorg.txt" "$notices/profiles/"
+cp "$sparkle/LICENSE" "$notices/sparkle/Sparkle-LICENSE.txt"
+cp "$here/vendor/sparkle-updater/LICENSE-MIT" "$notices/sparkle/sparkle-updater-LICENSE-MIT.txt"
 
 # ── The Sparkle framework ─────────────────────────────────────────────────────
 #
