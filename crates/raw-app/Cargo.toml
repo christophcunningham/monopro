@@ -61,3 +61,9 @@ sparkle-updater = "0.1.0"
 # Direct so `updater.rs` can write Sparkle's own `SUSkippedVersion` user default,
 # keeping our skip choice and Sparkle's skip machinery in agreement.
 objc2-foundation = { version = "0.3", features = ["NSUserDefaults"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# For the updater's private-API canary only: `objc2-foundation` re-exports
+# `NSObject` and `MainThreadMarker`, not `runtime::AnyClass`, which is what
+# asking the ObjC runtime whether a class still answers a selector needs.
+objc2 = "0.6"

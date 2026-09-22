@@ -13,7 +13,7 @@ pub use delegate::EventCallback;
 pub use error::{Error, Result};
 pub use events::{UpdateEvent, UserUpdateStage, UserUpdateState};
 pub use objc2::MainThreadMarker;
-pub use updater::{init, SparkleUpdater, UpdaterConfig};
+pub use updater::{init, SkipOutcome, SparkleUpdater, UpdaterConfig};
 
 #[cfg(test)]
 mod tests {

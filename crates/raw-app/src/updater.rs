@@ -56,7 +56,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use objc2_foundation::{NSUserDefaults, NSString};
 use sparkle_updater::{
     EventCallback, GentleReminders, MainThreadMarker, RelaunchContinuation, RelaunchHandler,
-    SparkleUpdater, UpdateEvent, UpdaterConfig,
+    SkipOutcome, SparkleUpdater, UpdateEvent, UpdaterConfig,
 };
 
 use crate::platform;
@@ -81,6 +81,8 @@ const CHECK_INTERVAL_SECS: f64 = 86_400.0;
 /// while still covering "skipped during the download" and "skipped after
 /// staging" without polling the feed.
 const SKIP_RESUME_ATTEMPTS: u8 = 2;
+const SKIP_WARNING_STATUS: &str =
+    "Skip was not confirmed; a staged update may still install when monopro quits";
 
 /// What the updater is currently holding for the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,11 +337,18 @@ pub struct Updates {
     status: Option<String>,
     /// A skipped version Sparkle may still be holding — a staged install, or
     /// a pending alert whose reply is the only route to the installer driver.
-    /// Cleared once Sparkle's own Skip choice has been delivered, or when a
-    /// cycle proves nothing is left to cancel.
+    /// Cleared once Sparkle's own Skip choice has been delivered or the user
+    /// explicitly stops skipping.
     skip_pending: Option<String>,
     /// Resume checks already spent on the current [`Self::skip_pending`].
     skip_attempts: u8,
+    /// A skip recorded locally but not confirmed by Sparkle. A staged installer
+    /// may still run at quit; a feed result alone cannot settle that question.
+    skip_undelivered: Option<String>,
+    /// Sparkle reported a finished download or a staged install since the last
+    /// new offer. Without one, a skip has no installer to cancel, and warning
+    /// that one "may still install" is a false alarm with no way to clear it.
+    staged_seen: bool,
 }
 
 impl Updates {
@@ -363,6 +372,8 @@ impl Updates {
             status: None,
             skip_pending: None,
             skip_attempts: 0,
+            skip_undelivered: None,
+            staged_seen: false,
         };
 
         let updater = MainThreadMarker::new().and_then(|mtm| {
@@ -463,17 +474,14 @@ impl Updates {
                     // is the resumed staged install talking: the appcast filter
                     // never sees it, so the skip has to be delivered through
                     // Sparkle's own alert reply, which is what cancels the
-                    // installer. Answer it and keep the badge dark either way.
+                    // installer. Keep any warning until Sparkle answers Skip.
                     if Self::skipped_version(config) == Some(version.as_str()) {
-                        if self
+                        if let Some(result) = self
                             .updater
                             .as_ref()
-                            .is_some_and(|updater| {
-                                updater.skip_current_update().unwrap_or(false)
-                            })
+                            .map(|updater| updater.skip_current_update())
                         {
-                            self.skip_pending = None;
-                            self.skip_attempts = 0;
+                            self.record_skip_reply(&version, result);
                         }
                         self.stage = Stage::Idle;
                         self.version = None;
@@ -485,11 +493,15 @@ impl Updates {
                         continue;
                     }
                     // The feed has moved past the skipped version, so the old
-                    // cancel has nothing left to reach; the new offer is a
-                    // fresh decision.
+                    // cancel has nothing left to reach. The new offer is a
+                    // fresh decision, but it does not prove an older staged
+                    // installer was canceled.
                     self.skip_pending = None;
                     self.skip_attempts = 0;
                     let is_new = self.version.as_deref() != Some(version.as_str());
+                    if is_new {
+                        self.staged_seen = false;
+                    }
                     self.stage = Stage::Available;
                     self.date = date;
                     self.update_on_quit = false;
@@ -521,12 +533,22 @@ impl Updates {
                         self.date = None;
                         Cache::discard();
                     }
-                    // The feed answered without a staged install to resume, so
-                    // nothing is left for a pending skip to cancel.
-                    self.skip_pending = None;
-                    self.skip_attempts = 0;
-                    note.get_or_insert_with(|| "monopro is up to date".to_owned());
-                    self.status = Some("monopro is up to date".to_owned());
+                    // Feed eligibility cannot prove an earlier staged installer
+                    // was canceled. Keep retrying a pending skip after the
+                    // cycle, and keep its warning visible in the meantime.
+                    // With nothing ever staged there is nothing to cancel.
+                    if let Some(pending) = &self.skip_pending {
+                        if self.staged_seen {
+                            self.skip_undelivered = Some(pending.clone());
+                        } else {
+                            self.skip_pending = None;
+                            self.skip_attempts = 0;
+                        }
+                    }
+                    if self.skip_undelivered.is_none() {
+                        note.get_or_insert_with(|| "monopro is up to date".to_owned());
+                        self.status = Some("monopro is up to date".to_owned());
+                    }
                 }
                 Notice::Downloading => {
                     if self.stage != Stage::Staged {
@@ -535,16 +557,19 @@ impl Updates {
                     }
                 }
                 Notice::Downloaded => {
+                    self.staged_seen = true;
                     self.stage = Stage::Staged;
                     self.status =
                         Some("update downloaded — it installs when monopro quits".to_owned());
                 }
                 Notice::StagedForQuit => {
+                    self.staged_seen = true;
                     self.stage = Stage::Staged;
                     self.status =
                         Some("update staged — it installs when monopro quits".to_owned());
                 }
                 Notice::Installing => {
+                    self.staged_seen = true;
                     self.stage = Stage::Staged;
                     self.status = Some("installing the update…".to_owned());
                 }
@@ -562,6 +587,9 @@ impl Updates {
                         Self::record_skip(config, &version);
                         self.skip_pending = None;
                         self.skip_attempts = 0;
+                        if self.skip_undelivered.as_deref() == Some(version.as_str()) {
+                            self.skip_undelivered = None;
+                        }
                         self.stage = Stage::Idle;
                         self.version = None;
                         self.notes.clear();
@@ -590,6 +618,18 @@ impl Updates {
 
     /// What the title strip should draw at its right end, if anything.
     pub fn badge(&self) -> Option<Badge> {
+        // Checked before `version`, which a skip clears: this is the one state
+        // where the app has something to say and nothing on offer.
+        if let Some(version) = &self.skip_undelivered {
+            return Some(Badge {
+                text: format!("{version} skip unconfirmed"),
+                detail: format!(
+                    "Could not confirm that monopro {version} was skipped. \
+                     A staged update may still install when monopro quits"
+                ),
+                failed: true,
+            });
+        }
         let version = self.version.as_deref()?;
         let text = match (self.stage, self.update_on_quit) {
             (Stage::Idle, _) => return None,
@@ -613,11 +653,18 @@ impl Updates {
 
     /// Whether the sheet has anything to present.
     pub fn sheet_ready(&self) -> bool {
-        self.version.is_some() || self.status.is_some()
+        self.skip_undelivered.is_some() || self.version.is_some() || self.status.is_some()
+    }
+
+    pub fn skip_warning_active(&self) -> bool {
+        self.skip_undelivered.is_some()
     }
 
     /// The sheet's version line: what is offered and what is running.
     pub fn sheet_version_line(&self) -> String {
+        if let Some(version) = &self.skip_undelivered {
+            return format!("monopro {version} — skip not confirmed");
+        }
         match (&self.version, &self.installed) {
             (Some(next), Some(current)) => {
                 format!("monopro {next} is available — you have {current}")
@@ -638,7 +685,11 @@ impl Updates {
 
     /// The one-line status for the sheet and the About page.
     pub fn sheet_status(&self) -> Option<&str> {
-        self.status.as_deref()
+        if self.skip_undelivered.is_some() {
+            Some(SKIP_WARNING_STATUS)
+        } else {
+            self.status.as_deref()
+        }
     }
 
     /// Whether "Restart now" may run: the update must be staged and the machine
@@ -700,6 +751,7 @@ impl Updates {
         Self::record_skip(config, &version);
         self.skip_pending = Some(version.clone());
         self.skip_attempts = 0;
+        self.skip_undelivered = None;
         self.stage = Stage::Idle;
         self.version = None;
         self.notes.clear();
@@ -717,7 +769,16 @@ impl Updates {
     /// skip that cannot be delivered — no alert, or an update that never
     /// staged — from polling the feed in a loop.
     fn request_skip_cancel(&mut self) {
-        if self.skip_pending.is_none() || self.skip_attempts >= SKIP_RESUME_ATTEMPTS {
+        let Some(pending) = self.skip_pending.clone() else {
+            return;
+        };
+        if self.skip_attempts >= SKIP_RESUME_ATTEMPTS {
+            // Out of resume checks with the alert never reached. If anything
+            // was staged, the app cannot establish whether it still is.
+            self.skip_pending = None;
+            if self.staged_seen {
+                self.skip_undelivered = Some(pending);
+            }
             return;
         }
         let Some(updater) = &self.updater else {
@@ -725,6 +786,27 @@ impl Updates {
         };
         self.skip_attempts += 1;
         let _ = updater.check_for_updates_in_background();
+    }
+
+    fn record_skip_reply(&mut self, version: &str, result: sparkle_updater::Result<SkipOutcome>) {
+        match result {
+            Ok(SkipOutcome::Sent) => {
+                self.skip_pending = None;
+                self.skip_attempts = 0;
+                self.skip_undelivered = None;
+                self.staged_seen = false;
+            }
+            // A missing selector or failed call will not be fixed by polling
+            // the feed again. Retain the warning even if pending was already
+            // consumed by an earlier failed attempt.
+            Ok(SkipOutcome::Unsupported) | Err(_) => {
+                self.skip_pending = None;
+                self.skip_attempts = 0;
+                self.skip_undelivered = Some(version.to_owned());
+            }
+            // No alert yet. The cycle-finished notice asks again.
+            Ok(SkipOutcome::NoAlert) => {}
+        }
     }
 
     /// Persist the skip: Sparkle's user default first, so its scheduled checks
@@ -743,6 +825,7 @@ impl Updates {
     pub fn stop_skipping(&mut self, config: &mut Settings) {
         self.skip_pending = None;
         self.skip_attempts = 0;
+        self.skip_undelivered = None;
         if config.skipped_update_version.take().is_some() {
             write_sparkle_skip(None);
             if let Err(e) = config.save() {
@@ -806,6 +889,8 @@ mod tests {
                 status: None,
                 skip_pending: skip_pending.map(str::to_owned),
                 skip_attempts,
+                skip_undelivered: None,
+                staged_seen: true,
             },
             tx,
         )
@@ -822,25 +907,150 @@ mod tests {
     }
 
     #[test]
-    fn up_to_date_abandons_a_pending_skip() {
+    fn up_to_date_does_not_claim_a_pending_skip_was_delivered() {
         let (mut updates, tx) = idle_updates(Some("0.2.0"), 1);
-        tx.send(Notice::UpToDate).expect("the receiver is in `updates`");
+        tx.send(Notice::UpToDate)
+            .expect("the receiver is in `updates`");
 
         updates.poll(&mut Settings::default());
 
-        assert!(updates.skip_pending.is_none());
-        assert_eq!(updates.skip_attempts, 0);
+        assert_eq!(updates.skip_pending.as_deref(), Some("0.2.0"));
+        assert_eq!(updates.skip_attempts, 1);
+        assert_eq!(updates.skip_undelivered.as_deref(), Some("0.2.0"));
+        assert!(updates.badge().is_some_and(|badge| badge.failed));
+        assert_eq!(updates.sheet_status(), Some(SKIP_WARNING_STATUS));
     }
 
     #[test]
     fn stop_skipping_abandons_a_pending_skip() {
         let (mut updates, _tx) = idle_updates(Some("0.2.0"), 1);
+        updates.skip_undelivered = Some("0.2.0".to_owned());
         let mut config = Settings::default();
 
         updates.stop_skipping(&mut config);
 
         assert!(updates.skip_pending.is_none());
         assert_eq!(updates.skip_attempts, 0);
+        assert!(updates.skip_undelivered.is_none());
         assert!(config.skipped_update_version.is_none());
+    }
+
+    /// The skip route runs through two selectors Sparkle does not declare in a
+    /// public header. Nothing in a build fails when they move — the skip just
+    /// stops arriving — so the linked framework is asked directly, here, where
+    /// a Sparkle bump that breaks `skip_current_update` is a red test instead
+    /// of a staged installer that runs at quit anyway. See
+    /// `vendor/sparkle-updater/LOCAL-PATCH.md`.
+    #[test]
+    fn the_pinned_framework_still_answers_the_skip_route() {
+        use objc2::runtime::AnyClass;
+        use objc2::sel;
+
+        let driver = AnyClass::get(c"SPUStandardUserDriver")
+            .expect("SPUStandardUserDriver is gone from the linked Sparkle");
+        assert!(
+            driver.instance_method(sel!(activeUpdateAlert)).is_some(),
+            "SPUStandardUserDriver no longer answers activeUpdateAlert"
+        );
+
+        let alert =
+            AnyClass::get(c"SUUpdateAlert").expect("SUUpdateAlert is gone from the linked Sparkle");
+        assert!(
+            alert.instance_method(sel!(skipThisVersion:)).is_some(),
+            "SUUpdateAlert no longer answers skipThisVersion:"
+        );
+    }
+
+    #[test]
+    fn a_skip_that_runs_out_of_resume_checks_warns_that_install_is_possible() {
+        let (mut updates, _tx) = idle_updates(Some("0.2.0"), SKIP_RESUME_ATTEMPTS);
+
+        updates.request_skip_cancel();
+
+        assert!(
+            updates.skip_pending.is_none(),
+            "the skip is no longer in flight"
+        );
+        assert_eq!(updates.skip_undelivered.as_deref(), Some("0.2.0"));
+        let badge = updates
+            .badge()
+            .expect("an undelivered skip keeps the badge up");
+        assert!(badge.failed, "an unconfirmed skip needs attention");
+        assert!(badge.text.contains("0.2.0"));
+        assert!(badge.detail.contains("may still install"));
+    }
+
+    #[test]
+    fn repeated_unsupported_replies_keep_the_warning_until_skip_is_sent() {
+        let (mut updates, _tx) = idle_updates(Some("0.2.0"), 1);
+
+        updates.record_skip_reply("0.2.0", Ok(SkipOutcome::Unsupported));
+        assert!(updates.skip_pending.is_none());
+        assert_eq!(updates.skip_undelivered.as_deref(), Some("0.2.0"));
+
+        updates.record_skip_reply("0.2.0", Ok(SkipOutcome::Unsupported));
+        assert_eq!(updates.skip_undelivered.as_deref(), Some("0.2.0"));
+        assert_eq!(
+            updates.sheet_version_line(),
+            "monopro 0.2.0 — skip not confirmed"
+        );
+
+        updates.record_skip_reply("0.2.0", Ok(SkipOutcome::Sent));
+        assert!(updates.skip_undelivered.is_none());
+    }
+
+    #[test]
+    fn skipping_an_update_that_never_staged_ends_quietly_when_the_feed_is_up_to_date() {
+        let (mut updates, tx) = idle_updates(Some("0.2.0"), 1);
+        updates.staged_seen = false;
+        tx.send(Notice::UpToDate)
+            .expect("the receiver is in `updates`");
+
+        updates.poll(&mut Settings::default());
+
+        assert!(updates.skip_pending.is_none());
+        assert!(updates.skip_undelivered.is_none());
+        assert!(updates.badge().is_none());
+        assert_eq!(updates.sheet_status(), Some("monopro is up to date"));
+    }
+
+    #[test]
+    fn a_skip_that_never_staged_runs_out_of_resume_checks_without_a_warning() {
+        let (mut updates, _tx) = idle_updates(Some("0.2.0"), SKIP_RESUME_ATTEMPTS);
+        updates.staged_seen = false;
+
+        updates.request_skip_cancel();
+
+        assert!(updates.skip_pending.is_none());
+        assert!(updates.skip_undelivered.is_none());
+        assert!(updates.badge().is_none());
+    }
+
+    #[test]
+    fn a_download_finishing_after_the_skip_still_arms_the_warning() {
+        let (mut updates, tx) = idle_updates(Some("0.2.0"), 1);
+        updates.staged_seen = false;
+        tx.send(Notice::Downloaded)
+            .expect("the receiver is in `updates`");
+        tx.send(Notice::UpToDate)
+            .expect("the receiver is in `updates`");
+
+        updates.poll(&mut Settings::default());
+
+        assert_eq!(updates.skip_undelivered.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn a_feed_with_nothing_to_offer_does_not_retire_the_warning() {
+        let (mut updates, tx) = idle_updates(None, 0);
+        updates.skip_undelivered = Some("0.2.0".to_owned());
+        tx.send(Notice::UpToDate)
+            .expect("the receiver is in `updates`");
+
+        updates.poll(&mut Settings::default());
+
+        assert_eq!(updates.skip_undelivered.as_deref(), Some("0.2.0"));
+        assert!(updates.badge().is_some_and(|badge| badge.failed));
+        assert_eq!(updates.sheet_status(), Some(SKIP_WARNING_STATUS));
     }
 }

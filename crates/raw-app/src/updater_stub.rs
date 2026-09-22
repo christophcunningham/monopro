@@ -49,6 +49,10 @@ impl Updates {
         false
     }
 
+    pub fn skip_warning_active(&self) -> bool {
+        false
+    }
+
     pub fn sheet_version_line(&self) -> String {
         "monopro".to_owned()
     }

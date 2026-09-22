@@ -13,6 +13,21 @@ use super::delegate::{EventCallback, SparkleDelegate};
 use crate::events::UpdateInfo;
 use crate::{Error, GentleReminders, RelaunchHandler, Result};
 
+/// What [`SparkleUpdater::skip_current_update`] was able to do.
+///
+/// `NoAlert` and `Unsupported` are different facts and must not be collapsed:
+/// the first is ordinary timing and worth retrying, the second means this
+/// binding and the linked framework have drifted and retrying cannot help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipOutcome {
+    /// The pending alert was answered with Skip.
+    Sent,
+    /// No alert is waiting to be answered yet.
+    NoAlert,
+    /// An alert is waiting but does not answer `skipThisVersion:`.
+    Unsupported,
+}
+
 fn is_valid_bundle() -> bool {
     unsafe {
         let bundle = NSBundle::mainBundle();
@@ -180,24 +195,22 @@ impl SparkleUpdater {
     /// update has already been staged for install-on-quit, cancels that staged
     /// installation instead of letting it run at quit.
     ///
-    /// Returns `Ok(false)` when no update alert is waiting to be answered.
-    ///
     /// `activeUpdateAlert` is declared in the Sparkle framework's shipped
     /// private headers; the pinned framework version is part of this binding.
-    pub fn skip_current_update(&self) -> Result<bool> {
+    pub fn skip_current_update(&self) -> Result<SkipOutcome> {
         let user_driver: Retained<NSObject> = unsafe { msg_send![&*self.controller, userDriver] };
         let alert: Option<Retained<NSObject>> =
             unsafe { msg_send![&*user_driver, activeUpdateAlert] };
         let Some(alert) = alert else {
-            return Ok(false);
+            return Ok(SkipOutcome::NoAlert);
         };
         let responds: bool =
             unsafe { msg_send![&*alert, respondsToSelector: sel!(skipThisVersion:)] };
         if !responds {
-            return Ok(false);
+            return Ok(SkipOutcome::Unsupported);
         }
         let _: () = unsafe { msg_send![&*alert, skipThisVersion: None::<&AnyObject>] };
-        Ok(true)
+        Ok(SkipOutcome::Sent)
     }
 
     pub fn can_check_for_updates(&self) -> Result<bool> {

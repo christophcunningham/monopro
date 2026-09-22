@@ -12364,7 +12364,7 @@ impl App {
             self.update_sheet_open = false;
             return;
         }
-        let (version_line, notes, date, status, failed) = {
+        let (version_line, notes, date, status, failed, skip_warning) = {
             let u = self.updates.as_ref().expect("checked above");
             (
                 u.sheet_version_line(),
@@ -12372,6 +12372,7 @@ impl App {
                 u.sheet_date().map(str::to_owned),
                 u.sheet_status().map(str::to_owned),
                 u.badge().is_some_and(|b| b.failed),
+                u.skip_warning_active(),
             )
         };
         // **Busy is the export thread or an unresolved quit confirmation.** A
@@ -12393,16 +12394,18 @@ impl App {
             theme::tracked(ui, "SOFTWARE UPDATE", theme::AMBER);
             ui.add_space(6.0);
             ui.label(theme::readout(version_line.clone()));
-            if let Some(d) = &date {
-                ui.label(theme::caption(d.clone()));
-            }
-            if !notes.is_empty() {
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .max_height(180.0)
-                    .show(ui, |ui| {
-                        ui.label(theme::label(notes.clone()));
-                    });
+            if !skip_warning {
+                if let Some(d) = &date {
+                    ui.label(theme::caption(d.clone()));
+                }
+                if !notes.is_empty() {
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            ui.label(theme::label(notes.clone()));
+                        });
+                }
             }
             if let Some(line) = &status {
                 ui.add_space(6.0);
@@ -12412,7 +12415,7 @@ impl App {
                     theme::caption(line.clone())
                 });
             }
-            if busy {
+            if busy && !skip_warning {
                 ui.add_space(6.0);
                 ui.label(theme::caption(
                     "Wait for the export to finish — and answer the quit prompt if one is \
@@ -12420,36 +12423,43 @@ impl App {
                 ));
             }
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                // The default choice, first and safest. Installs after a clean
-                // quit — Sparkle's staged installer does the swap at termination.
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Update on quit"))
-                    .clicked()
-                {
-                    update_on_quit = true;
+            if skip_warning {
+                // The app cannot promise either update action while Sparkle's
+                // answer to Skip is unknown. Settings can stop skipping later.
+                if ui.button("Close").clicked() {
+                    close = true;
                 }
-                if ui
-                    .add_enabled(
-                        restart_ready && !busy,
-                        egui::Button::new("Restart now"),
-                    )
-                    .on_disabled_hover_text(if busy {
-                        "an export is still being written"
-                    } else {
-                        "still downloading — it can restart once it is staged"
-                    })
-                    .clicked()
-                {
-                    restart_now = true;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Skip this version").clicked() {
-                        skip = true;
+            } else {
+                ui.horizontal(|ui| {
+                    // The default choice, first and safest. Installs after a clean
+                    // quit — Sparkle's staged installer does the swap at termination.
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Update on quit"))
+                        .clicked()
+                    {
+                        update_on_quit = true;
                     }
+                    if ui
+                        .add_enabled(restart_ready && !busy, egui::Button::new("Restart now"))
+                        .on_disabled_hover_text(if busy {
+                            "an export is still being written"
+                        } else {
+                            "still downloading — it can restart once it is staged"
+                        })
+                        .clicked()
+                    {
+                        restart_now = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Skip this version").clicked() {
+                            skip = true;
+                        }
+                    });
                 });
-            });
-            if let Some(v) = &skipped {
+            }
+            if !skip_warning
+                && let Some(v) = &skipped
+            {
                 ui.add_space(4.0);
                 ui.label(theme::caption(format!("skipping monopro {v}")));
             }

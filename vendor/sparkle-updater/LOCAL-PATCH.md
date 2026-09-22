@@ -26,11 +26,20 @@ Sparkle's own skip and, when an update is already staged, reaches
 
 ## Delta
 
-- `src/updater.rs`: added `skip_current_update()` and its doc comment. It asks
-  the controller for its `userDriver` (public property), the driver for its
-  `activeUpdateAlert` (declared in the framework's shipped `PrivateHeaders`),
-  and sends `skipThisVersion:` to the alert. Returns `Ok(false)` when there is
-  no pending alert.
+- `src/updater.rs`: added `skip_current_update()` and the `SkipOutcome` it
+  returns. It asks the controller for its `userDriver` (public property), the
+  driver for its `activeUpdateAlert` (declared in the framework's shipped
+  `PrivateHeaders`), and sends `skipThisVersion:` to the alert.
+- `src/lib.rs`: `SkipOutcome` added to the public re-exports.
+
+`SkipOutcome` distinguishes `NoAlert` — ordinary timing, the caller should ask
+again after the next update cycle — from `Unsupported`, which means the alert
+does not answer `skipThisVersion:` and this binding has drifted from the linked
+framework. Collapsing both to a bool is what made a drifted private API
+indistinguishable from "not yet", and a skip that silently never arrived
+indistinguishable from one that did. `crates/raw-app/src/updater.rs` checks both
+selectors against the linked framework in a macOS test, so a missing selector
+fails the test run rather than first appearing during a user's skip.
 
 Everything else is byte-for-byte upstream. The patch depends on Sparkle 2.9.6
 internals (`SPUStandardUserDriver.activeUpdateAlert`, `SUUpdateAlert`'s
