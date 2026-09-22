@@ -26,7 +26,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
    **Step 2:** Bound blur work with an appropriate reduced-resolution or more efficient filter, and retain valid upstream results when only downstream settings change. Preserve the mask's appearance, gray pivot, edges and export consistency.
 
-   **Source:** [blur.wgsl](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-gpu/src/blur.wgsl:60); [graph construction](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-graph/src/lib.rs:414).
+   **Source:** [blur.wgsl](crates/raw-gpu/src/blur.wgsl:60); [graph construction](crates/raw-graph/src/lib.rs:414).
 
 2. **[P1] Contrast Mask at supported zoom levels exceeds GPU texture limits; allocation churn starts much earlier.**
 
@@ -38,7 +38,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
    **Step 2:** Bound processing resolution and working memory, validate derived texture sizes, and handle unsupported requests cleanly. Merely enlarging the texture pool will not solve this growth.
 
-   **Source:** [zoom-scaled blur extent](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-graph/src/node.rs:165); [unchecked texture allocation](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-gpu/src/pool.rs:117); [pool retention limit](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-gpu/src/pool.rs:145).
+   **Source:** [zoom-scaled blur extent](crates/raw-graph/src/node.rs:165); [unchecked texture allocation](crates/raw-gpu/src/pool.rs:117); [pool retention limit](crates/raw-gpu/src/pool.rs:145).
 
 3. **[P1] Moving the cursor forces unnecessary full-image redraws.**
 
@@ -48,7 +48,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
    **Step 2:** Separate live-view validity from auxiliary sampling/histogram state and avoid repeating expensive shared processing. Removing only the dirty assignment is insufficient because the cached render key is also overwritten.
 
-   **Source:** [shared render state](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-gpu/src/lib.rs:1699); [histogram invalidation](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-gpu/src/lib.rs:2054); [sample invalidation](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-gpu/src/lib.rs:2113); [automatic cursor sampling](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/main.rs:9309).
+   **Source:** [shared render state](crates/raw-gpu/src/lib.rs:1699); [histogram invalidation](crates/raw-gpu/src/lib.rs:2054); [sample invalidation](crates/raw-gpu/src/lib.rs:2113); [automatic cursor sampling](crates/raw-app/src/main.rs:9309).
 
 4. **[P1] Exposure and mask edits run an unnecessary synchronous CPU blur before GPU rendering.**
 
@@ -58,7 +58,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
    **Step 2:** Make zone preparation demand-driven, keep its expensive work off the UI thread, and cache inputs appropriately. The zone histogram may still require this data when its panel is actually using it.
 
-   **Source:** [unconditional zone rebuild](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-gpu/src/lib.rs:1662); [CPU Gaussian](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-core/src/zone.rs:344).
+   **Source:** [unconditional zone rebuild](crates/raw-gpu/src/lib.rs:1662); [CPU Gaussian](crates/raw-core/src/zone.rs:344).
 
 5. **[P2] Unrelated controls unnecessarily rebuild all CPU histogram data.**
 
@@ -68,7 +68,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
    **Step 2:** Give each distribution a cache key containing only its actual inputs and compute it only when needed.
 
-   **Source:** [histogram cache and rebuild](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/histogram.rs:231); [per-frame histogram refresh](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/main.rs:11562).
+   **Source:** [histogram cache and rebuild](crates/raw-app/src/histogram.rs:231); [per-frame histogram refresh](crates/raw-app/src/main.rs:11562).
 
 6. **[P2] Many numeric fields cannot be nudged with Up/Down because the step rounds away.**
 
@@ -78,7 +78,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
    **Step 2:** Define meaningful numeric increments consistent with precision and units, including explicit integer steps. Check both focused display mode and text-edit mode across the affected controls.
 
-   **Source:** [shared numeric row](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/widgets.rs:534); [Contact Sheet integer fields](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/contact_sheet.rs:593); [Rename integer fields](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/rename.rs:222).
+   **Source:** [shared numeric row](crates/raw-app/src/widgets.rs:534); [Contact Sheet integer fields](crates/raw-app/src/contact_sheet.rs:593); [Rename integer fields](crates/raw-app/src/rename.rs:222).
 
 7. **[P2] Dodge & Burn tonal selection is shifted when Contrast Mask is enabled.**
 
@@ -88,7 +88,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
    **Step 2:** Align the two formulas and add CPU/GPU parity checks with active masking.
 
-   **Source:** [CPU formula](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-core/src/zone.rs:126); [GPU formula](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-gpu/src/contrast_mask.wgsl:49).
+   **Source:** [CPU formula](crates/raw-core/src/zone.rs:126); [GPU formula](crates/raw-gpu/src/contrast_mask.wgsl:49).
 
 8. **[P2] Undo while typing can undo photograph edits.**
 
@@ -98,7 +98,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
    **Step 2:** Route text-editing commands to the focused editor; apply photograph history commands only when that editor does not own them.
 
-   **Source:** [typing guard](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/hotkeys.rs:1126); [image Undo dispatch](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/main.rs:3063).
+   **Source:** [typing guard](crates/raw-app/src/hotkeys.rs:1126); [image Undo dispatch](crates/raw-app/src/main.rs:3063).
 
 9. **[P2] Unicode captions can make PNG export fail completely.**
 
@@ -108,7 +108,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
    **Step 2:** Use UTF-8 text chunks for these fields or omit incompatible redundant mirrors without failing image export.
 
-   **Source:** [PNG metadata mirrors](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/export.rs:1490).
+   **Source:** [PNG metadata mirrors](crates/raw-app/src/export.rs:1490).
 
 10. **[P2] JPEG export silently drops requested metadata.**
 
@@ -118,7 +118,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
     **Step 2:** Embed supported metadata in JPEG and verify a real readback, including Unicode values.
 
-    **Source:** [JPEG export branch](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/export.rs:966); [JPEG encoder](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/export.rs:1262).
+    **Source:** [JPEG export branch](crates/raw-app/src/export.rs:966); [JPEG encoder](crates/raw-app/src/export.rs:1262).
 
 11. **[P1] Framed proofs bypass output-size limits and can attempt enormous allocations.**
 
@@ -128,7 +128,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
     **Step 2:** Validate complete final dimensions and allocation sizes for every export type, before rendering or allocating.
 
-    **Source:** [master-only limit check](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/export.rs:798); [canvas allocation](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/export.rs:1043); [allowed margin range](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/main.rs:8057).
+    **Source:** [master-only limit check](crates/raw-app/src/export.rs:798); [canvas allocation](crates/raw-app/src/export.rs:1043); [allowed margin range](crates/raw-app/src/main.rs:8057).
 
 12. **[P2] The print loupe omits Toning.**
 
@@ -138,7 +138,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
     **Step 2:** Share the appropriate export-tail processing with the loupe, including toned color conversion.
 
-    **Source:** [loupe composition arguments](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/loupe.rs:583); [forced grayscale pixels](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/loupe.rs:606).
+    **Source:** [loupe composition arguments](crates/raw-app/src/loupe.rs:583); [forced grayscale pixels](crates/raw-app/src/loupe.rs:606).
 
 13. **[P2] The print loupe shows the wrong region/scale when output is reduced substantially.**
 
@@ -148,7 +148,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
     **Step 2:** Assemble the whole requested source region, or perform a correctly scaled render. Do not silently truncate a region and resample it as though it were complete.
 
-    **Source:** [loupe source request](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/loupe.rs:561); [silent patch clamp](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-gpu/src/lib.rs:1992).
+    **Source:** [loupe source request](crates/raw-app/src/loupe.rs:561); [silent patch clamp](crates/raw-gpu/src/lib.rs:1992).
 
 14. **[P2] Snapshot comparison can reapply bypassed modules.**
 
@@ -158,7 +158,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
     **Step 2:** Resolve module bypass consistently before rendering each snapshot.
 
-    **Source:** [raw snapshot parameters passed to renderer](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/main.rs:8858); [bypass resolution](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-core/src/params.rs:571).
+    **Source:** [raw snapshot parameters passed to renderer](crates/raw-app/src/main.rs:8858); [bypass resolution](crates/raw-core/src/params.rs:571).
 
 15. **[P2] Snapshot comparison ignores each snapshot's saved Decode/Luminance state.**
 
@@ -168,7 +168,7 @@ Priorities: **P1** means address in the first repair pass because of major respo
 
     **Step 2:** Associate each snapshot comparison with the correct prepared source and include its identity in cache validity.
 
-    **Source:** [shared current luminance](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/main.rs:8745); [cell cache key](/Users/christophercunningham/Documents/monopro/monopro_rs/Main/crates/raw-app/src/main.rs:8843).
+    **Source:** [shared current luminance](crates/raw-app/src/main.rs:8745); [cell cache key](crates/raw-app/src/main.rs:8843).
 
 The existing workspace suite passed with native GPU access: **1,062 passed, 0 failed, 4 ignored**. This includes **90 passing GPU render integration tests**. An initial sandbox run hid the GPU and produced eight adapter-related helper failures; those disappeared with native access. Some camera integration tests return early when the optional private `raws/` corpus is absent, so the pass count does not establish coverage for every camera. The supplied RAF was exercised separately for decoding, default reconstruction, GPU rendering and performance.
 
