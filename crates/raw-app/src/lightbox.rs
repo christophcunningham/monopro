@@ -2151,6 +2151,11 @@ impl Lightbox {
                         e.orientation = Some(next);
                     }
                     self.tiles.remove(&idx);
+                    // The full-preview key carries no orientation, and selection has
+                    // usually preloaded this frame at the old one.
+                    let full = self.full_key(idx);
+                    self.preview_textures.remove(&full);
+                    self.preview_queue.cancel(full);
                     touched = true;
                 }
                 Err(e) => errors.push(e),
@@ -9184,6 +9189,46 @@ mod tests {
         assert!(
             !lb.queue.is_busy(key),
             "Quick Look was put back behind thumbnail work"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_look_after_a_rotation_shows_the_turned_frame_not_the_preloaded_one() {
+        // Selecting a tile preloads its full preview at the old orientation, and the
+        // preview key has no orientation in it. Space straight after a turn showed
+        // that stale frame until something happened to retire the generation.
+        let ctx = egui::Context::default();
+        let dir = folder_of("turn-look", &[("a.dng", 0, None)]);
+        let mut lb = Lightbox::new();
+        lb.open_folder(&dir);
+        lb.selected = Some(0);
+        let key = lb.full_key(0);
+        let image = egui::ColorImage {
+            size: [1, 1],
+            pixels: vec![egui::Color32::BLACK],
+            source_size: egui::vec2(1.0, 1.0),
+        };
+        let texture = ctx.load_texture("unturned", image, egui::TextureOptions::LINEAR);
+        lb.preview_textures
+            .insert(key, PreviewTexture { texture, seen: 0 });
+
+        assert_eq!(lb.rotate(true), None);
+
+        assert!(
+            !lb.preview_textures.contains_key(&key),
+            "the preview loaded before the turn is still what Space would show"
+        );
+
+        lb.preview_queue.submit(key, decode::BACKGROUND, || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            None
+        });
+        lb.rotate(true);
+        assert!(
+            !lb.preview_queue.is_busy(key),
+            "a load begun at the old orientation was left to land"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
