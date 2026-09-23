@@ -2135,18 +2135,9 @@ impl Lightbox {
             if e.kind != Kind::Picture {
                 continue;
             }
-            let (path, from) = (e.path.clone(), e.orientation);
-            // **A quarter turn from where it is now**, which for a frame nobody has
-            // turned means from the file's own tag. Reading that costs a metadata
-            // probe, paid once per rotated frame on a keypress rather than per tile.
-            let current = from.unwrap_or_else(|| as_shot(&path));
-            let next = if clockwise {
-                current.right()
-            } else {
-                current.left()
-            };
-            match write_orientation(&path, next) {
-                Ok(()) => {
+            let path = e.path.clone();
+            match write_turn(&path, clockwise) {
+                Ok(next) => {
                     if let Some(e) = self.entries.get_mut(idx as usize) {
                         e.orientation = Some(next);
                     }
@@ -3850,8 +3841,9 @@ fn as_shot(path: &Path) -> raw_core::Orientation {
     probe.map_or_else(Default::default, |(_, m)| m.orientation)
 }
 
-/// Put `orientation` in the sidecar, keeping every other edit and all metadata.
-fn write_orientation(path: &Path, orientation: raw_core::Orientation) -> Result<(), String> {
+/// Turn the frame a quarter turn in its sidecar, crop included, keeping every other
+/// edit and all metadata. Returns the new orientation.
+fn write_turn(path: &Path, clockwise: bool) -> Result<raw_core::Orientation, String> {
     let (mut params, metadata) = match raw_core::sidecar::read(path) {
         raw_core::sidecar::Loaded::Ok(s) => (s.params, s.metadata),
         raw_core::sidecar::Loaded::Absent => Default::default(),
@@ -3861,9 +3853,17 @@ fn write_orientation(path: &Path, orientation: raw_core::Orientation) -> Result<
             return Err(format!("{}: {e}", name_of(path)));
         }
     };
-    params.composition.orientation = Some(orientation);
+    // A quarter turn from where it is now, which for a frame nobody has turned means
+    // from the file's own tag. That probe is paid only by an unturned frame.
+    let exif = if params.composition.orientation.is_some() {
+        raw_core::Orientation::default()
+    } else {
+        as_shot(path)
+    };
+    params.composition.turn(clockwise, exif);
     raw_core::sidecar::write(path, &params, &metadata)
-        .map_err(|e| format!("{}: {e}", name_of(path)))
+        .map_err(|e| format!("{}: {e}", name_of(path)))?;
+    Ok(params.composition.orientation(exif))
 }
 
 /// A camera thumbnail, drawn grey.
@@ -9189,6 +9189,49 @@ mod tests {
         assert!(
             !lb.queue.is_busy(key),
             "Quick Look was put back behind thumbnail work"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_in_lightbox_turns_the_crop_with_the_picture() {
+        use raw_core::composition::{Ratio, Rect};
+        let dir = folder_of("turn-crop", &[("a.dng", 0, None)]);
+        let path = dir.join("a.dng");
+        let mut params = raw_core::Params::default();
+        params.composition.orientation = Some(raw_core::Orientation::Rotate0);
+        // The top-left quarter: after a clockwise turn it is the top-right one.
+        params.composition.crop = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.5,
+            h: 0.5,
+        };
+        params.composition.ratio = Ratio::Fixed(1.5);
+        raw_core::sidecar::write(&path, &params, &Default::default()).expect("sidecar");
+        let mut lb = Lightbox::new();
+        lb.open_folder(&dir);
+        lb.selected = Some(0);
+
+        assert_eq!(lb.rotate(true), None);
+
+        let raw_core::sidecar::Loaded::Ok(after) = raw_core::sidecar::read(&path) else {
+            panic!("the sidecar did not survive the turn");
+        };
+        assert_eq!(
+            after.params.composition.crop,
+            Rect {
+                x: 0.5,
+                y: 0.0,
+                w: 0.5,
+                h: 0.5,
+            },
+            "the crop stayed where it was while the picture turned under it"
+        );
+        assert!(
+            after.params.composition.portrait,
+            "a locked 3:2 did not stand on its end with the frame"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

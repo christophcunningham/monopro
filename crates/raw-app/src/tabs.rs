@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use raw_core::composition::{Orientation, Rect};
+use raw_core::composition::Orientation;
 use raw_core::{Frame, History, LumaImage, Params, SensorImage};
 use raw_gpu::{Cell, Viewport};
 
@@ -1469,42 +1469,8 @@ impl Tab {
     /// the first press of `⌘]` on a portrait frame would straighten it to landscape
     /// instead of turning it.
     pub fn rotate(&mut self, clockwise: bool) {
-        let from = self.params.composition.orientation(self.exif_orientation());
-        let to = if clockwise { from.right() } else { from.left() };
-        self.params.composition.orientation = Some(to);
-        // **The crop turns with the picture.** It is normalised to a frame that has
-        // just transposed, so leaving the fractions alone would rotate the image and
-        // leave the crop pointing at a different part of it — you would turn a
-        // portrait and find you had cropped the sky.
-        //
-        // A quarter turn clockwise sends normalised `(u, v)` to `(1 - v, u)`, so the
-        // rectangle's new left edge comes from its old *bottom* edge. Transposing
-        // `x` and `y` is the mirror of the right answer and looks correct on a
-        // centred crop, which is exactly how it would survive being eyeballed.
-        let c = self.params.composition.crop;
-        self.params.composition.crop = if clockwise {
-            Rect {
-                x: 1.0 - c.y - c.h,
-                y: c.x,
-                w: c.h,
-                h: c.w,
-            }
-        } else {
-            Rect {
-                x: c.y,
-                y: 1.0 - c.x - c.w,
-                w: c.h,
-                h: c.w,
-            }
-        }
-        .sane();
-        // A locked 3:2 crop on its side is 3:2 stood on its end, which is what the
-        // `↕` flag means. Not `can_flip`: `Original` is defined against the frame,
-        // which transposed at this same moment, so its base already flipped and
-        // flipping the flag too would turn it back. See `flips_with_the_frame`.
-        if self.params.composition.ratio.flips_with_the_frame() {
-            self.params.composition.portrait = !self.params.composition.portrait;
-        }
+        let exif = self.exif_orientation();
+        self.params.composition.turn(clockwise, exif);
     }
 
     /// Pull the crop back onto real pixels after the angle moved under it.

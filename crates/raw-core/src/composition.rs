@@ -727,6 +727,40 @@ impl CompositionParams {
         self.orientation.unwrap_or(exif)
     }
 
+    /// Turn a quarter turn, taking the crop and a locked ratio with the picture.
+    ///
+    /// Every rotate route has to come through here: turning the orientation alone
+    /// leaves the normalised crop pointing at a different part of the picture.
+    pub fn turn(&mut self, clockwise: bool, exif: Orientation) {
+        let from = self.orientation(exif);
+        self.orientation = Some(if clockwise { from.right() } else { from.left() });
+        // A quarter turn clockwise sends normalised `(u, v)` to `(1 - v, u)`, so the
+        // new left edge comes from the old bottom edge. Transposing `x` and `y` is
+        // the mirror image, and looks right on a centred crop.
+        let c = self.crop;
+        self.crop = if clockwise {
+            Rect {
+                x: 1.0 - c.y - c.h,
+                y: c.x,
+                w: c.h,
+                h: c.w,
+            }
+        } else {
+            Rect {
+                x: c.y,
+                y: 1.0 - c.x - c.w,
+                w: c.h,
+                h: c.w,
+            }
+        }
+        .sane();
+        // Not `can_flip`: `Original` is defined against the frame, which has just
+        // transposed, so its base already flipped.
+        if self.ratio.flips_with_the_frame() {
+            self.portrait = !self.portrait;
+        }
+    }
+
     /// What this renders as when the module is switched off.
     ///
     /// **Orientation survives the bypass; crop, straighten and keystone do not**, which is
