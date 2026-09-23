@@ -1,7 +1,12 @@
 #!/bin/zsh
 # Assemble appcast.xml for a release, with Sparkle's generate_appcast.
 #
-#   packaging/macos/appcast <archives-dir> [--ed-key-file <key>]
+#   packaging/macos/appcast <archives-dir> [--ed-key-file <key>] \
+#     [--download-url-prefix https://github.com/christophcunningham/monopro/releases/download/v<version>/]
+#
+# Pass the release's own tag as the prefix. Without it the enclosure URL is derived
+# from SUFeedURL's releases/latest alias, which points at the wrong release as soon
+# as a newer one is published.
 #
 # <archives-dir> holds the notarized ZIP enclosures to publish, the previous
 # appcast.xml when extending an existing feed, and release notes as sibling
@@ -27,6 +32,7 @@ sparkle="$here/Sparkle"
 
 archives=
 key_args=()
+prefix_args=()
 while (( $# )); do
   case "$1" in
     --ed-key-file)
@@ -34,7 +40,12 @@ while (( $# )); do
       key_args=(--ed-key-file "$2")
       shift 2
       ;;
-    -*) echo "usage: packaging/macos/appcast <archives-dir> [--ed-key-file <key>]" >&2; exit 2 ;;
+    --download-url-prefix)
+      [[ "$2" == https://*/ ]] || { echo "appcast: --download-url-prefix needs an https URL ending in /" >&2; exit 2; }
+      prefix_args=(--download-url-prefix "$2")
+      shift 2
+      ;;
+    -*) echo "usage: packaging/macos/appcast <archives-dir> [--ed-key-file <key>] [--download-url-prefix <url>/]" >&2; exit 2 ;;
     *)
       if [[ -n "$archives" ]]; then
         echo "appcast: one archives directory, please" >&2
@@ -61,7 +72,7 @@ fi
 # items rather than linked: the update sheet renders them as plain text from
 # the appcast itself and caches them, so an offline launch still shows what
 # the release changed.
-"$sparkle/sparkle-bin/generate_appcast" --embed-release-notes "${key_args[@]}" "$archives"
+"$sparkle/sparkle-bin/generate_appcast" --embed-release-notes "${key_args[@]}" "${prefix_args[@]}" "$archives"
 
 cast="$archives/appcast.xml"
 [[ -s "$cast" ]] || { echo "appcast: generate_appcast produced no $cast" >&2; exit 1 }

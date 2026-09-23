@@ -100,6 +100,7 @@ Publishing a release:
 2. Publish both assets on the GitHub release, together with release notes as a
    plain-text file named after the ZIP (`monopro-<version>-macos.txt`).
 3. Extend the feed with `packaging/macos/appcast <archives-dir>
+   --download-url-prefix https://github.com/christophcunningham/monopro/releases/download/v<version>/
    [--ed-key-file <key>]`: a staging directory holding the new ZIP, its notes
    file, and the previous release's `appcast.xml`. The tool embeds the notes
    into each item, signs enclosures, and prunes versions older than the newest;
