@@ -91,7 +91,7 @@ The lockfile also records transitive dependencies.
 
 | Dependency | Version | Use |
 |---|---|---|
-| rawler | 0.7.2 | RAW decoding |
+| rawler | 0.8.0 | RAW decoding |
 | wgpu | 29.0.4 | GPU processing |
 | eframe, egui, egui-wgpu | 0.35.0 | Interface and rendering |
 | egui_tiles | 0.16.0 | Panel layout |

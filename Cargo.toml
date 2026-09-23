@@ -28,7 +28,7 @@ raw-core = { path = "crates/raw-core" }
 raw-graph = { path = "crates/raw-graph" }
 raw-gpu = { path = "crates/raw-gpu" }
 
-rawler = "0.7.2"
+rawler = "0.8.0"
 # Must match what egui-wgpu 0.35 depends on, or wgpu types from eframe's render
 # state are a *different crate* to ours and will not typecheck. egui-wgpu 0.35
 # pins wgpu 29.0; wgpu 30 exists but nothing in the egui stack uses it yet.
