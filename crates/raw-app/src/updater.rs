@@ -557,10 +557,13 @@ impl Updates {
                     }
                 }
                 Notice::Downloaded => {
+                    // Not staged yet: Sparkle validates the signature after the
+                    // download, and a rejected update must not read as ready.
+                    // `StagedForQuit` is the event that follows a valid one.
                     self.staged_seen = true;
-                    self.stage = Stage::Staged;
-                    self.status =
-                        Some("update downloaded — it installs when monopro quits".to_owned());
+                    if self.stage != Stage::Staged {
+                        self.status = Some("verifying the update…".to_owned());
+                    }
                 }
                 Notice::StagedForQuit => {
                     self.staged_seen = true;
@@ -1024,6 +1027,41 @@ mod tests {
         assert!(updates.skip_pending.is_none());
         assert!(updates.skip_undelivered.is_none());
         assert!(updates.badge().is_none());
+    }
+
+    #[test]
+    fn an_update_rejected_after_download_reads_as_failed_not_ready() {
+        // Sparkle checks the signature after the download finishes. A tampered
+        // update showed "0.2.0 ready" with install buttons after being refused.
+        let (mut updates, tx) = idle_updates(None, 0);
+        updates.version = Some("0.2.0".to_owned());
+        updates.stage = Stage::Available;
+        tx.send(Notice::Downloaded)
+            .expect("the receiver is in `updates`");
+        tx.send(Notice::Failed("The update is improperly signed".to_owned()))
+            .expect("the receiver is in `updates`");
+
+        updates.poll(&mut Settings::default());
+
+        let badge = updates.badge().expect("a failed update keeps the badge up");
+        assert!(badge.failed, "a rejected update reads as {:?}", badge.text);
+        assert!(!updates.restart_now_ready(), "Restart now offered for a rejected update");
+    }
+
+    #[test]
+    fn a_valid_download_is_ready_once_sparkle_stages_it() {
+        let (mut updates, tx) = idle_updates(None, 0);
+        updates.version = Some("0.2.0".to_owned());
+        updates.stage = Stage::Available;
+        tx.send(Notice::Downloaded)
+            .expect("the receiver is in `updates`");
+        tx.send(Notice::StagedForQuit)
+            .expect("the receiver is in `updates`");
+
+        updates.poll(&mut Settings::default());
+
+        assert_eq!(updates.badge().map(|b| b.text), Some("0.2.0 ready".to_owned()));
+        assert!(updates.restart_now_ready());
     }
 
     #[test]

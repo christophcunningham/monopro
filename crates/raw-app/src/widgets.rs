@@ -1654,6 +1654,16 @@ pub struct UpdateBadge {
     pub failed: bool,
 }
 
+/// What the title strip's update badge was asked to do this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BadgeClick {
+    None,
+    /// The body: open the update sheet.
+    Open,
+    /// The `×`: hide the badge until the update state changes.
+    Dismiss,
+}
+
 /// Paint the window's app strip on macOS and its mode/status strip elsewhere.
 ///
 /// The window is created with `fullsize_content_view` and a hidden titlebar so the
@@ -1676,14 +1686,13 @@ pub struct UpdateBadge {
 ///
 /// `update` is the badge that occupies the strip's right end when the updater has
 /// something to say. The centre readout stays centred on the *window* whether or
-/// not the badge is up; a badge appearing never displaces it. Returns whether the
-/// badge was clicked this frame.
+/// not the badge is up; a badge appearing never displaces it.
 pub fn title_strip(
     ui: &mut egui::Ui,
     title: &str,
     centre: &str,
     update: Option<&UpdateBadge>,
-) -> bool {
+) -> BadgeClick {
     let h = crate::theme::TITLE_STRIP;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -1709,30 +1718,37 @@ pub fn title_strip(
     }
 
     let Some(badge) = update else {
-        return false;
+        return BadgeClick::None;
     };
-    // The pill is sized to its own text and pinned to the right end, clear of the
-    // edge by the same inset the strip uses at the top. Click opens the update
-    // sheet — the only interaction the pill has.
+    // Pinned to the right end, clear of the edge by the strip's own inset. Square,
+    // like every other control, with the body opening the sheet and the `×` at its
+    // right end dismissing it.
     let font = egui::FontId::proportional(crate::theme::size::CAPTION);
     let galley = painter.layout_no_wrap(badge.text.clone(), font.clone(), Color32::WHITE);
     let pad_x = 8.0;
-    let pill = Rect::from_center_size(
-        pos2(
-            rect.right() - crate::theme::TITLE_INSET.min(16.0) - galley.size().x / 2.0 - pad_x,
-            rect.center().y,
-        ),
-        vec2(galley.size().x + pad_x * 2.0, h - 8.0),
+    let close_w = h - 8.0;
+    let height = h - 8.0;
+    let right = rect.right() - crate::theme::TITLE_INSET.min(16.0);
+    let close = Rect::from_min_size(
+        pos2(right - close_w, rect.center().y - height / 2.0),
+        vec2(close_w, height),
     );
-    let clicked = ui
-        .interact(pill, ui.id().with("update-badge"), Sense::click())
+    let body = Rect::from_min_max(
+        pos2(close.left() - galley.size().x - pad_x * 2.0, close.top()),
+        pos2(close.left(), close.bottom()),
+    );
+    let body_response = ui
+        .interact(body, ui.id().with("update-badge"), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(if badge.detail.is_empty() {
             "An update is available — click for details".to_owned()
         } else {
             badge.detail.clone()
-        })
-        .clicked();
+        });
+    let close_response = ui
+        .interact(close, ui.id().with("update-badge-close"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Hide until the update changes");
     // Amber is the strip's "there is something waiting" ink — the loupe's
     // argument: ruby would put this in the class of marks that change the
     // picture. A failed check is the exception, and borrows ruby's pair.
@@ -1741,9 +1757,28 @@ pub fn title_strip(
     } else {
         (crate::theme::AMBER.linear_multiply(0.22), crate::theme::AMBER)
     };
-    painter.rect_filled(pill, pill.height() / 2.0, ground);
-    painter.text(pill.center(), egui::Align2::CENTER_CENTER, &badge.text, font, ink);
-    clicked
+    let whole = body.union(close);
+    painter.rect_filled(whole, 0.0, ground);
+    if body_response.hovered() {
+        painter.rect_filled(body, 0.0, ink.linear_multiply(0.12));
+    }
+    if close_response.hovered() {
+        painter.rect_filled(close, 0.0, ink.linear_multiply(0.12));
+    }
+    painter.vline(
+        close.left(),
+        close.y_range().shrink(3.0),
+        egui::Stroke::new(1.0, ink.linear_multiply(0.35)),
+    );
+    painter.text(body.center(), egui::Align2::CENTER_CENTER, &badge.text, font.clone(), ink);
+    painter.text(close.center(), egui::Align2::CENTER_CENTER, "×", font, ink);
+    if close_response.clicked() {
+        BadgeClick::Dismiss
+    } else if body_response.clicked() {
+        BadgeClick::Open
+    } else {
+        BadgeClick::None
+    }
 }
 
 /// The toning placement curve: **strength against print tone**.

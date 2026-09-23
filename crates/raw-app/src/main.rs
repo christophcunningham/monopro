@@ -568,6 +568,9 @@ struct App {
     /// The update sheet (badge click, menu route, About button). View state, not
     /// a preference — nothing here is written to `settings.toml`.
     update_sheet_open: bool,
+    /// The update badge the user dismissed with its `×`. It stays hidden while
+    /// the badge would say the same thing, and returns when that changes.
+    update_badge_dismissed: Option<(String, bool)>,
     /// A one-line message from a key whose feature is not built yet. Shown in the
     /// footer so an unbuilt binding reports itself rather than doing nothing.
     pending_note: Option<String>,
@@ -612,6 +615,7 @@ impl App {
             menus_installed: false,
             updates: None,
             update_sheet_open: false,
+            update_badge_dismissed: None,
             tabs: Tabs::new(),
             lightbox: lightbox::Lightbox::new(),
             queue: decode::Queue::new(decode::WORKERS),
@@ -3611,18 +3615,27 @@ impl eframe::App for App {
                     .updates
                     .as_ref()
                     .and_then(|updates| updates.badge())
+                    .filter(|b| {
+                        self.update_badge_dismissed.as_ref()
+                            != Some(&(b.text.clone(), b.failed))
+                    })
                     .map(|b| widgets::UpdateBadge {
                         text: b.text,
                         detail: b.detail,
                         failed: b.failed,
                     });
-                if widgets::title_strip(
+                match widgets::title_strip(
                     ui,
                     platform::strip_title(self.lightbox.active),
                     &exposure,
                     badge.as_ref(),
                 ) {
-                    self.update_sheet_open = true;
+                    widgets::BadgeClick::None => {}
+                    widgets::BadgeClick::Open => self.update_sheet_open = true,
+                    widgets::BadgeClick::Dismiss => {
+                        self.update_badge_dismissed =
+                            badge.map(|b| (b.text, b.failed));
+                    }
                 }
             });
 
@@ -12414,9 +12427,9 @@ impl App {
                 ));
             }
             ui.add_space(10.0);
-            if skip_warning {
-                // The app cannot promise either update action while Sparkle's
-                // answer to Skip is unknown. Settings can stop skipping later.
+            if skip_warning || failed {
+                // Nothing is staged to install: a rejected or failed update, or a
+                // skip Sparkle has not confirmed. Settings can stop skipping later.
                 if ui.button("Close").clicked() {
                     close = true;
                 }
