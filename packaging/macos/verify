@@ -10,12 +10,14 @@ app="$repo_root/dist/monopro.app"
 dmg="$repo_root/dist/monopro-$version.dmg"
 arm64_only=0
 notarized=0
+feed=0
 
 while (( $# )); do
   case "$1" in
     --arm64) arm64_only=1 ;;
-    --notarized) notarized=1 ;;
-    *) echo "usage: packaging/macos/verify [--arm64] [--notarized]" >&2; exit 2 ;;
+    --notarized) notarized=1; feed=1 ;;
+    --feed) feed=1 ;;
+    *) echo "usage: packaging/macos/verify [--arm64] [--notarized | --feed]" >&2; exit 2 ;;
   esac
   shift
 done
@@ -40,8 +42,8 @@ test -f "$dmg"
 # The Sparkle framework must be present, executable, and covered by the bundle's
 # signature; the plist must carry the updater's keys (automatic checks stay off
 # in a local no-key build — that is the deliberate quiet state, not a defect).
-# The ZIP enclosure and its EdDSA signature exist only on the notarized path,
-# which is the only path that produces a publishable feed.
+# The ZIP enclosure and its EdDSA signature exist on the publishable paths:
+# notarized (--signed) and ad-hoc with a feed (--release).
 framework="$app/Contents/Frameworks/Sparkle.framework"
 test -d "$framework"
 test -x "$framework/Autoupdate"
@@ -51,10 +53,10 @@ codesign --verify --deep --strict "$framework"
 # The rpath that resolves Contents/Frameworks when dyld loads the framework.
 otool -l "$app/Contents/MacOS/monopro" | grep -q '@executable_path/../Frameworks'
 zip="$repo_root/dist/monopro-$version-macos.zip"
-if (( notarized )); then
-  feed=$(plutil -extract SUFeedURL raw -o - "$app/Contents/Info.plist")
-  [[ "$feed" == https://* ]] || {
-    echo "SUFeedURL is not https: $feed" >&2
+if (( feed )); then
+  feed_url=$(plutil -extract SUFeedURL raw -o - "$app/Contents/Info.plist")
+  [[ "$feed_url" == https://* ]] || {
+    echo "SUFeedURL is not https: $feed_url" >&2
     exit 1
   }
   [[ -n "$(plutil -extract SUPublicEDKey raw -o - "$app/Contents/Info.plist")" ]]

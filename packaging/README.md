@@ -29,8 +29,13 @@ Run on macOS with both Rust targets installed:
 ```sh
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 ./package                         # local, ad-hoc-signed test package
-./package --signed                # public release package
+./package --release               # public release package, ad-hoc signed
+./package --signed                # public release package, Developer ID signed
 ```
+
+`--release` is the current public path: ad-hoc signed and not notarized, so a first
+install needs **Open Anyway** in System Settings, but it carries the update feed and
+produces the EdDSA-signed ZIP. Updates Sparkle installs afterwards need no approval.
 
 `--signed` requires a Developer ID Application identity in
 `MONOPRO_MAC_SIGNING_IDENTITY` and a notarytool keychain profile in
@@ -88,8 +93,8 @@ still enable a deliberate local test.
 
 Publishing a release:
 
-1. `./package --signed` produces the DMG (for humans) and the notarized ZIP of
-   the signed app (the enclosure Sparkle downloads), plus
+1. `./package --release` (or `--signed`) produces the DMG (for humans) and the ZIP
+   of the app (the enclosure Sparkle downloads, notarized on `--signed`), plus
    `monopro-<version>-macos.zip.ed.sig` — the EdDSA signature over the ZIP
    bytes from `sign_update`.
 2. Publish both assets on the GitHub release, together with release notes as a

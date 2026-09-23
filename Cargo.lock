@@ -3186,7 +3186,7 @@ checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
 name = "raw-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "eframe",
@@ -3218,7 +3218,7 @@ dependencies = [
 
 [[package]]
 name = "raw-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "image",
@@ -3233,7 +3233,7 @@ dependencies = [
 
 [[package]]
 name = "raw-gpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "pollster",
@@ -3244,7 +3244,7 @@ dependencies = [
 
 [[package]]
 name = "raw-graph"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "raw-core",
  "thiserror 2.0.19",
