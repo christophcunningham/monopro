@@ -47,6 +47,11 @@ views, and the print loupe provide measurement and review tools.
 
 ## Pipeline
 
+Develop supports sensors with a 2×2 Bayer color filter array. **Fujifilm X-Trans
+sensors (X-series bodies such as the X-T5 or X-T30 III) are not supported yet:**
+Lightbox browses them from their embedded previews, but Develop cannot open them.
+Fujifilm GFX bodies use Bayer sensors and are supported.
+
 RAW decoding preserves the Bayer color filter array. Each photosite is black-subtracted,
 normalized to its channel's white level, and gain-equalized:
 
