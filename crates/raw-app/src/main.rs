@@ -8850,7 +8850,7 @@ impl App {
         // Two is the least that compares anything. One pinned snapshot beside nothing
         // is the live view with a border, so the grid declines and the viewport draws.
         let pinned = tab.snapshots.pinned();
-        let looks: Vec<raw_core::Params> = pinned.iter().map(|s| s.params.clone()).collect();
+        let looks = tab.snapshots.pinned_looks();
         let names: Vec<String> = pinned.iter().map(|s| s.label.clone()).collect();
         let (n, slots) = tabs::Compare::counts(tab.compare.n_up, looks.len());
         if n < 2 {

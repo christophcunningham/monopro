@@ -117,6 +117,12 @@ impl Snapshots {
             .collect()
     }
 
+    /// What each pinned snapshot renders as: its params with module bypass resolved.
+    /// The stored params keep the bypassed values, as the live edit does.
+    pub fn pinned_looks(&self) -> Vec<Params> {
+        self.pinned().iter().map(|s| s.params.effective()).collect()
+    }
+
     pub fn pinned_count(&self) -> usize {
         self.pinned().len()
     }
@@ -253,6 +259,29 @@ mod tests {
     /// A `w x h` image where every pixel carries `v`.
     fn flat(w: u32, h: u32, v: u8) -> Vec<u8> {
         vec![v; (w * h * 4) as usize]
+    }
+
+    #[test]
+    fn a_compared_snapshot_leaves_out_the_modules_it_had_bypassed() {
+        let mut p = Params::default();
+        p.exposure.ev = 1.5;
+        p.exposure.enabled = false;
+        let mut snapshots = Snapshots::default();
+        snapshots.capture(p, None);
+        snapshots.capture(Params::default(), None);
+        for s in &mut snapshots.items {
+            s.pinned = true;
+        }
+
+        let looks = snapshots.pinned_looks();
+        assert!(
+            looks.iter().all(|look| look.exposure.ev == 0.0),
+            "a bypassed exposure was drawn in the compare grid"
+        );
+        assert!(
+            snapshots.pinned().iter().any(|s| s.params.exposure.ev == 1.5),
+            "resolving the bypass lost the stored edit"
+        );
     }
 
     #[test]
