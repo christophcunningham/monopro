@@ -362,31 +362,24 @@ struct CurvePresetNameDialog {
     request_focus: bool,
 }
 
-/// Resolve the complete master grid, including FRAME, and enforce the allocation
+/// Resolve the complete export grid, including FRAME, and enforce the allocation
 /// limits on the file rather than only on the photograph inside it.
-fn master_layout(
+fn export_layout(
     params: &Params,
     picture: raw_core::Dims,
+    proof: Option<export::ProofScale>,
 ) -> Result<raw_core::frame::PixelLayout, String> {
     let effective = params.effective();
-    let image = effective.output.target_dims(picture);
+    let image = match proof {
+        Some(scale) => scale.dims(picture),
+        None => effective.output.target_dims(picture),
+    };
     let (w, h) = effective.output.print_inches(picture);
     let layout = effective
         .frame
         .pixel_layout(image, [w, h])
         .map_err(|e| format!("FRAME cannot be resolved: {e}"))?;
-    if layout.outer.w > OutputParams::MAX_EDGE as usize
-        || layout.outer.h > OutputParams::MAX_EDGE as usize
-        || (layout.outer.w as u64) * (layout.outer.h as u64) > OutputParams::MAX_PIXELS
-    {
-        return Err(format!(
-            "output would be {} x {} px — past the {} px edge / {} MP limit",
-            layout.outer.w,
-            layout.outer.h,
-            OutputParams::MAX_EDGE,
-            OutputParams::MAX_PIXELS / 1_000_000
-        ));
-    }
+    export::within_limits(layout.outer)?;
     Ok(layout)
 }
 
@@ -1481,11 +1474,9 @@ impl App {
         // Before the file dialog, not after: being asked where to put a file and then
         // told it cannot be written is worse than being told first. The button is
         // greyed for the same reason, but ⌘E does not go through the button.
-        // A proof is a fraction of the picture and cannot exceed it, so only a master
-        // can be asked for something past the limits.
+        // Proofs too: FRAME margins are physical and do not shrink with the proof.
         if let Some(d) = tab.output_dims()
-            && proof.is_none()
-            && let Err(why) = master_layout(&tab.params, d)
+            && let Err(why) = export_layout(&tab.params, d, proof)
         {
             tab.error = Some(why);
             return;
@@ -6257,7 +6248,7 @@ impl App {
         let can_export = self.tabs.active().is_some_and(|t| {
             t.has_image()
                 && t.output_dims()
-                    .is_none_or(|d| master_layout(&t.params, d).is_ok())
+                    .is_none_or(|d| export_layout(&t.params, d, None).is_ok())
         }) && self.export_rx.is_none();
         let exporting = self.export_rx.is_some();
         let export_target = &mut self.export_target;

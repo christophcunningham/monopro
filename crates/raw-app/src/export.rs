@@ -770,11 +770,41 @@ impl Spec {
         self.frame.pixel_layout(self.image_dims(picture), [w, h])
     }
 
+    /// [`Self::frame_layout`], refused when the complete file is past the limits.
+    ///
+    /// Proofs are checked too: FRAME margins are physical, so a proof that keeps its
+    /// picture's pixels can still outgrow any limit.
+    pub fn checked_layout(&self, picture: Dims) -> Result<raw_core::frame::PixelLayout, String> {
+        let layout = self
+            .frame_layout(picture)
+            .map_err(|e| format!("FRAME cannot be resolved: {e}"))?;
+        within_limits(layout.outer)?;
+        Ok(layout)
+    }
+
     /// The resolution tag, as a whole number. Both containers want an integer and
     /// neither wants zero.
     fn dpi(&self) -> u32 {
         self.output.ppi.round().max(1.0) as u32
     }
+}
+
+/// Refuse a file past `OutputParams`' edge and pixel-count limits. `outer` is the
+/// complete file, FRAME included.
+pub fn within_limits(outer: Dims) -> Result<(), String> {
+    if outer.w > OutputParams::MAX_EDGE as usize
+        || outer.h > OutputParams::MAX_EDGE as usize
+        || (outer.w as u64) * (outer.h as u64) > OutputParams::MAX_PIXELS
+    {
+        return Err(format!(
+            "output would be {} x {} px — past the {} px edge / {} MP limit",
+            outer.w,
+            outer.h,
+            OutputParams::MAX_EDGE,
+            OutputParams::MAX_PIXELS / 1_000_000
+        ));
+    }
+    Ok(())
 }
 
 /// Encode scene-referred f32 and write it.
@@ -791,25 +821,8 @@ pub fn write(path: &Path, w: u32, h: u32, scene: &[f32], spec: &Spec) -> std::io
         h: h as usize,
     };
     let frame_layout = spec
-        .frame_layout(picture)
-        .map_err(|e| std::io::Error::other(format!("FRAME cannot be resolved: {e}")))?;
-    // A proof is bounded by the picture it came from, so only a master can ask for
-    // something past the limits. The limit is on the complete file, including FRAME.
-    if spec.proof.is_none()
-        && (frame_layout.outer.w > OutputParams::MAX_EDGE as usize
-            || frame_layout.outer.h > OutputParams::MAX_EDGE as usize
-            || (frame_layout.outer.w as u64) * (frame_layout.outer.h as u64)
-                > OutputParams::MAX_PIXELS)
-    {
-        let d = frame_layout.outer;
-        return Err(std::io::Error::other(format!(
-            "output would be {} x {} px, past the {} px edge / {} MP limit",
-            d.w,
-            d.h,
-            OutputParams::MAX_EDGE,
-            OutputParams::MAX_PIXELS / 1_000_000,
-        )));
-    }
+        .checked_layout(picture)
+        .map_err(std::io::Error::other)?;
 
     // Tone map FIRST, then resize, then encode. The order is the whole of
     // `raw_core::resample`'s module note: resizing L\* codes averages perceptual
@@ -1659,6 +1672,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_framed_proof_past_the_output_limits_is_refused_before_it_allocates() {
+        // 400 in margins at 300 ppi: a proof of a 100 px picture is a 240,100 px file.
+        let spec = Spec::proof(
+            Target::default(),
+            ToneMap::Clip,
+            OutputParams {
+                ppi: 300.0,
+                ..Default::default()
+            },
+            Tail {
+                frame: raw_core::FrameParams {
+                    enabled: true,
+                    margins: raw_core::frame::Margins::all(400.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            None,
+            ProofScale::Full,
+        );
+        let picture = Dims { w: 100, h: 100 };
+        assert!(
+            spec.checked_layout(picture).is_err(),
+            "a proof's FRAME took it past the limits unchecked"
+        );
+        let dir = std::env::temp_dir().join(format!("monopro-proof-limit-{}", std::process::id()));
+        let err = write(&dir.join("proof.tif"), 100, 100, &[], &spec)
+            .expect_err("an oversized proof was written");
+        assert!(err.to_string().contains("limit"), "{err}");
     }
 
     #[test]
