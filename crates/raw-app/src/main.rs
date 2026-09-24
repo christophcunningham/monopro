@@ -30,6 +30,7 @@
 //! The pool being app-level is what made tabs cheap; see
 //! `raw_gpu::pool`.
 
+mod cli;
 mod contact_sheet;
 mod crop;
 mod curve_presets;
@@ -80,55 +81,11 @@ use layout::{Head, HeadClicks, Layout, Pane};
 use tabs::{Image, Render, Tab, TabId, Tabs};
 
 fn main() -> eframe::Result<()> {
-    // Headless export: `raw-app --export <raw> <out.tif|out.png>`. No window, no
-    // dialog. Exists so the export path can be exercised end to end without a GUI —
-    // which is also what makes it usable for batch work.
+    // `monopro render …` and `monopro info …` run here and exit, before a window
+    // or an event loop exists. See `cli`.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == "--export") {
-        if args.len() < 3 {
-            eprintln!(
-                "usage: raw-app --export <raw> <out.tif|out.png> \
-                 [--agx] [--8bit] [--mask <spacer_pct>] [--demosaic <algo>]"
-            );
-            std::process::exit(2);
-        }
-        // `--mask <spacer>` turns Contrast Mask on at its default gamma. Exists so
-        // the module can be judged on real frames, and timed, without a window.
-        // The value is a percentage of the frame diagonal, matching the slider.
-        let mask = args
-            .iter()
-            .position(|a| a == "--mask")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|v| v.parse::<f32>().ok());
-        // `--demosaic <algo>` switches to full-resolution sampling with that
-        // algorithm. The demosaic modes are exactly the ones that have to be
-        // compared at 1:1 on real frames, which is not something a window is good
-        // at doing reproducibly.
-        let algo = args
-            .iter()
-            .position(|a| a == "--demosaic")
-            .and_then(|i| args.get(i + 1))
-            .map(|name| {
-                DemosaicAlgo::UI_ORDER
-                    .into_iter()
-                    .find(|a| a.label().eq_ignore_ascii_case(name))
-                    .unwrap_or_else(|| {
-                        eprintln!(
-                            "unknown demosaic algorithm {name:?}; have {:?}",
-                            DemosaicAlgo::UI_ORDER.map(|a| a.label())
-                        );
-                        std::process::exit(2);
-                    })
-            });
-        headless_export(
-            &args[1],
-            &args[2],
-            args.iter().any(|a| a == "--agx"),
-            args.iter().any(|a| a == "--8bit"),
-            mask,
-            algo,
-        );
-        return Ok(());
+    if let Some(code) = cli::run(&args) {
+        std::process::exit(code);
     }
 
     let options = eframe::NativeOptions {
@@ -186,169 +143,6 @@ fn wgpu_config() -> egui_wgpu::WgpuConfiguration {
         });
     }
     cfg
-}
-
-/// Run the whole pipeline once and write a file. Same code path as the GUI export,
-/// minus the window.
-fn headless_export(
-    input: &str,
-    output: &str,
-    agx: bool,
-    eight: bool,
-    mask: Option<f32>,
-    algo: Option<DemosaicAlgo>,
-) {
-    let out = std::path::Path::new(output);
-    let target = export::Target {
-        container: match out.extension().and_then(|e| e.to_str()) {
-            Some("png") => export::Container::Png,
-            _ => export::Container::Tiff,
-        },
-        depth: if eight {
-            export::Depth::Eight
-        } else {
-            export::Depth::Sixteen
-        },
-        compression: export::Compression::None,
-        // The headless path writes masters. A proof is a thing you look at, and this
-        // one has nobody looking at it.
-        space: export::Space::Monostar,
-    };
-
-    // Start from the sidecar when there is one, so a batch export renders what was
-    // actually edited rather than defaults. The flags below then override it, which
-    // is what a flag on top of a saved state should do.
-    let mut params = match sidecar::read(std::path::Path::new(input)) {
-        sidecar::Loaded::Ok(s) => {
-            println!(
-                "read {} (schema {})",
-                sidecar::path_for(input.as_ref()).display(),
-                s.schema
-            );
-            s.params
-        }
-        sidecar::Loaded::Corrupt(e) => {
-            // Exporting at defaults from a file the user believes carries their
-            // edits would silently ship the wrong picture.
-            eprintln!("sidecar unreadable, refusing to export at defaults: {e}");
-            std::process::exit(1);
-        }
-        sidecar::Loaded::Absent => Params::default(),
-    };
-    let metadata = sidecar::effective_metadata(std::path::Path::new(input)).unwrap_or_default();
-    if agx {
-        params.display.enabled = true;
-        params.display.tone_map = ToneMap::AGX_DEFAULT;
-    }
-    if let Some(spacer) = mask {
-        params.contrast_mask.enabled = true;
-        params.contrast_mask.spacer = spacer;
-    }
-    if let Some(algo) = algo {
-        params.luminance.sampling = Sampling::Demosaic(algo);
-    }
-    // Headless follows the same bypass resolution as a live tab. In particular,
-    // DISPLAY-off means Clip while retaining the required transfer function.
-    params = params.effective();
-
-    let sensor = match SensorImage::load(std::path::Path::new(input)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("load failed: {e}");
-            std::process::exit(1);
-        }
-    };
-    let (sc, _) = scene::decode(&sensor, params.decode);
-    let luma = scene::derive_luminance(&sc, params.luminance.sampling, params.luminance.weighting);
-    // The composition from the sidecar, over the file's own orientation tag —
-    // exactly what the app resolves, so a headless export is the picture the
-    // viewport showed and not the negative it was cut from.
-    let frame = raw_core::Frame::resolve(
-        luma.output_dims,
-        sensor.meta.orientation,
-        &params.composition,
-    );
-    println!(
-        "{} · {} x {}{}",
-        sc.camera,
-        frame.crop.w,
-        frame.crop.h,
-        if frame.is_uncropped() {
-            String::new()
-        } else {
-            format!(" (cropped from {} x {})", frame.frame.w, frame.frame.h)
-        }
-    );
-
-    let Some((device, queue)) = raw_gpu::headless_device() else {
-        eprintln!("no usable GPU adapter");
-        std::process::exit(1);
-    };
-    let mut ctx = GpuContext::new(&device);
-    let mut vp = Viewport::new(&device, &queue, &luma);
-    let Some((w, h, data)) = vp.export(&mut ctx, &device, &queue, &params, &frame, |d, t| {
-        if t > 1 {
-            println!("  tile {d}/{t}");
-        }
-    }) else {
-        eprintln!("export render failed");
-        std::process::exit(1);
-    };
-
-    // The size, the resolution and the metadata all come from the sidecar's Output
-    // section, so a headless export writes the file the GUI would have written. The
-    // literal `300` that used to sit here is exactly the failure the brief warned
-    // about: three readouts moved with a setting and the file's own tag did not.
-    // The preference, read here as the app reads it. A headless export that ignored it
-    // would put the credit line back on a file someone had deliberately stripped —
-    // and a batch export is exactly where that would go unnoticed.
-    let include = match settings::Settings::load() {
-        sidecar::Loaded::Ok(s) => s.export_metadata,
-        _ => settings::Settings::default().export_metadata,
-    };
-    let mut spec = export::Spec::new(
-        target,
-        params.display.tone_map,
-        params.output,
-        // `effective`, so a bypassed grain does not cost the emulsion it would then
-        // throw away, and a bypassed sharpen does not cost a wavelet decomposition.
-        // Headless is where that would go unnoticed: a batch of forty.
-        export::Tail::of(&params),
-        include.then_some(&metadata),
-    );
-    spec.dither = params.display.dither;
-    let picture = raw_core::geometry::Dims {
-        w: w as usize,
-        h: h as usize,
-    };
-    let image_d = spec.image_dims(picture);
-    if image_d != picture {
-        println!(
-            "  resampling {w}x{h} -> {}x{} ({})",
-            image_d.w,
-            image_d.h,
-            spec.output.scale_note(picture)
-        );
-    }
-    let d = spec.dims(picture);
-    match export::write(out, w, h, &data, &spec) {
-        Ok(()) => println!(
-            "wrote {output} · {} · {}x{} · {:.0} ppi{}",
-            target.label(),
-            d.w,
-            d.h,
-            spec.output.ppi,
-            if spec.metadata.is_some() {
-                " · metadata"
-            } else {
-                ""
-            }
-        ),
-        Err(e) => {
-            eprintln!("write failed: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 /// Result of a background encode.
@@ -1545,31 +1339,7 @@ impl App {
         let export_metadata =
             sidecar::effective_metadata(&img.path).unwrap_or_else(|_| tab.metadata.clone());
         let meta = settings.export_metadata.then_some(&export_metadata);
-        let spec = match proof {
-            Some(scale) => export::Spec::proof(
-                target,
-                p.display.tone_map,
-                p.output,
-                export::Tail::of(&p),
-                meta,
-                scale,
-            ),
-            None => export::Spec::new(
-                target,
-                p.display.tone_map,
-                p.output,
-                export::Tail::of(&p),
-                meta,
-            ),
-        };
-        // **The EXPORT module's dither checkbox, which is `display.dither`.** One flag,
-        // one meaning — "break up the 8-bit quantisation" — governing the screen, which
-        // is an 8-bit surface, and every 8-bit file. It is inert at 16 bits either way;
-        // see `Spec::dither`.
-        let spec = export::Spec {
-            dither: p.display.dither,
-            ..spec
-        };
+        let spec = export::Spec::for_params(target, proof, &p, meta);
         // `Spec::dims`, not `output.target_dims`: a proof ignores the master's
         // resample, and asking the spec is the one way the status line and the
         // encoder cannot disagree about the size of the file.

@@ -27,6 +27,19 @@ history to undo or redo changes.
 
 Press `,` for Settings and `.` for the hotkey reference.
 
+The same program runs without its window, for scripts and batch work:
+
+```sh
+monopro render *.RAF --out-dir exports     # each raw as its sidecar describes it
+monopro render a.RAF --proof               # a proof, beside the raw
+monopro info a.RAF                         # camera, sensor, exposure, sidecar state
+monopro help
+```
+
+In the macOS app the executable is `monopro.app/Contents/MacOS/monopro`. Exit
+status is 0 when every file was written, 1 when any failed, and 2 for a bad
+command line.
+
 On macOS the app checks the stable release feed once a day, quietly: nothing
 appears while it is current, a badge appears at the right of the title strip
 when an update exists, and clicking it offers *Update on quit* (default),

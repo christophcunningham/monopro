@@ -35,6 +35,10 @@ These are scope decisions, not gaps.
 - **Camera coverage follows rawler.** A body rawler 0.8 cannot decode does not open
   in Develop, and a file without an embedded preview shows a placeholder in
   Lightbox rather than a thumbnail.
+- **Nikon High Efficiency★ NEF is not decoded.** rawler 0.8 refuses NEF files
+  recorded with High Efficiency★ compression, a raw option on recent Z bodies, so
+  they fail in Develop and in `monopro render`. Plain High Efficiency is untested.
+  Conventionally compressed NEF, such as the D850's, decodes.
 
 ## Lightbox
 

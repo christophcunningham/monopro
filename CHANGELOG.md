@@ -17,6 +17,10 @@ changes belong in [docs/known-limitations.md](docs/known-limitations.md).
 ## Unreleased
 
 New
+- monopro runs from the command line without opening a window. monopro render
+  writes each raw as its sidecar describes it, exactly as the Export button would,
+  as a master or a proof, one file or a whole folder. monopro info prints what a
+  raw is and what its sidecar holds. Run monopro help for the options.
 - Settings can set the Panel and Module backgrounds beside the viewer background,
   with a switch to have panels follow the viewer. Lightbox has its own Viewer
   background, Panel and Tiles values, which match Develop's by default.

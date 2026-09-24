@@ -740,6 +740,35 @@ impl Spec {
         }
     }
 
+    /// The spec an export of `p` writes, as a master or as a proof at `proof`.
+    ///
+    /// `p` must already be `effective`. **The one place an edit becomes a spec**, used
+    /// by the Export button and by `monopro render` alike, so the two cannot build
+    /// different files from the same sidecar. The dither flag is the EXPORT module's,
+    /// which is `display.dither`: one flag governing the screen and every 8-bit file.
+    pub fn for_params(
+        target: Target,
+        proof: Option<ProofScale>,
+        p: &raw_core::Params,
+        meta: Option<&Metadata>,
+    ) -> Self {
+        let spec = match proof {
+            Some(scale) => Self::proof(
+                target,
+                p.display.tone_map,
+                p.output,
+                Tail::of(p),
+                meta,
+                scale,
+            ),
+            None => Self::new(target, p.display.tone_map, p.output, Tail::of(p), meta),
+        };
+        Self {
+            dither: p.display.dither,
+            ..spec
+        }
+    }
+
     /// What this spec will write, given the picture's own dimensions.
     ///
     /// One function so the panel's caption and the encoder cannot disagree about the
