@@ -83,6 +83,8 @@ pub enum Action {
     RenameFiles,
     /// Open the Contact Sheet PDF dialog for the current Lightbox selection or view.
     ContactSheet,
+    /// Re-read the open Lightbox folder for files that arrived or left.
+    RefreshFolder,
     Rating(u8),
     ColourLabel(u8),
     // -- Composition
@@ -811,6 +813,17 @@ pub const TABLE: &[Binding] = &[
         CmdShift,
         "p",
         "Contact Sheet",
+        Lightbox,
+        true,
+    ),
+    // The window coming back to the front re-reads the folder quietly; this is for
+    // files that land while monopro stays in front, and it says what it found.
+    b(
+        Action::RefreshFolder,
+        Key::R,
+        Cmd,
+        "r",
+        "Refresh folder",
         Lightbox,
         true,
     ),

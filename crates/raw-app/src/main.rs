@@ -1642,8 +1642,12 @@ impl App {
         // one writes a `.mono.xmp` that the grid knows nothing about, so the edited rule
         // and the Developed sort were both answering from whenever the folder was last
         // read. See `Lightbox::refresh_edited` — a stat per entry, on a mode switch.
+        //
+        // And re-read the folder in the background: `monopro render`, a second window
+        // or a Finder copy can all have added files while Develop was up.
         if active {
             self.lightbox.refresh_edited();
+            self.lightbox.refresh(false);
         }
         // Compare and the loupe are viewport modes and the viewport is going away.
         // Closed rather than suspended, which is what `k` and the loupe's own key
@@ -2779,8 +2783,11 @@ impl eframe::App for App {
         // A sidecar can appear while the window is in the background. See
         // `window_focused`, and `Lightbox::refresh_edited` for what the stat buys.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        // The folder itself is re-read too, off the main thread and at most every few
+        // seconds — cards copied in from Finder arrive exactly while the window is away.
         if focused && !self.window_focused && self.lightbox.active {
             self.lightbox.refresh_edited();
+            self.lightbox.refresh(false);
         }
         self.window_focused = focused;
 
@@ -3352,6 +3359,9 @@ impl eframe::App for App {
                 }
                 hotkeys::Action::ContactSheet if self.lightbox.active => {
                     self.lightbox.begin_contact_sheet();
+                }
+                hotkeys::Action::RefreshFolder if self.lightbox.active => {
+                    self.lightbox.refresh(true);
                 }
                 // Zoom needs the viewport's anchor, so it is handled where that
                 // exists; see `viewport_panel` — except in Lightbox, where there is

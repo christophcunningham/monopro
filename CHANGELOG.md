@@ -28,6 +28,11 @@ New
   stays readable. Pictures, tone ramps and colours you picked are left as they are.
 - Dragging a side panel past its minimum width tucks it off the edge of the window,
   leaving a strip that brings it back.
+- Lightbox notices files added to or removed from the open folder while it is open:
+  it looks again whenever you come back to the window or switch into Lightbox,
+  without reloading the thumbnails already shown or losing your selection and
+  place. Cmd+R refreshes on demand and says what changed, and re-reads the folder
+  tree too.
 
 Changed
 - Tab-bar arrows step one tab at a time instead of a third of the bar.

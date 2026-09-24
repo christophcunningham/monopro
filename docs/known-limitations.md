@@ -42,11 +42,11 @@ These are scope decisions, not gaps.
 
 ## Lightbox
 
-- **An open folder does not notice new or deleted files.** A folder's contents are
-  read when it is opened or first expanded in the tree. Files copied in afterwards
-  appear only after opening the folder again. Edit badges are the exception: they
-  are re-checked on switching into Lightbox and whenever the window comes back to
-  the front.
+- **No live file watching.** The open folder is re-read when the window comes back
+  to the front, when you switch into Lightbox, and on ⌘R. Files that arrive while
+  monopro stays in front, such as tethered captures, appear on the next of those.
+  A file watcher would not see changes another machine makes on a network volume,
+  which is where it would matter most.
 
 ## Toning
 

@@ -92,6 +92,7 @@ Letter shortcuts are suppressed while typing into text fields.
 | `Cmd+Shift+V` | Paste Develop settings |
 | `Cmd+Shift+R` | Rename selected file(s) |
 | `Cmd+Shift+P` | Contact Sheet |
+| `Cmd+R` | Refresh folder: pick up files added or removed while it was open |
 | `Cmd+1` | One star |
 | `Cmd+2` | Two stars |
 | `Cmd+3` | Three stars |
