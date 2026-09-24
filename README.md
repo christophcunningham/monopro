@@ -176,7 +176,7 @@ Frames of the real interface can be drawn without a window, for looking at a UI
 change: `cargo test -p raw-app visual -- --ignored` writes them to `target/visual/`
 (see [`visual.rs`](crates/raw-app/src/visual.rs)).
 
-[Changelog](CHANGELOG.md) · [Known limitations](docs/known-limitations.md) ·
+[Architecture](ARCHITECTURE.md) · [Changelog](CHANGELOG.md) · [Known limitations](docs/known-limitations.md) ·
 [Keyboard shortcuts](docs/hotkeys.md) · [Optional test fixtures](docs/private-fixtures.md)
 
 ## Licence
