@@ -159,6 +159,7 @@ package and desktop validation remain pending. See [packaging](packaging/README.
 [platform status](docs/cross-platform-release.md), and the
 [release checklist](docs/release-smoke-test.md).
 
+[Changelog](CHANGELOG.md) · [Known limitations](docs/known-limitations.md) ·
 [Keyboard shortcuts](docs/hotkeys.md) · [Optional test fixtures](docs/private-fixtures.md)
 
 ## Licence

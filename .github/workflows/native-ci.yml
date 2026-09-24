@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
   workflow_dispatch:
+  # Weekly, for the advisories job alone: a new RustSec advisory can land against a
+  # lockfile that has not changed, and nothing else would run to notice it.
+  schedule:
+    - cron: "17 6 * * 1"
 
 permissions:
   contents: read
@@ -17,8 +21,30 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  advisories:
+    name: Dependency advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Pinned to the commit behind v2.1.1, not the tag: this job exists as
+      # supply-chain insurance, so the tool doing the checking is not a moving tag.
+      # Policy is in deny.toml.
+      - name: Check Cargo.lock against the RustSec advisory database
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          arguments: --all-features --locked
+          command: check
+          command-arguments: advisories
+
   test:
     name: ${{ matrix.name }}
+    # The weekly schedule is for advisories; the build matrix gains nothing from it.
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
