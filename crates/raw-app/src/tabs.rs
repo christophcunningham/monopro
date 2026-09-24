@@ -1126,6 +1126,11 @@ pub struct Tab {
     /// Doing it by actually resetting the params would be indistinguishable from
     /// the user resetting them, which is the one thing it must not be.
     pub preview_original: bool,
+    /// The Viewer's "Dither the screen" preference, mirrored here each frame by
+    /// `App::ui` so [`Self::render_params`] can apply it. On the tab rather than in
+    /// `params` because it is not an edit: changing it re-renders the view and
+    /// records no undo entry and no sidecar write.
+    pub screen_dither: bool,
     pub status: String,
     /// Read from the sidecar on load, written back with it. Owned by other
     /// applications as much as by this one, so it is carried through rather than
@@ -1203,6 +1208,7 @@ impl Tab {
             preview_image: None,
             preview_texture: None,
             preview_original: false,
+            screen_dither: true,
             status: String::new(),
             metadata: Default::default(),
             saved: None,
@@ -1402,6 +1408,9 @@ impl Tab {
         if self.mode.is_keystone() {
             p.composition.keystone = raw_core::KeystoneParams::default();
         }
+        // Dither is how the 8-bit screen is drawn, not part of the photograph. Set
+        // last so preview-original and every mode above get it too.
+        p.display.dither = self.screen_dither;
         p
     }
 

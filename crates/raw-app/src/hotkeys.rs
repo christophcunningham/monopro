@@ -927,7 +927,15 @@ pub const TABLE: &[Binding] = &[
         Files,
         true,
     ),
-    b(Action::Export, Key::E, Cmd, "e", "Export", Files, true),
+    b(
+        Action::Export,
+        Key::E,
+        Cmd,
+        "e",
+        "Export master",
+        Files,
+        true,
+    ),
     b(
         Action::ExportProof,
         Key::E,

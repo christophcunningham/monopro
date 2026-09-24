@@ -291,6 +291,32 @@ const PAD_X: i8 = 9;
 /// few seconds. `the_module_width_does_not_run_away` is the guard.
 const STROKE: f32 = 1.0;
 
+// Modules a `visual` scene asked to be drawn open. Thread-local, because a scene
+// draws its frames on its own test thread; empty everywhere else.
+#[cfg(test)]
+thread_local! {
+    static OPEN_FOR_A_TEST: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::default();
+}
+
+/// Draw the module `name` open on this thread, whatever its remembered state. For
+/// `visual`, whose scenes need a folded module shown without clicking a header
+/// whose position moves with every layout change.
+#[cfg(test)]
+pub fn open_for_a_test(name: &str) {
+    OPEN_FOR_A_TEST.with(|open| open.borrow_mut().insert(name.to_owned()));
+}
+
+#[cfg(test)]
+fn opened_for_a_test(name: &str) -> bool {
+    OPEN_FOR_A_TEST.with(|open| open.borrow().contains(name))
+}
+
+#[cfg(not(test))]
+fn opened_for_a_test(_: &str) -> bool {
+    false
+}
+
 /// All three `show`s. `modified` is `None` for a plain section — no dot and no
 /// reset — and `enabled` is `None` for a module without a switch.
 #[expect(
@@ -318,7 +344,7 @@ fn draw(
     let mut open = ui
         .data_mut(|d| d.get_temp::<bool>(id))
         .unwrap_or(open_on_start);
-    if open_this_frame {
+    if open_this_frame || opened_for_a_test(name) {
         open = true;
     }
 

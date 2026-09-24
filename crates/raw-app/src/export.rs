@@ -33,20 +33,24 @@
 //! deciding encoding — "8-bit means gamma" — and had no principle behind it. This
 //! rule is one sentence and survives the colour transition unchanged.
 //!
-//! # One master encoding, two axes
+//! # A master is a TIFF; everything else is a proof
 //!
-//! Every **master** is greyscale, L\*-encoded, tagged `monostar.icc`. What varies is
-//! only the container and the depth:
+//! The **format says which a file is**, so nobody has to open it to find out:
 //!
-//! | | 8-bit | 16-bit |
-//! |---|---|---|
-//! | **TIFF** | small master, dithered | the master |
-//! | **PNG** | compressed, dithered | compressed master |
+//! | | container | depth | size | dither |
+//! |---|---|---|---|---|
+//! | **master** | TIFF, uncompressed | 16-bit | OUTPUT's print size | never |
+//! | **proof** | PNG or JPEG | 8 or 16-bit (JPEG 8) | full, ½, ⅓ or ¼ | 8-bit, by preference |
 //!
-//! Collapsing "proof" and "master" into container × depth is what keeps this
-//! honest. An earlier version had the 8-bit path go out as display-gamma RGB, which
-//! meant two different encodings and two different colour behaviours to reason
-//! about.
+//! A master has no choices beyond its colour space: it is the archival file a print
+//! is made from, and a 16-bit uncompressed TIFF is the form every RIP and every
+//! editor opens without question. A proof may be full resolution — "proof" says the
+//! file is not the archival one, not that it is small. See [`Target::master`] and
+//! `Settings::proof_target`.
+//!
+//! An earlier arrangement let the master be any container at either depth, which
+//! meant a full-size 8-bit JPEG counted as a master and shared a name with a
+//! half-size sRGB proof.
 //!
 //! **8-bit L\* is a genuinely good deliverable, not a degraded one.** L\* is
 //! perceptually uniform by construction, so it distributes 256 codes evenly across
@@ -280,20 +284,7 @@ pub enum Container {
 }
 
 impl Container {
-    /// The **EXPORT module's** containers, in order.
-    ///
-    /// **JPEG is here, and it did not used to be.** The old comment read "a master is
-    /// the file a print is made from, and a lossy master is a contradiction", which is
-    /// a true sentence about masters and turned out to be the wrong claim about this
-    /// list: the module is where a file leaves the app, and not everything that leaves
-    /// is a master. the maintainer asked for JPEG, 2026-08-06, having gone looking for it. The
-    /// argument against remains on `proof_note`, where it is a caption the user reads
-    /// rather than a control they cannot reach — and `Container::depths` still refuses
-    /// it 16 bits, so the *shape* of the refusal survives where it is structural.
-    ///
-    /// Lossless first, so the order still says which of them a print is made from.
-    pub const UI_ORDER: [Self; 3] = [Self::Tiff, Self::Png, Self::Jpeg];
-    /// The **proof's**. PNG first, because it is the one that tells the truth.
+    /// The **proof's** — a master is always [`Container::Tiff`]. PNG first, because it is the one that tells the truth.
     pub const PROOF_ORDER: [Self; 2] = [Self::Png, Self::Jpeg];
 
     pub fn extension(self) -> &'static str {
@@ -475,37 +466,32 @@ impl Depth {
 /// asserting it, because "compressed" reasonably reads as "degraded" and the claim
 /// should not have to be taken on faith.
 ///
-/// Uncompressed is still the default and worth keeping: some print RIPs and older
-/// software are fussy, and an uncompressed TIFF can be memory-mapped and read
-/// without decoding.
+/// **A master is always uncompressed** — the maintainer's call: some print RIPs
+/// and older software are fussy, and an uncompressed TIFF can be memory-mapped and
+/// read without decoding. Deflate stays in the writer, and under test, but no export
+/// asks for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compression {
     #[default]
     None,
-    /// Deflate with a horizontal predictor.
+    /// Deflate with a horizontal predictor. Kept in the writer, and proven
+    /// bit-identical by the tests, though no export asks for it any more.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "a master is always uncompressed; the writer keeps deflate, which the tests exercise"
+        )
+    )]
     Deflate,
 }
 
 impl Compression {
-    pub const UI_ORDER: [Self; 2] = [Self::None, Self::Deflate];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::None => "uncompressed",
             Self::Deflate => "deflate (lossless)",
         }
-    }
-
-    /// Stable key for persistence; see `Container::key`.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Deflate => "deflate",
-        }
-    }
-
-    pub fn from_key(s: &str) -> Option<Self> {
-        Self::UI_ORDER.into_iter().find(|c| c.key() == s)
     }
 }
 
@@ -530,6 +516,17 @@ impl Default for Target {
 }
 
 impl Target {
+    /// **The** master: a 16-bit uncompressed TIFF in `space`. The only thing about a
+    /// master that is a choice is its colour space; see the module note.
+    pub fn master(space: Space) -> Self {
+        Self {
+            container: Container::Tiff,
+            depth: Depth::Sixteen,
+            compression: Compression::None,
+            space,
+        }
+    }
+
     /// The default **proof**: half size, 8-bit PNG, sRGB-encoded.
     ///
     /// PNG rather than JPEG because a proof you cannot trust is not a proof; sRGB
@@ -619,13 +616,10 @@ pub struct Spec {
     /// TPDF dither on the 8-bit quantisation. **Ignored at 16 bits**, where there is
     /// nothing to break up.
     ///
-    /// This was structural — `samples8` dithered unconditionally and `samples16` never
-    /// did — on the argument that a rule no call site can get backwards is better than
-    /// a flag. The rule is unchanged and still lives in one place; what changed is that
-    /// 8-bit is now a *master* format here and not only a proof one, since JPEG and
-    /// 8-bit PNG are selectable in the EXPORT module. An 8-bit deliverable going
-    /// somewhere that will re-encode it is a case where you might not want a pixel of
-    /// added noise, and there was no way to say so.
+    /// Only a proof can be 8-bit, so in practice this is the proof's own switch,
+    /// `Settings::proof_dither`: an 8-bit file going somewhere that will re-encode it
+    /// is a case where you might not want a pixel of added noise. It is separate from
+    /// the screen's dither, which is a viewer preference.
     ///
     /// Defaulted **on** by `Spec::new`, so the only way to get an undithered 8-bit file
     /// is to have asked for one.
@@ -743,14 +737,15 @@ impl Spec {
     /// The spec an export of `p` writes, as a master or as a proof at `proof`.
     ///
     /// `p` must already be `effective`. **The one place an edit becomes a spec**, used
-    /// by the Export button and by `monopro render` alike, so the two cannot build
-    /// different files from the same sidecar. The dither flag is the EXPORT module's,
-    /// which is `display.dither`: one flag governing the screen and every 8-bit file.
+    /// by the Export buttons and by `monopro render` alike, so the two cannot build
+    /// different files from the same sidecar. `dither` is the proof preference; it has
+    /// no effect on a 16-bit file, which a master always is.
     pub fn for_params(
         target: Target,
         proof: Option<ProofScale>,
         p: &raw_core::Params,
         meta: Option<&Metadata>,
+        dither: bool,
     ) -> Self {
         let spec = match proof {
             Some(scale) => Self::proof(
@@ -763,10 +758,7 @@ impl Spec {
             ),
             None => Self::new(target, p.display.tone_map, p.output, Tail::of(p), meta),
         };
-        Self {
-            dither: p.display.dither,
-            ..spec
-        }
+        Self { dither, ..spec }
     }
 
     /// What this spec will write, given the picture's own dimensions.
@@ -2322,7 +2314,7 @@ mod tests {
                     let reader = dec.read_info().unwrap();
                     reader.info().icc_profile.as_deref() == Some(MONOSTAR_ICC)
                 }
-                // Not in `ALL` — masters are never JPEG. See `Container::UI_ORDER`.
+                // Not in `ALL` — masters are never JPEG. See `Target::master`.
                 Container::Jpeg => unreachable!("a master is never a JPEG"),
             };
             assert!(embedded, "{target:?} did not embed monostar");

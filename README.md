@@ -30,7 +30,7 @@ Press `,` for Settings and `.` for the hotkey reference.
 The same program runs without its window, for scripts and batch work:
 
 ```sh
-monopro render *.RAF --out-dir exports     # each raw as its sidecar describes it
+monopro render *.RAF --out-dir exports     # masters, as each sidecar describes them
 monopro render a.RAF --proof               # a proof, beside the raw
 monopro info a.RAF                         # camera, sensor, exposure, sidecar state
 monopro help
@@ -101,8 +101,11 @@ the print loupe previews them at the selected output scale. Grain uses stochasti
 silver-halide crystal synthesis. Toning models material conversion and optical density;
 its coefficients are currently adjusted by eye rather than measured.
 
-Export supports TIFF, PNG, and JPEG. Grayscale masters can use L* encoding with the
-[monostar ICC profile](profiles/MONOSTAR.md). Toning introduces color after the
+Export writes two kinds of file. A **master** is the archival file a print is made
+from: always a 16-bit uncompressed TIFF at the print size, by default grayscale and
+L*-encoded with the [monostar ICC profile](profiles/MONOSTAR.md). A **proof** is
+anything else: a PNG or JPEG, at full resolution or a fraction of it, usually sRGB
+for screens. The format says which is which. Toning introduces color after the
 monochrome processing stages. Edits and metadata are stored in `.mono.xmp` sidecars.
 
 ## Dependencies

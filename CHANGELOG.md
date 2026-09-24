@@ -35,6 +35,18 @@ New
   tree too.
 
 Changed
+- Masters and proofs are defined by format. Export Master always writes a 16-bit
+  uncompressed TIFF; there is no depth or compression to choose. Anything else is
+  a proof: a PNG or JPEG, at full resolution or a half, third or quarter of it.
+- The proof's format, depth, color space, size and dither are set in the Develop
+  EXPORT module, beside the buttons, instead of in Settings. The Info panel's
+  buttons are now Export Master and Export Proof.
+- Dither is split in two. The screen's is a Viewer setting (Dither the screen),
+  and an 8-bit proof has its own switch in the EXPORT module. A master is never
+  dithered. The old per-photo dither switch is gone, and photos that had it off
+  dither on screen again.
+- Settings → Export names the suffixes Master suffix and Proof suffix, and keeps
+  one Master color space; the PNG and JPEG color space rows are gone.
 - Tab-bar arrows step one tab at a time instead of a third of the bar.
 - Shorter Settings labels, with redundant captions removed. Settings sliders use
   the same handles as Develop.

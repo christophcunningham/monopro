@@ -109,8 +109,8 @@ Letter shortcuts are suppressed while typing into text fields.
 | Key | Action |
 |---|---|
 | `Cmd+O` | Open a raw |
-| `Cmd+E` | Export |
-| `Cmd+Shift+E` | Export proof |
+| `Cmd+E` | Export master (16-bit TIFF) |
+| `Cmd+Shift+E` | Export proof (PNG or JPEG) |
 | `Cmd+S` | Save duplicate file |
 | `Cmd+D` | Duplicate this tab |
 | `Cmd+W` | Close tab |

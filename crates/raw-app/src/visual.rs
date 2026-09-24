@@ -247,6 +247,39 @@ fn develop_light() {
     scene_develop(Ground::Light);
 }
 
+/// Develop with the EXPORT module open: the master button, and the proof's format,
+/// depth, space, size and dither. Tall, so the whole column is on screen.
+fn scene_export(ground: Ground) {
+    let _turn = one_at_a_time();
+    let name = format!("export{}", ground.suffix());
+    let Some(path) = raw("L1000016.DNG") else {
+        eprintln!("{name}: skipped, no corpus raw L1000016.DNG");
+        return;
+    };
+    crate::widgets::open_for_a_test("EXPORT");
+    ground
+        .settings()
+        .save()
+        .expect("write settings into the isolated test storage");
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(crate::device_descriptor);
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(SIZE.x, 1600.0))
+        .with_pixels_per_point(2.0)
+        .with_os(egui::os::OperatingSystem::Mac)
+        .with_max_steps(64)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(move |cc| App::new(cc, Some(path)));
+    settle(&mut h, &name, develop_ready);
+    save(&mut h, &name);
+}
+
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn export() {
+    scene_export(Ground::Dark);
+}
+
 #[test]
 #[ignore = "draws with the GPU and the private corpus; see the module note"]
 fn lightbox() {

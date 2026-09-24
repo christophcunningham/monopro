@@ -1163,7 +1163,9 @@ pub fn to_xml(params: &Params, metadata: &Metadata, source_name: &str) -> String
         attr("AgxShoulderPower", num(agx.shoulder_power));
     }
     attr("Gamma", num(p.display.gamma));
-    attr("Dither", p.display.dither.to_string());
+    // No `Dither`: screen dither is a viewer preference and 8-bit files take the
+    // proof's, so there is nothing per image to store. Files that carry the attribute
+    // still open; it is ignored.
 
     // Grain. The size is written as the ODD value that runs, never as whatever was
     // typed — see `GrainParams::set_size`; a file that said 6 and printed 7 would put
@@ -1676,7 +1678,7 @@ pub fn from_xml(text: &str) -> Loaded<Sidecar> {
         enabled: b("DisplayEnabled").unwrap_or(dd.enabled),
         tone_map,
         gamma: f("Gamma").unwrap_or(dd.gamma),
-        dither: b("Dither").unwrap_or(dd.dither),
+        dither: dd.dither,
     };
 
     // Grain. Absent reads as the default, which is **off** — so every file written
@@ -2057,6 +2059,26 @@ fn read_metadata(desc: &roxmltree::Node) -> Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dither_switch_from_an_older_file_is_ignored() {
+        // Dither stopped being per image: the screen follows a viewer preference and
+        // 8-bit files the proof's. A file written while it was per image must still
+        // open, and its old switch must not quietly turn the screen's dither off.
+        let old = to_xml(&Params::default(), &Metadata::default(), "frame.dng").replace(
+            "monopro:Gamma=",
+            "monopro:Dither=\"false\"\n   monopro:Gamma=",
+        );
+        assert!(
+            old.contains("Dither=\"false\""),
+            "the fixture carries the old attribute"
+        );
+        let Loaded::Ok(read) = from_xml(&old) else {
+            panic!("a file with the retired attribute still opens");
+        };
+        assert!(read.params.display.dither);
+        assert!(!to_xml(&read.params, &read.metadata, "frame.dng").contains("Dither"));
+    }
     use crate::dodgeburn::{Dab, Gesture, Instance, Linear, Radial, Shape, Sign, ZoneMask};
 
     fn roundtrip(p: &Params) -> Params {
@@ -2195,7 +2217,6 @@ mod tests {
             strength: 0.375,
         };
         p.display.gamma = 2.4;
-        p.display.dither = false;
         p.composition.enabled = false;
         p.composition.orientation = Some(Orientation::Rotate270);
         p.composition.straighten = -2.75;

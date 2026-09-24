@@ -1,8 +1,8 @@
 //! `monopro` without its window.
 //!
 //! ```text
-//! monopro render <raw>... [--out FILE | --out-dir DIR] [--proof]
-//!                [--format tiff|png|jpeg] [--bits 8|16] [--overwrite]
+//! monopro render <raw>... [--out FILE | --out-dir DIR]
+//!                [--proof] [--format png|jpeg] [--bits 8|16] [--overwrite]
 //! monopro info <raw>...
 //! monopro help | --version
 //! ```
@@ -12,15 +12,18 @@
 //! run from a script, over SSH, or in CI with no display attached. In a packaged
 //! macOS build the executable is `monopro.app/Contents/MacOS/monopro`.
 //!
-//! **`render` is the Export button, not a second exporter.** It starts from the
+//! **`render` is the Export buttons, not a second exporter.** It starts from the
 //! file's sidecar, resolves bypasses with `Params::effective`, renders through the
 //! same `Viewport::export`, builds its spec with the same `Spec::for_params`, and
-//! is refused by the same size limits. Where the button reads a choice from the
-//! window — the EXPORT module's container, which lives in app memory rather than
-//! in `settings.toml` — `render` takes a flag instead and otherwise defaults to an
-//! uncompressed TIFF master at the configured depth. Proofs use the Settings proof
-//! target and scale, names use the Settings suffixes, and the destination is the
-//! configured output folder or the raw's own folder, as Quick Export's would be.
+//! is refused by the same size limits.
+//!
+//! By default it writes the **master**: a 16-bit uncompressed TIFF in the master
+//! colour space, exactly as Export Master does, with no format or depth to choose.
+//! `--proof` writes a **proof** with the EXPORT module's proof preferences, and
+//! `--format`, `--bits` or a `.png`/`.jpg` `--out` override them for this run —
+//! each of which means a proof, since a master is only ever a TIFF. Names use the
+//! Settings suffixes, and the destination is the configured output folder or the
+//! raw's own folder, as Quick Export's would be.
 //!
 //! Exit status, so a script can tell the outcomes apart:
 //!
@@ -51,13 +54,15 @@ usage:
   monopro info <raw>...
   monopro help | --version
 
-render writes each raw as its sidecar describes it, as the Export button would.
-  -o, --out FILE      the file to write (one raw only); its extension picks the format
+render writes each raw as its sidecar describes it, as the Export buttons would:
+a master (16-bit TIFF) by default, or a proof (PNG or JPEG).
+  -o, --out FILE      the file to write (one raw only); .tif is a master,
+                      .png or .jpg a proof
   --out-dir DIR       the folder to write into (default: the Settings output folder,
                       otherwise beside each raw), named with the Settings suffixes
-  --proof             write a proof with the Settings proof format and scale
-  --format FMT        tiff, png or jpeg (a proof is png or jpeg)
-  --bits N            8 or 16 (JPEG is 8 only)
+  --proof             write a proof with the EXPORT module's proof settings
+  --format FMT        a proof in png or jpeg (implies --proof)
+  --bits N            a proof at 8 or 16 bits (JPEG is 8 only; implies --proof)
   --overwrite         replace files that already exist
 
   for testing, applied over the sidecar:
@@ -240,32 +245,45 @@ fn parse_render(rest: &[String]) -> Result<Render, String> {
         if r.inputs.len() > 1 {
             return Err("--out names one file; use --out-dir for several raws".into());
         }
-        // The extension is the format when nothing else says so, and must agree
-        // with --format when something does: writing PNG bytes into `x.tif` is a
-        // file that lies about itself.
+        // The extension says which kind of file this is, and must agree with any
+        // flag that says so too: writing PNG bytes into `x.tif` is a file that lies
+        // about itself, and a `.tif` proof would be a proof that looks archival.
         let by_extension = out
             .extension()
             .and_then(|e| e.to_str())
             .and_then(container_named)
             .ok_or_else(|| format!("{} must end in .tif, .png or .jpg", out.display()))?;
-        match r.format {
-            None => r.format = Some(by_extension),
-            Some(f) if f != by_extension => {
+        if by_extension == Container::Tiff {
+            if r.proof || r.format.is_some() || r.bits.is_some() {
                 return Err(format!(
-                    "--format {} disagrees with {}",
-                    f.label(),
+                    "{} is a master, which is always a 16-bit TIFF; a proof is .png or .jpg",
                     out.display()
                 ));
             }
-            Some(_) => {}
+        } else {
+            match r.format {
+                None => r.format = Some(by_extension),
+                Some(f) if f != by_extension => {
+                    return Err(format!(
+                        "--format {} disagrees with {}",
+                        f.label(),
+                        out.display()
+                    ));
+                }
+                Some(_) => {}
+            }
         }
     }
-    if r.proof
-        && let Some(f) = r.format
+    if let Some(f) = r.format
         && !Container::PROOF_ORDER.contains(&f)
     {
-        return Err(format!("a proof is PNG or JPEG, not {}", f.label()));
+        return Err(format!(
+            "--format picks a proof's format, PNG or JPEG; a master is always {}",
+            f.label()
+        ));
     }
+    // A format or a depth only means anything for a proof: a master has neither.
+    r.proof |= r.format.is_some() || r.bits.is_some();
     if let (Some(f), Some(d)) = (r.format, r.bits)
         && !f.supports(d)
     {
@@ -286,21 +304,17 @@ fn container_named(name: &str) -> Option<Container> {
 impl Render {
     /// The file format, from Settings and then the flags.
     fn target(&self, settings: &Settings) -> Target {
-        let mut t = if self.proof {
-            settings.proof_target()
-        } else {
-            Target {
-                depth: settings.export_depth(),
-                ..Target::default()
-            }
-        };
+        if !self.proof {
+            return settings.master_target();
+        }
+        let mut t = settings.proof_target();
         if let Some(c) = self.format {
             t.container = c;
         }
         if let Some(d) = self.bits {
             t.depth = d;
         }
-        // A JPEG chosen by flag over a 16-bit Settings depth: the flag names the
+        // A JPEG chosen by flag over a 16-bit proof preference: the flag names the
         // container, so the depth is what gives way.
         t.settle();
         t
@@ -442,7 +456,7 @@ fn render_one(
     // Read now, as the button reads it: IPTC edited in Lightbox lives in the sidecar.
     let metadata = sidecar::effective_metadata(input)?;
     let meta = settings.export_metadata.then_some(&metadata);
-    let spec = export::Spec::for_params(target, proof, &params, meta);
+    let spec = export::Spec::for_params(target, proof, &params, meta, settings.proof_dither);
     // Before the render, not after: FRAME margins are physical and can take even a
     // proof past the limits, and a refused file should not cost a GPU pass first.
     spec.checked_layout(frame.output_dims())?;
@@ -617,6 +631,9 @@ mod tests {
             "render a.RAF --out x.webp",
             "render a.RAF --out x.png --format tiff",
             "render a.RAF --proof --format tiff",
+            "render a.RAF --format tiff",
+            "render a.RAF --out x.tif --proof",
+            "render a.RAF --out x.tif --bits 8",
             "render a.RAF --format jpeg --bits 16",
             "render a.RAF --mask -3",
             "render a.RAF --demosaic nope",
@@ -633,33 +650,41 @@ mod tests {
     }
 
     #[test]
-    fn the_out_extension_picks_the_format() {
+    fn the_out_extension_says_master_or_proof() {
         let r = render_of("render a.RAF -o x.PNG").unwrap();
+        assert!(r.proof, "a .png is a proof");
         assert_eq!(r.format, Some(Container::Png));
         let r = render_of("render a.RAF --out x.jpeg --format jpg").unwrap();
         assert_eq!(r.format, Some(Container::Jpeg));
+        let r = render_of("render a.RAF --out x.tif").unwrap();
+        assert!(!r.proof, "a .tif is the master");
     }
 
     #[test]
-    fn a_master_defaults_to_the_settings_depth_and_a_proof_to_the_proof_target() {
+    fn a_master_is_always_a_sixteen_bit_tiff_and_a_proof_follows_its_preferences() {
         let settings = Settings::default();
         let master = render_of("render a.RAF").unwrap().target(&settings);
-        assert_eq!(
-            master,
-            Target {
-                depth: settings.export_depth(),
-                ..Target::default()
-            }
-        );
+        assert_eq!(master, Target::master(settings.master_space()));
+        assert_eq!(master.depth, Depth::Sixteen);
         let proof = render_of("render a.RAF --proof").unwrap().target(&settings);
         assert_eq!(proof, settings.proof_target());
     }
 
     #[test]
-    fn a_jpeg_flag_over_a_sixteen_bit_setting_settles_to_eight() {
+    fn a_format_or_a_depth_means_a_proof() {
+        assert!(render_of("render a.RAF --format png").unwrap().proof);
+        assert!(render_of("render a.RAF --bits 16").unwrap().proof);
+    }
+
+    #[test]
+    fn a_jpeg_flag_over_a_sixteen_bit_proof_preference_settles_to_eight() {
+        let settings = Settings {
+            proof_depth: Depth::Sixteen.key().into(),
+            ..Settings::default()
+        };
         let t = render_of("render a.RAF --format jpeg")
             .unwrap()
-            .target(&Settings::default());
+            .target(&settings);
         assert_eq!(t.container, Container::Jpeg);
         assert_eq!(t.depth, Depth::Eight);
     }
