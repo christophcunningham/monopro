@@ -48,7 +48,7 @@
 //!
 //! So a v1/v2 sidecar contributes **exposure in EV and the metadata**, and nothing
 //! else. A stop is a stop in any pipeline, and `dc:`/`xmp:` are not ours to
-//! interpret. Everything else opens at defaults. See `docs/decisions.md`.
+//! interpret. Everything else opens at defaults.
 //!
 //! **The cut is at [`PIPELINE_SCHEMA`], not [`SCHEMA_VERSION`].** They were the same
 //! number until the version first moved, at which point `schema < SCHEMA_VERSION` would

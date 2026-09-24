@@ -55,8 +55,8 @@
 //!
 //! This does not reproduce the prototype's pixels and could not: `rand_distr`'s normal
 //! sampler is a ziggurat whose stream needs the crate. The *distributions* match, which
-//! is what the algorithm is specified in terms of, and `docs/decisions.md` holds the
-//! tonal-profile comparison that checked it.
+//! is what the algorithm is specified in terms of, and a tonal-profile
+//! comparison against the prototype checked it.
 //!
 //! At the defaults the grain is heavy — a fifth of local density in the shadows — and
 //! that is Pierre's model rather than a port that slipped a factor. What quietens it is
@@ -141,8 +141,8 @@ impl Default for GrainParams {
     ///
     /// 2.5% RMS: deliberately not the quietest the module can do, because a default you
     /// cannot see is a default that looks broken the other way. **Layers stay at 30** —
-    /// sixty is indistinguishable at 1:1 and doubles every export. Measurements in
-    /// `docs/decisions.md`.
+    /// sixty is indistinguishable at 1:1 and doubles every export. The cost is
+    /// measured by `tests/grain_cost.rs`.
     ///
     /// The seed is fixed rather than drawn from the clock, so a file with no grain block
     /// in its sidecar and a file written today grain the same way.

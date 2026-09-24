@@ -9,7 +9,7 @@
 //! There is no node editor. `build` turns a `Params` into a `Graph` and is called
 //! afresh whenever anything changes; nothing mutates a graph in place. That is
 //! what keeps the sidecar a flat list of settings, undo a stack of parameter
-//! snapshots, and tab duplication a `Params::clone` — see `docs/decisions.md`.
+//! snapshots, and tab duplication a `Params::clone`.
 //!
 //! # The two propagation passes
 //!
@@ -459,7 +459,7 @@ pub fn build_with_mask_source(
     // and not the tempting one beside the global exposure it locally modifies. Putting
     // it first would make burning a sky change the mask that sky prints through.
     // `raw_core::zone::Basis` builds its proxy in this same order so the zone masks
-    // read the tonality the user is looking at. See `docs/decisions.md`.
+    // read the tonality the user is looking at.
     //
     //   exposure ─► [contrast mask] ─► dodge & burn ─► curve ─► display
     if params.dodgeburn.is_active() {

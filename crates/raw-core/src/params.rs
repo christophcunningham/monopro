@@ -488,7 +488,7 @@ pub struct Params {
     /// It sits beside `grain` rather than up with the tone modules because that is
     /// where it runs — `resample` → `grain` → **sharpen** → encode — and because the
     /// print loupe is what watches both. The output position was chosen over the
-    /// prototype's scene-linear one; `docs/decisions.md` has the argument.
+    /// prototype's scene-linear one; `export::write` has the argument.
     pub sharpen: SharpenParams,
     /// Print resolution, output size and what metadata travels.
     ///

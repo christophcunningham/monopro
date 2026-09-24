@@ -150,8 +150,8 @@ pub enum Mods {
     /// the key simply never arrived. the maintainer chose `⌃Tab`, which is the other
     /// cross-platform convention for walking a tab strip and is not reserved.
     ///
-    /// Bare backtick still flicks A/B — see `docs/decisions.md`, "Both tab keys stay".
-    /// That half of the decision is untouched and is the half that was working.
+    /// Bare backtick still flicks A/B. That half of keeping both tab keys is untouched,
+    /// and is the half that was working.
     Ctrl,
     CtrlShift,
 }
@@ -1564,8 +1564,8 @@ mod tests {
         // focus to next window" and takes the event before the app or its menu bar sees
         // it, so both were dead keys that read as implemented. See `Mods::Ctrl`.
         //
-        // **Bare backtick keeps the flick**, which is the half of `docs/decisions.md`
-        // "Both tab keys stay" that was always working, and the A/B gesture the
+        // **Bare backtick keeps the flick**, which is the half of keeping both tab
+        // keys that was always working, and the A/B gesture the
         // `WARM = 2` decision rests on.
         let ticks: Vec<&Binding> = TABLE
             .iter()

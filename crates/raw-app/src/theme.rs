@@ -276,7 +276,7 @@ pub fn caption(text: impl Into<String>) -> egui::RichText {
 /// in, and now what every other control's is too.
 ///
 /// This exists because half the rule was already written down and the other half was
-/// not. `docs/decisions.md` says *a label for a control is body; caption is for
+/// not. The written half: *a label for a control is body; caption is for
 /// explanatory prose*, and Composition's Ratio and Guides and Output's Resolution, Size
 /// and Colour space were duly moved off `caption` — onto a bare `ui.label`, which takes
 /// egui's `noninteractive` grey at **180**. A checkbox label takes `inactive` at **200**,

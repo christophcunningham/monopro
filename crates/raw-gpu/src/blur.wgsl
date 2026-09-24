@@ -19,8 +19,7 @@
 //
 // At distance `d` from the nearest edge of the input rectangle the radius becomes
 // `min(r, d)`, so only real pixels are ever read and the mean stays centred. Clamping,
-// renormalising and odd reflection were each measured and each gave up one of those;
-// the table and the bug that found it are in `docs/decisions.md`.
+// renormalising and odd reflection were each measured and each gave up one of those.
 //
 // **View-independent, which is what keeps preview and export agreeing.** For a pixel at
 // image position x the effective radius is `min(x, r)` wherever the viewport or tile

@@ -931,8 +931,7 @@ pub fn write(path: &Path, w: u32, h: u32, scene: &[f32], spec: &Spec) -> std::io
     // output pixels, so it compensates the downsample that has just happened, for the
     // medium the file is going to. Sharpening before the resize would have the
     // resampler partly undo it, which is the reason the step exists separately from a
-    // capture sharpen. This position was chosen over the prototype's scene-linear one;
-    // `docs/decisions.md` has the argument and what it costs.
+    // capture sharpen. This position was chosen over the prototype's scene-linear one.
     //
     // *After grain*, because **output sharpening compensates the medium and the medium
     // does not discriminate**. Dot gain, paper spread and the softening of a downsample

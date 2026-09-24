@@ -738,11 +738,10 @@ const HANDLE_ASPECT: f32 = 0.48;
 ///
 /// It was the other way round — label left, box hard against the panel's right edge —
 /// on the argument that neither moves when the other changes length. That argument is
-/// fine and it was answering the wrong question. `docs/decisions.md` already records
-/// "checkbox: box left, label right" as the app's rule, and the stock `egui::checkbox`
+/// fine and it was answering the wrong question. The app's rule was already
+/// "checkbox: box left, label right", and the stock `egui::checkbox`
 /// this sits beside has drawn it that way since the design pass set it in `Visuals`, so
-/// the one hand-painted switch in the app was the only thing breaking its own written
-/// rule. A box a panel's width away from the words it governs is also simply hard to
+/// the one hand-painted switch in the app was the only thing breaking that rule. A box a panel's width away from the words it governs is also simply hard to
 /// read. the maintainer asked for it on the left.
 ///
 /// Returns the response of the whole row, so the entire strip is the hit target

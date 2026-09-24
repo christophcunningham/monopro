@@ -2959,7 +2959,7 @@ impl eframe::App for App {
                 hotkeys::Action::CycleTabsBack => self.tabs.step(-1),
                 // Not the same as cycling: this toggles a *pair*, which is what
                 // flicker comparison needs and what walking a strip of three or
-                // more cannot do. See `docs/decisions.md`.
+                // more cannot do.
                 hotkeys::Action::FlickTab => self.tabs.flicker(),
                 // Opens it, and closes it when the main window is the one with
                 // focus. The settings viewport handles its own copy of this key —
@@ -5474,7 +5474,7 @@ impl App {
     /// **Built from the primitives and adding none.** The row is the Dodge & Burn layer
     /// row's shape — a thumbnail where the dot is, the name, then the controls right —
     /// because a list of named things you pick from is a solved problem in this app and
-    /// a second answer to it would be the drift `docs/decisions.md` was written to stop.
+    /// a second answer to it would be drift.
     ///
     /// # Restore is a button, and that is a departure from the prototype
     ///
@@ -7146,8 +7146,8 @@ impl App {
         // print size. That is the module working rather than a unit nobody converted,
         // and it is what the caption has to say.
         //
-        // Three controls, where the prototype has six plus a mode pill. What was cut
-        // and why is in `docs/decisions.md`; the short of it is that its own presets
+        // Three controls, where the prototype has six plus a mode pill. What was cut, in
+        // short: its own presets
         // never moved the radius and its band equaliser reaches scales that are local
         // contrast rather than output sharpening.
         // The same snapshot Grain takes, and for the same reason. See `widgets::arm`.
@@ -11107,7 +11107,7 @@ fn pipeline_section(tab: &Tab, ui: &mut egui::Ui, env: InfoEnv) {
         // larger than the `CAPTURE` / `SCREEN` / `PRINT` markers heading them — the
         // block read as three tiny labels interrupting a column of body text rather
         // than as three stanzas. the maintainer called it; one size for the whole panel is also
-        // the rule the rest of the app follows. See `docs/decisions.md`.
+        // the rule the rest of the app follows.
         let line = |ui: &mut egui::Ui, v: String| {
             ui.label(theme::readout(v).size(theme::size::CAPTION));
         };
@@ -11512,7 +11512,7 @@ fn inspector_section(tab: &mut Tab, ui: &mut egui::Ui, env: InfoEnv, icons: &ico
                             // row and the tab strip both draw this exact control — a
                             // 14pt square that fills grey on hover and paints the
                             // `close` icon — and a third `×` in a third face would be
-                            // the drift `docs/decisions.md` exists to stop.
+                            // drift.
                             let (close_rect, close) = ui
                                 .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                             let hot = close.hovered();

@@ -5930,7 +5930,7 @@ impl Lightbox {
                 }
                 ui.separator();
 
-                // **American, like every other label.** `decisions.md` settled it:
+                // **American, like every other label.** That is settled:
                 // the user reads "color" and "gray", while identifiers, persistence
                 // keys and comments keep the British form — which is why `self.grey`
                 // and `theme::label_colour` are spelt the way they are two lines from

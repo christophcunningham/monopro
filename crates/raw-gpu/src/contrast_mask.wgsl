@@ -12,7 +12,7 @@
 // error and gets blamed on the registration control.
 //
 // This compresses range rather than adding clarity: highlights sit above the local
-// mean and are pulled down, shadows are lifted. See `docs/decisions.md`.
+// mean and are pulled down, shadows are lifted.
 //
 // # The pivot
 //

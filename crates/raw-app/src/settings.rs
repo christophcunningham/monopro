@@ -248,7 +248,7 @@ pub struct Settings {
     // -- 5. Behaviour
     /// **On means today's behaviour.** Off makes a new file inherit the develop
     /// settings of the tab that was active when it opened — but never over its own
-    /// sidecar. See `docs/decisions.md`.
+    /// sidecar.
     pub reset_on_open: bool,
     /// Whether authored IPTC, subject keywords, rating and label travel with an
     /// exported file.
