@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 # egui shell. At milestone 1 this is one window, one image, two sliders.
 
 # **The executable is `monopro`, and that is not cosmetic.** macOS takes the application

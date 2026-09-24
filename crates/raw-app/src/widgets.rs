@@ -293,7 +293,7 @@ const STROKE: f32 = 1.0;
 
 /// All three `show`s. `modified` is `None` for a plain section — no dot and no
 /// reset — and `enabled` is `None` for a module without a switch.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "the one drawing routine behind all three module `show`s; each flag is one of their differences")]
 fn draw(
     name: &str,
     modified: Option<bool>,

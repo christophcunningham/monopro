@@ -4789,7 +4789,7 @@ impl App {
     /// It does not need to know whether it is the selected one — the red rules and
     /// the expansion are drawn by the caller, which is what keeps them wrapped
     /// around the whole block rather than around the row.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "a layer row reads the tab and reports three separate outcomes to its caller")]
     fn layer_row(
         ui: &mut egui::Ui,
         tab: &mut tabs::Tab,
@@ -4966,7 +4966,6 @@ impl App {
     }
 
     /// What a selected layer expands to show: its shape, then its tonal range.
-    #[allow(clippy::too_many_arguments)]
     fn layer_options(
         ui: &mut egui::Ui,
         tab: &mut tabs::Tab,
@@ -9409,7 +9408,7 @@ impl App {
 
     /// One-shot Curve point sampler. Its cursor is Triopro's white-point cursor:
     /// crosshair for the exact sampled pixel, eyedropper for the operation.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
     fn curve_point_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -9504,7 +9503,7 @@ impl App {
     /// Screen → frame → source going in, source → frame → screen coming out. Pins are
     /// stored against the **negative** — see [`tabs::Pin`] — so every read and write
     /// crosses `Frame`, and a pin stays on its subject through a rotation or a crop.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
     fn pin_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -9803,7 +9802,7 @@ impl App {
     /// in and the space `Viewport::patch` takes. Screen → frame is one line and its
     /// inverse is one line; there is no source-space step here, unlike the brush,
     /// because the loupe samples the *composed* picture rather than the negative.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
     fn print_loupe(
         &mut self,
         ui: &mut egui::Ui,
@@ -9974,7 +9973,7 @@ impl App {
     /// own density like the crop handles — chrome, not pixels. It is the only thing
     /// that says what radius the brush currently is, and it is why `[` and `]` need
     /// no readout to be usable.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
     fn paint_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -10289,7 +10288,7 @@ impl App {
     /// chrome, not pixels, the same way the curve editor's control points are. That
     /// is also what keeps them crisp: they are painted in points at the window's own
     /// density rather than resampled with the picture.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
     fn crop_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -10496,7 +10495,7 @@ impl App {
     /// Manual perspective guides. Their four points are authored in the oriented
     /// photograph and drawn over that unwarped photograph while the tool is open;
     /// leaving the tool applies the correction in one step.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
     fn keystone_tool(
         &mut self,
         ui: &mut egui::Ui,

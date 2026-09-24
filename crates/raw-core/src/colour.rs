@@ -106,7 +106,7 @@ impl Primaries {
 /// OKLab → XYZ, D65. Ottosson's inverse matrices, transcribed rather than recalled.
 pub fn oklab_to_xyz_d65(l: f32, a: f32, b: f32) -> [f32; 3] {
     // M2^-1: Lab -> nonlinear LMS.
-    #[allow(clippy::excessive_precision)]
+    #[expect(clippy::excessive_precision, reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source")]
     let lms_ = [
         l + 0.3963377774 * a + 0.2158037573 * b,
         l - 0.1055613458 * a - 0.0638541728 * b,
@@ -114,10 +114,10 @@ pub fn oklab_to_xyz_d65(l: f32, a: f32, b: f32) -> [f32; 3] {
     ];
     let lms = [lms_[0].powi(3), lms_[1].powi(3), lms_[2].powi(3)];
     // M1^-1: LMS -> XYZ.
-    // `#[allow]` rather than trimmed digits: these are Ottosson's published constants,
+    // Exempted rather than trimmed: these are Ottosson's published constants,
     // transcribed so they can be diffed against the reference. Rounding them to f32's
     // shortest distinct form would make that diff fail for a reader holding the paper.
-    #[allow(clippy::excessive_precision)]
+    #[expect(clippy::excessive_precision, reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source")]
     const M1_INV: [[f32; 3]; 3] = [
         [1.2270138511, -0.5577999807, 0.2812561490],
         [-0.0405801784, 1.1122568696, -0.0716766787],
@@ -134,7 +134,6 @@ pub fn oklab_to_xyz_d65(l: f32, a: f32, b: f32) -> [f32; 3] {
 pub fn adapt_d65_to_d50(xyz: [f32; 3]) -> [f32; 3] {
     // The published Bradford D65 -> D50 matrix, transcribed. See `oklab_to_xyz_d65` on
     // why the digits are not trimmed.
-    #[allow(clippy::excessive_precision)]
     const BRADFORD: [[f32; 3]; 3] = [
         [1.0478112, 0.0228866, -0.0501270],
         [0.0295424, 0.9904844, -0.0170491],
@@ -296,7 +295,7 @@ pub fn srgb_of_lab([l, a, b]: [f32; 3]) -> [u8; 3] {
 /// XYZ (D65) → OKLab. The forward matrix sits beside its inverse so Lab input and
 /// display output cannot acquire a second, subtly different colour transform.
 fn xyz_d65_to_oklab(xyz: [f32; 3]) -> (f32, f32, f32) {
-    #[allow(clippy::excessive_precision)]
+    #[expect(clippy::excessive_precision, reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source")]
     const M1: [[f32; 3]; 3] = [
         [0.8189330101, 0.3618667424, -0.1288597137],
         [0.0329845436, 0.9293118715, 0.0361456387],
@@ -304,7 +303,7 @@ fn xyz_d65_to_oklab(xyz: [f32; 3]) -> (f32, f32, f32) {
     ];
     let lms = apply(M1, xyz);
     let c = [lms[0].cbrt(), lms[1].cbrt(), lms[2].cbrt()];
-    #[allow(clippy::excessive_precision)]
+    #[expect(clippy::excessive_precision, reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source")]
     (
         0.2104542553 * c[0] + 0.7936177850 * c[1] - 0.0040720468 * c[2],
         1.9779984951 * c[0] - 2.4285922050 * c[1] + 0.4505937099 * c[2],
@@ -545,7 +544,6 @@ mod tests {
         // sRGB's primaries, D50-adapted, as an ICC profile stores them. Built here
         // rather than read from a profile so this module's tests do not depend on
         // `raw-app`'s embedded bytes; `raw-app` has the test that reads the real ones.
-        #[allow(clippy::excessive_precision)]
         let to_xyz = [
             [0.4360657, 0.3851515, 0.1430784],
             [0.2224884, 0.7168733, 0.0606384],

@@ -17,6 +17,21 @@ exclude = ["vendor/sparkle-updater", "vendor/egui_tiles"]
 # earns its complexity. Contrast Mask is what earned it — it forks and joins, so
 # it cannot be expressed as a line.
 
+# Stricter than clippy's defaults in two places, both from the Linebender set. Each
+# crate opts in with `[lints] workspace = true`; CI denies warnings, so these hold.
+#
+# `cast_possible_truncation` was tried and left off: 363 hits, almost all a
+# dimension already bounded by `OutputParams::MAX_EDGE` or a value clamped to 0-255
+# on the same line, and float-to-int `as` saturates rather than wrapping. A real
+# truncation would have been one line among three hundred exemptions.
+[workspace.lints.clippy]
+# An exemption says why, and `expect` rather than `allow` so it is flagged once the
+# lint stops firing and the exemption has become a stale claim.
+allow_attributes_without_reason = "warn"
+allow_attributes = "warn"
+# A debug_assert that fires in a decode should say what it was guarding.
+missing_assert_message = "warn"
+
 [workspace.package]
 version = "0.1.1"
 edition = "2024"

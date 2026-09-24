@@ -40,7 +40,10 @@ impl SceneImage {
     /// coordinate. Do not remove the snap.
     #[inline]
     pub fn color_at(&self, row: usize, col: usize) -> CfaColor {
-        debug_assert!(self.geom.crop_x.is_multiple_of(2) && self.geom.crop_y.is_multiple_of(2));
+        debug_assert!(
+            self.geom.crop_x.is_multiple_of(2) && self.geom.crop_y.is_multiple_of(2),
+            "the crop origin must sit on a 2x2 CFA tile boundary"
+        );
         self.geom.pattern[row & 1][col & 1]
     }
 }

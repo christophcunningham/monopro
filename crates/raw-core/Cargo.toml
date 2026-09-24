@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 # Decode -> scene. No GPU, no UI. Headless-testable against a folder of reference raws.
 
 [dependencies]
