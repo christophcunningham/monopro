@@ -320,7 +320,8 @@ fn ramp(ui: &mut egui::Ui, t: &ToningParams) {
     let painter = ui.painter_at(rect);
 
     let n = (w.max(2.0) as usize).clamp(2, 512);
-    for (i, toned) in t.bake(n).iter().enumerate() {
+    // The process's own colours: never re-greyed for the module ground.
+    theme::true_colour(ui, || for (i, toned) in t.bake(n).iter().enumerate() {
         let x0 = rect.left() + i as f32 / n as f32 * rect.width();
         let x1 = rect.left() + (i + 1) as f32 / n as f32 * rect.width();
         let l = raw_core::colour::oklab_lightness(toned.y);
@@ -332,7 +333,7 @@ fn ramp(ui: &mut egui::Ui, t: &ToningParams) {
             0.0,
             Color32::from_rgb(enc(lin[0]), enc(lin[1]), enc(lin[2])),
         );
-    }
+    });
 }
 
 #[cfg(test)]

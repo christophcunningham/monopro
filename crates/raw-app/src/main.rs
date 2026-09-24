@@ -2358,6 +2358,12 @@ fn file_tab(
 /// the module borders stay clear even while it is being dragged.
 const SCROLL_GUTTER: i8 = 10;
 
+/// Left margin on the same panels. Narrower than [`SCROLL_GUTTER`], which also has
+/// a scrollbar to clear, but enough that a module's left edge does not sit on the
+/// pane's — invisible while panel and module were one grey, obvious once the panel
+/// ground can differ from the module's.
+const PANEL_INSET: i8 = 5;
+
 /// The value under the cursor.
 #[derive(Clone, Copy)]
 enum Readout {
@@ -4194,9 +4200,17 @@ impl eframe::App for App {
             // call, on the grounds that the moment EXIF is a panel the folder tree
             // has to be one too. See `lightbox::Pane`.
             let mut open_in_develop = None;
+            // The seams between panes show this, so it is the panel ground.
+            let lb_panel = theme::background_of(self.settings.lightbox_grounds()[1]);
             egui::CentralPanel::default()
-                .frame(egui::Frame::NONE.fill(theme::CHROME))
-                .show(ui, |ui| open_in_develop = self.lightbox.ui(ui, &self.icons));
+                .frame(egui::Frame::NONE.fill(lb_panel))
+                .show(ui, |ui| {
+                    self.lightbox.grounds = self
+                        .settings
+                        .lightbox_grounds()
+                        .map(|v| theme::background_of(v).r());
+                    open_in_develop = self.lightbox.ui(ui, &self.icons)
+                });
             let renamed = self.lightbox.take_rename_events();
             for (id, path) in self.tabs.rename_paths(&renamed) {
                 self.start_load(id, path, &ctx);
@@ -4214,8 +4228,10 @@ impl eframe::App for App {
                 self.set_lightbox(false);
             }
         } else {
+            let panel = theme::background_of(self.settings.panel_background());
+            theme::set_module_ground(self.settings.module_background());
             egui::CentralPanel::default()
-                .frame(egui::Frame::NONE.fill(theme::CHROME))
+                .frame(egui::Frame::NONE.fill(panel))
                 .show(ui, |ui| self.tile_tree(ui, &ctx, &rs, &actions));
         }
 
@@ -4458,6 +4474,7 @@ impl App {
         let scroll_id = ("develop-scroll", self.scroll_session, self.tabs.active_id());
         egui::Frame::new()
             .outer_margin(egui::Margin {
+                left: PANEL_INSET,
                 right: SCROLL_GUTTER,
                 ..Default::default()
             })
@@ -4576,6 +4593,7 @@ impl App {
         let scroll_id = ("toning-scroll", self.scroll_session, self.tabs.active_id());
         egui::Frame::new()
             .outer_margin(egui::Margin {
+                left: PANEL_INSET,
                 right: SCROLL_GUTTER,
                 ..Default::default()
             })
@@ -4660,6 +4678,7 @@ impl App {
         );
         egui::Frame::new()
             .outer_margin(egui::Margin {
+                left: PANEL_INSET,
                 right: SCROLL_GUTTER,
                 ..Default::default()
             })
@@ -4733,6 +4752,9 @@ impl App {
         // stack: it is where you go to start something, and a control that walks off
         // the bottom as the list grows is one you hunt for.
         // `Panel`, which in egui 0.35 replaced the four `*Panel` types with one.
+        // Built on `CHROME` like a module and re-greyed like one, so it follows the
+        // module value rather than staying dark under a light stack.
+        theme::module_ground_ui(ui, |ui| {
         egui::containers::panel::Panel::bottom("db-add")
             .frame(
                 egui::Frame::NONE
@@ -4813,6 +4835,7 @@ impl App {
                 // editing were nowhere near it — the same complaint that moved the
                 // tonal range inside the layer rows in the first place.
             });
+        });
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             let module = widgets::Module::new("DODGE / BURN")
@@ -5490,6 +5513,7 @@ impl App {
         let scroll_id = ("history-scroll", self.scroll_session, self.tabs.active_id());
         egui::Frame::new()
             .outer_margin(egui::Margin {
+                left: PANEL_INSET,
                 right: SCROLL_GUTTER,
                 ..Default::default()
             })
@@ -5516,6 +5540,7 @@ impl App {
             .show(ui, |ui| {
                 egui::Frame::new()
                     .outer_margin(egui::Margin {
+                        left: PANEL_INSET,
                         right: SCROLL_GUTTER,
                         ..Default::default()
                     })
@@ -5692,6 +5717,7 @@ impl App {
         );
         egui::Frame::new()
             .outer_margin(egui::Margin {
+                left: PANEL_INSET,
                 right: SCROLL_GUTTER,
                 ..Default::default()
             })
@@ -5966,6 +5992,7 @@ impl App {
         let scroll_id = ("info-scroll", self.scroll_session, self.tabs.active_id());
         egui::Frame::new()
             .outer_margin(egui::Margin {
+                left: PANEL_INSET,
                 right: SCROLL_GUTTER,
                 ..Default::default()
             })
@@ -7437,8 +7464,8 @@ impl App {
             .open_when(reveal_loupe_module)
             .show(ui, |ui| {
                 ui.label(theme::caption(
-                    "sharpening and grain are applied on export only — neither is a \
-                 viewport pass. The loupe is where you judge them.",
+                    "sharpening and grain are applied on export only. The loupe is \
+                 where you judge them.",
                 ));
                 ui.horizontal(|ui| {
                     // **An eye, not a checkbox** — the maintainer's call, and the same button the
@@ -8455,11 +8482,14 @@ impl App {
                                 layout.outer_inches[1] * scale,
                             ),
                         );
-                        ui.painter().rect_filled(
-                            outer,
-                            0.0,
-                            egui::Color32::from_rgb(f.color[0], f.color[1], f.color[2]),
-                        );
+                        // The mount's real colour: exempt from the module re-grey.
+                        theme::true_colour(ui, || {
+                            ui.painter().rect_filled(
+                                outer,
+                                0.0,
+                                egui::Color32::from_rgb(f.color[0], f.color[1], f.color[2]),
+                            )
+                        });
                         let image_rect = egui::Rect::from_min_size(
                             egui::pos2(
                                 outer.left() + layout.margins.left * scale,
@@ -11848,11 +11878,14 @@ fn colour_picker_lab_button(
         ui.style().interact(&response)
     };
     let painted = rect.expand(visuals.expansion);
-    ui.painter().rect_filled(
-        painted.shrink(1.0),
-        0.0,
-        egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
-    );
+    // The chosen colour itself, so never re-greyed for the module ground.
+    theme::true_colour(ui, || {
+        ui.painter().rect_filled(
+            painted.shrink(1.0),
+            0.0,
+            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+        )
+    });
     ui.painter().rect_stroke(
         painted,
         0.0,
@@ -11970,7 +12003,7 @@ fn surround_colour(ui: &mut egui::Ui, s: &mut settings::Settings, d: &settings::
         ui,
         s.surround_okhsl != d.surround_okhsl,
         "Mount color",
-        Some("Rising Museum Board presets or a custom color."),
+        None,
         |ui| {
             // Settings controls are laid out from the right edge. Add these in the
             // reverse of their visual order so the row reads exactly like FRAME:
@@ -12021,7 +12054,7 @@ fn surround_colour(ui: &mut egui::Ui, s: &mut settings::Settings, d: &settings::
     if !was_focused {
         hex.clone_from(&canonical_hex);
     }
-    settings::item(ui, false, "Hex", Some("sRGB · #RRGGBB"), |ui| {
+    settings::item(ui, false, "Hex", None, |ui| {
         let valid = parse_hex_rgb(&hex).is_some();
         let response = ui.add(
             egui::TextEdit::singleline(&mut hex)
@@ -12776,7 +12809,7 @@ impl App {
                         ui,
                         s.tiff_suffix != d.tiff_suffix,
                         "TIFF suffix",
-                        Some("Added to the original filename."),
+                        None,
                         |ui| ui.add(egui::TextEdit::singleline(&mut s.tiff_suffix).desired_width(190.0)),
                     );
                     if reset {
@@ -12787,7 +12820,7 @@ impl App {
                         ui,
                         s.png_suffix != d.png_suffix,
                         "PNG suffix",
-                        Some("Added to the original filename."),
+                        None,
                         |ui| ui.add(egui::TextEdit::singleline(&mut s.png_suffix).desired_width(190.0)),
                     );
                     if reset {
@@ -12844,7 +12877,7 @@ impl App {
                     s.print_unit = d.print_unit.clone();
                 }
                 settings::rule(ui);
-                let (_, reset) = settings::item(ui, s.print_ppi != d.print_ppi, "Default resolution", Some("Used when a new image opens."), |ui| {
+                let (_, reset) = settings::item(ui, s.print_ppi != d.print_ppi, "Default resolution", None, |ui| {
                     ui.add(
                         egui::DragValue::new(&mut s.print_ppi)
                             .speed(1.0)
@@ -13156,20 +13189,54 @@ impl App {
                 s.export_depth = depth.key().to_owned();
 
                                 }
-                if sheet.shows(ui, settings::Section::Viewer, "VIEWER BACKGROUND canvas background grey gray brightness") {
-                    settings::heading(ui, "VIEWER BACKGROUND");
+                if sheet.shows(ui, settings::Section::Viewer, "BACKGROUNDS viewer background canvas grey gray brightness panel panels match module modules card") {
+                    settings::heading(ui, "BACKGROUNDS");
                     settings::rule(ui);
                     let (_, reset) = settings::item(
                         ui,
                         s.viewer_background != d.viewer_background,
-                        "Canvas value",
-                        Some("Background behind the image."),
+                        "Viewer background",
+                        None,
                         |ui| {
                             widgets::settings_slider(ui, &mut s.viewer_background, d.viewer_background, 0.0..=100.0)
                         },
                     );
                     if reset {
                         s.viewer_background = d.viewer_background;
+                    }
+                    settings::rule(ui);
+                    // Greyed rather than hidden while the panels follow the canvas, so
+                    // the value is still there to come back to when the switch is off.
+                    let follow = s.panel_matches_viewer;
+                    let (_, reset) = settings::item(
+                        ui,
+                        s.panel_background != d.panel_background,
+                        "Panel",
+                        None,
+                        |ui| {
+                            ui.add_enabled_ui(!follow, |ui| {
+                                widgets::settings_slider(ui, &mut s.panel_background, d.panel_background, 0.0..=100.0)
+                            })
+                            .inner
+                        },
+                    );
+                    if reset {
+                        s.panel_background = d.panel_background;
+                    }
+                    settings::rule(ui);
+                    settings::check(ui, &mut s.panel_matches_viewer, d.panel_matches_viewer, "Match viewer background");
+                    settings::rule(ui);
+                    let (_, reset) = settings::item(
+                        ui,
+                        s.module_background != d.module_background,
+                        "Module",
+                        None,
+                        |ui| {
+                            widgets::settings_slider(ui, &mut s.module_background, d.module_background, 0.0..=100.0)
+                        },
+                    );
+                    if reset {
+                        s.module_background = d.module_background;
                     }
 
                                 }
@@ -13194,7 +13261,6 @@ impl App {
                     if reset_sample {
                         s.sample_area = d.sample_area.clone();
                     }
-                    settings::note(ui, "3 × 3 is the smallest reliable DirectMosaic sample.");
                     settings::rule(ui);
                     let refv = s.reference_values();
                     let reset_reference = settings::combo_width(
@@ -13214,7 +13280,6 @@ impl App {
                     if reset_reference {
                         s.reference_values = d.reference_values.clone();
                     }
-                    settings::note(ui, "Controls readouts for JPEG and raw-linear views.");
                 }
 
                 if sheet.shows(ui, settings::Section::Viewer, "SURROUND mount border colour color okhsl hue width mat") {
@@ -13224,7 +13289,7 @@ impl App {
                     ui,
                     s.surround_width != d.surround_width,
                     "Width",
-                    Some("Used whenever Surround is shown with B."),
+                    None,
                     |ui| {
                         widgets::settings_slider(ui, &mut s.surround_width, d.surround_width, 0.0..=300.0)
                     },
@@ -13323,6 +13388,35 @@ impl App {
                     );
                     if reset {
                         s.lightbox_folder_root = d.lightbox_folder_root.clone();
+                    }
+                }
+                if sheet.shows(ui, settings::Section::Lightbox, "BACKGROUNDS canvas panel panels module modules card cards grey gray brightness match viewer") {
+                    settings::heading(ui, "BACKGROUNDS");
+                    settings::rule(ui);
+                    settings::check(
+                        ui,
+                        &mut s.lightbox_matches_viewer,
+                        d.lightbox_matches_viewer,
+                        "Match viewer",
+                    );
+                    // Greyed rather than hidden while matching, so each value is still
+                    // there to come back to when the switch is off.
+                    let follow = s.lightbox_matches_viewer;
+                    for (value, default, title) in [
+                        (&mut s.lightbox_canvas, d.lightbox_canvas, "Viewer background"),
+                        (&mut s.lightbox_panel, d.lightbox_panel, "Panel"),
+                        (&mut s.lightbox_module, d.lightbox_module, "Tiles"),
+                    ] {
+                        settings::rule(ui);
+                        let (_, reset) = settings::item(ui, *value != default, title, None, |ui| {
+                            ui.add_enabled_ui(!follow, |ui| {
+                                widgets::settings_slider(ui, value, default, 0.0..=100.0)
+                            })
+                            .inner
+                        });
+                        if reset {
+                            *value = default;
+                        }
                     }
                 }
                 if sheet.shows(ui, settings::Section::Lightbox, "TILES thumbnails edits gray grey default sort frameless filenames folders non-image files") {
@@ -13462,7 +13556,6 @@ impl App {
                                 }
                 if sheet.shows(ui, settings::Section::General, "PANEL POSITIONS layout tiles docking reset arrangement") {
                     settings::heading(ui, "PANEL POSITIONS");
-                    settings::note(ui, "Panel positions are remembered across restarts.");
                     if ui.button("Reset to the default layout").clicked() {
                         reset_layout = true;
                     }

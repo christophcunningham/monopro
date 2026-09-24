@@ -808,6 +808,9 @@ struct RenameCaches {
 pub struct Lightbox {
     /// Whether the mode is up. `main` reads this to decide what to draw.
     pub active: bool,
+    /// Canvas, panel and card greys, from `Settings::lightbox_grounds`. Set by
+    /// `main` every frame, so a Settings change is live.
+    pub grounds: [u8; 3],
     /// Index into [`SIZES`].
     pub size: usize,
     pub folder: Option<PathBuf>,
@@ -1020,6 +1023,11 @@ impl Lightbox {
             show_folders: false,
             show_other_files: false,
             grey: true,
+            grounds: [
+                theme::CHROME.r(),
+                theme::CHROME_DEEP.r(),
+                theme::CHROME_DEEP.r(),
+            ],
             sort: Sort::default(),
             descending: false,
             filters: Filters::default(),
@@ -4064,22 +4072,10 @@ struct Panes<'a> {
     dropped: bool,
 }
 
-impl egui_tiles::Behavior<Pane> for Panes<'_> {
-    fn pane_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        tile_id: egui_tiles::TileId,
-        pane: &mut Pane,
-    ) -> egui_tiles::UiResponse {
-        // Every pane paints its own ground: a tile is handed a bare `Ui` with no
-        // `Frame` around it, so without this the central panel's fill shows through.
-        let bg = if *pane == Pane::Grid {
-            theme::CHROME
-        } else {
-            theme::CHROME_DEEP
-        };
-        ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
-
+impl Panes<'_> {
+    /// A pane's header and contents, on the ground `pane_ui` has already painted.
+    /// Returns whether the header started a drag.
+    fn pane_body(&mut self, ui: &mut egui::Ui, tile_id: egui_tiles::TileId, pane: &Pane) -> bool {
         // **A pane that is not in a tab bar needs a handle, or it cannot be moved.**
         // the maintainer found FAVORITES and EXIF ungrabbable once stacked: a tab is its own
         // drag handle, and a lone pane has none. This is the header Develop's panes
@@ -4166,6 +4162,40 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
             }
             Pane::Exif => self.lb.exif_ui(ui),
         }
+        dragged
+    }
+}
+
+impl egui_tiles::Behavior<Pane> for Panes<'_> {
+    fn pane_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        tile_id: egui_tiles::TileId,
+        pane: &mut Pane,
+    ) -> egui_tiles::UiResponse {
+        // Every pane paints its own ground: a tile is handed a bare `Ui` with no
+        // `Frame` around it, so without this the central panel's fill shows through.
+        //
+        // **The grounds are settings**, the grid on the canvas value and the rest on
+        // the panel value. Everything a pane draws was designed on the old fixed grey
+        // (`CHROME` for the grid, `CHROME_DEEP` for the panels) and is re-greyed from
+        // it — the same rule Develop's modules use, so text flips dark on a light
+        // ground. Thumbnails are pictures and are never touched.
+        let [canvas, panel, _] = self.lb.grounds;
+        let ground = if *pane == Pane::Grid {
+            theme::Ground {
+                design: theme::CHROME.r(),
+                to: canvas,
+            }
+        } else {
+            theme::Ground {
+                design: theme::CHROME_DEEP.r(),
+                to: panel,
+            }
+        };
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, egui::Color32::from_gray(ground.to));
+        let dragged = theme::reground_ui(ui, ground, |ui| self.pane_body(ui, tile_id, pane));
         if dragged {
             egui_tiles::UiResponse::DragStarted
         } else {
@@ -6245,8 +6275,17 @@ impl Lightbox {
         } else {
             theme::CHROME_DEEP
         };
+        // **The card has its own ground, the module value**, independent of the
+        // canvas it sits on. The three fills above were written against
+        // `CHROME_DEEP`; moved to the card grey here, and kept out of the grid's own
+        // re-grey so the canvas value does not move them a second time.
+        let fill = theme::Ground {
+            design: theme::CHROME_DEEP.r(),
+            to: self.grounds[2],
+        }
+        .apply(fill);
         if !self.frameless || r.hovered() || in_batch {
-            ui.painter().rect_filled(img_rect, 2.0, fill);
+            theme::true_colour(ui, || ui.painter().rect_filled(img_rect, 2.0, fill));
         }
         // **Three states, three weights, and they stack.** Batch membership is a
         // ground, the anchor is a full ruby ring, and a batch member that is not the

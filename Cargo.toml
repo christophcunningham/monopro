@@ -8,7 +8,7 @@ members = [
 ]
 # Vendored, not a member: it stays out of `cargo test --workspace` (its native
 # harness wants an AppKit run loop) and off non-macOS builds.
-exclude = ["vendor/sparkle-updater"]
+exclude = ["vendor/sparkle-updater", "vendor/egui_tiles"]
 
 # catalog/ is deliberately absent — lightbox comes after tabs.
 #
@@ -74,6 +74,9 @@ pollster = "0.4"
 # touches are pinned by the Sparkle 2.9.6 framework in packaging/macos/Sparkle.
 [patch.crates-io]
 sparkle-updater = { path = "vendor/sparkle-updater" }
+# `egui_tiles` 0.16.0, vendored so a tab bar's scroll arrows step one tab at a
+# time instead of a third of the bar. See vendor/egui_tiles/LOCAL-PATCH.md.
+egui_tiles = { path = "vendor/egui_tiles" }
 
 [profile.dev]
 opt-level = 1 # decoding a 100MP RAF in a debug build is otherwise unusable

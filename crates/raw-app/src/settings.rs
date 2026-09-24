@@ -162,6 +162,13 @@ pub fn cache_dir() -> Option<PathBuf> {
     dir().map(|root| root.join("thumbcache"))
 }
 
+/// 0.09 display-encoded, on the 0-100 scale. Also the panels' default, so out of
+/// the box the panels and the canvas are one ground.
+const DEFAULT_VIEWER_BACKGROUND: f32 = 9.0;
+
+/// `theme::CHROME` (grey 38) on the 0-100 scale.
+const DEFAULT_MODULE_BACKGROUND: f32 = 15.0;
+
 /// Everything the Settings menu configures.
 ///
 /// `#[serde(default)]` on the struct is what makes a partial file legal: any key the
@@ -219,6 +226,16 @@ pub struct Settings {
     // -- 4. Viewer background, and the surround
     /// 0–100. The canvas the image sits on, *not* the border around it.
     pub viewer_background: f32,
+    /// 0–100, the same scale as `viewer_background`. The side panels' ground when
+    /// `panel_matches_viewer` is off.
+    pub panel_background: f32,
+    /// Whether the side panels follow `viewer_background` instead of
+    /// `panel_background`.
+    pub panel_matches_viewer: bool,
+    /// 0–100, the same scale as `viewer_background`. The ground of every module
+    /// card, independent of both the canvas and the panels. The default is
+    /// `theme::CHROME`, which is what the modules were designed on.
+    pub module_background: f32,
     /// The border around the image — a mount, the way a print sits on one. Whether it
     /// is shown belongs to the image tab; Settings owns only the reference mount's
     /// geometry and colour.
@@ -277,6 +294,15 @@ pub struct Settings {
     /// open in the same visual language as Develop. Turning it off is remembered,
     /// so color remains one click away without becoming a session-only surprise.
     pub lightbox_gray: bool,
+    /// Lightbox follows the viewer's canvas, panel and module values. On by default so
+    /// the two modes look like one app; off, the three below take over.
+    pub lightbox_matches_viewer: bool,
+    /// 0–100. The grid behind the thumbnails.
+    pub lightbox_canvas: f32,
+    /// 0–100. Folders, Search, Favorites and EXIF.
+    pub lightbox_panel: f32,
+    /// 0–100. The thumbnail cards.
+    pub lightbox_module: f32,
     /// The one local folder shown at the top level of FOLDERS. `None` means the
     /// current user's Home folder, which keeps a settings file portable between
     /// machines and accounts. Mounted external drives and cards are discovered
@@ -542,9 +568,10 @@ impl Default for Settings {
             export_depth: export::Depth::Sixteen.key().into(),
             print_unit: Unit::default().key().into(),
             print_ppi: p.output.ppi,
-            // 0.09 display-encoded is what `theme::SURROUND` and `display.wgsl`
-            // both hold today; on a 0-100 scale that is 9.
-            viewer_background: 9.0,
+            viewer_background: DEFAULT_VIEWER_BACKGROUND,
+            panel_background: DEFAULT_VIEWER_BACKGROUND,
+            panel_matches_viewer: false,
+            module_background: DEFAULT_MODULE_BACKGROUND,
             surround_width: 85.0,
             // Mathematical white, matching the direct White button in the Viewer
             // page and the Frame module. Rising boards remain measured alternatives.
@@ -553,6 +580,12 @@ impl Default for Settings {
             export_metadata: true,
             lightbox_xmp_thumbnails: false,
             lightbox_gray: true,
+            lightbox_matches_viewer: true,
+            // Lightbox's own look before these were settings: the grid on `CHROME`,
+            // panels and cards on `CHROME_DEEP`.
+            lightbox_canvas: 15.0,
+            lightbox_panel: 11.8,
+            lightbox_module: 11.8,
             lightbox_folder_root: None,
             quick_export: false,
             remember_lightbox_sort: true,
@@ -898,6 +931,37 @@ impl Settings {
     /// unit both the shader and the egui letterbox want.
     pub fn background(&self) -> f32 {
         (self.viewer_background / 100.0).clamp(0.0, 1.0)
+    }
+
+    /// Lightbox's canvas, panel and card grounds, in the same unit as
+    /// [`Settings::background`] — the viewer's when `lightbox_matches_viewer` is on.
+    pub fn lightbox_grounds(&self) -> [f32; 3] {
+        if self.lightbox_matches_viewer {
+            [
+                self.background(),
+                self.panel_background(),
+                self.module_background(),
+            ]
+        } else {
+            [self.lightbox_canvas, self.lightbox_panel, self.lightbox_module]
+                .map(|v| (v / 100.0).clamp(0.0, 1.0))
+        }
+    }
+
+    /// The module cards' ground, in the same unit as [`Settings::background`].
+    pub fn module_background(&self) -> f32 {
+        (self.module_background / 100.0).clamp(0.0, 1.0)
+    }
+
+    /// The side panels' ground, in the same unit as [`Settings::background`]: the
+    /// viewer background when `panel_matches_viewer` is on, else its own value.
+    pub fn panel_background(&self) -> f32 {
+        let v = if self.panel_matches_viewer {
+            self.viewer_background
+        } else {
+            self.panel_background
+        };
+        (v / 100.0).clamp(0.0, 1.0)
     }
 
     // ------------------------------------------------------------ persistence
@@ -1323,9 +1387,12 @@ fn toggle_switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
         egui::pos2(knob_x, rect.top() + 3.0),
         egui::vec2(knob_size, knob_size),
     );
-    ui.painter().rect_filled(
+    // **The knob wears the slider handle's bezel**: the same 1pt corner and 1pt
+    // outline, so a switch and a slider read as one family of grips. The track keeps
+    // its square corners — the bezel belongs to the thing you take hold of.
+    ui.painter().rect(
         knob,
-        0.0,
+        1.0,
         if *value {
             // Settings switches use a restrained 78.4% white rather than the app's
             // 93.3% bright text white. The square remains legible without reading as
@@ -1334,6 +1401,8 @@ fn toggle_switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
         } else {
             crate::theme::DIM
         },
+        egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+        egui::StrokeKind::Inside,
     );
     response
 }
@@ -1550,12 +1619,19 @@ mod tests {
             print_unit: "cm".into(),
             print_ppi: 360.0,
             viewer_background: 42.5,
+            panel_background: 20.0,
+            panel_matches_viewer: true,
+            module_background: 80.0,
             surround_width: 60.0,
             surround_okhsl: [35.0, 0.15, 0.9],
             reset_on_open: false,
             export_metadata: false,
             lightbox_xmp_thumbnails: true,
             lightbox_gray: false,
+            lightbox_matches_viewer: false,
+            lightbox_canvas: 50.0,
+            lightbox_panel: 60.0,
+            lightbox_module: 70.0,
             lightbox_folder_root: Some("/example/Pictures".into()),
             quick_export: true,
             remember_lightbox_sort: false,
@@ -1785,6 +1861,23 @@ mod tests {
         // honest if it moves again.
         assert_eq!(fresh.sampling(), Sampling::default());
         assert_eq!(fresh.params().luminance.sampling, Sampling::default());
+    }
+
+    #[test]
+    fn lightbox_follows_the_viewer_until_told_not_to() {
+        let mut s = Settings {
+            viewer_background: 30.0,
+            panel_background: 40.0,
+            module_background: 50.0,
+            lightbox_canvas: 10.0,
+            lightbox_panel: 20.0,
+            lightbox_module: 90.0,
+            ..Settings::default()
+        };
+        assert!(s.lightbox_matches_viewer, "matching is the default");
+        assert_eq!(s.lightbox_grounds(), [0.3, 0.4, 0.5]);
+        s.lightbox_matches_viewer = false;
+        assert_eq!(s.lightbox_grounds(), [0.1, 0.2, 0.9]);
     }
 
     #[test]

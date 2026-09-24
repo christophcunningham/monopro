@@ -329,7 +329,13 @@ fn draw(
         bypass: false,
         reset: false,
     };
+    // Filled, not transparent: the panel ground behind it can follow the viewer
+    // background, and the modules keep their own grey whatever it is set to. Drawn
+    // at `CHROME` and then re-greyed to the chosen module ground — see
+    // `theme::regrey` — so every colour inside is written once, for one ground.
+    crate::theme::module_ground_ui(ui, |ui| {
     egui::Frame::new()
+        .fill(crate::theme::CHROME)
         .stroke(Stroke::new(STROKE, Color32::from_gray(52)))
         .corner_radius(2.0)
         .inner_margin(egui::Margin::symmetric(PAD_X, 7))
@@ -383,6 +389,7 @@ fn draw(
                 body(ui);
             }
         });
+    });
 
     ui.data_mut(|d| d.insert_temp(id, open));
     ui.add_space(7.0);
@@ -822,7 +829,69 @@ pub fn settings_slider(
     default: f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> egui::Response {
-    let mut response = ui.add(egui::Slider::new(value, range).integer());
+    // **egui's slider for the gesture and the rail, Develop's handle on top of it.**
+    // The rail is what the Settings window has always shown and stays exactly as it
+    // was — the `inactive` fill and corner, painted here because the handle and the
+    // rail read the same visuals slot and the only way to hide one is to hide both.
+    // The handle is the develop slider's: a narrow outlined rectangle, ruby only while
+    // it is being pulled.
+    let rail_fill = ui.visuals().widgets.inactive.bg_fill;
+    let rail_corner = ui.visuals().widgets.inactive.corner_radius;
+    // egui sizes its handle from the slider's height (`handle_radius` is height / 2.5)
+    // and insets the travel by the handle's half-width. Asking for an aspect that
+    // makes that half-width ours keeps the drawn handle on egui's own position.
+    let thickness = ui
+        .text_style_height(&egui::TextStyle::Body)
+        .max(ui.spacing().interact_size.y);
+    let aspect_ratio = (HANDLE_W * 0.5) / (thickness / 2.5);
+    let mut response = ui
+        .scope(|ui| {
+            let w = &mut ui.visuals_mut().widgets;
+            for v in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+                v.bg_fill = Color32::TRANSPARENT;
+                v.fg_stroke = Stroke::NONE;
+                v.expansion = 0.0;
+            }
+            ui.add(
+                egui::Slider::new(value, range.clone())
+                    .integer()
+                    .show_value(false)
+                    .handle_shape(egui::style::HandleShape::Rect { aspect_ratio }),
+            )
+        })
+        .inner;
+    {
+        let rect = response.rect;
+        let rail_h = ui.spacing().slider_rail_height;
+        let painter = ui.painter();
+        painter.rect_filled(
+            Rect::from_center_size(rect.center(), vec2(rect.width(), rail_h)),
+            rail_corner,
+            rail_fill,
+        );
+        let (lo, hi) = (*range.start(), *range.end());
+        let t = ((*value - lo) / (hi - lo).max(1e-9)).clamp(0.0, 1.0);
+        let (x0, x1) = (rect.left() + HANDLE_W * 0.5, rect.right() - HANDLE_W * 0.5);
+        let handle = egui::Rect::from_center_size(
+            pos2(x0 + t * (x1 - x0), rect.center().y),
+            vec2(HANDLE_W, HANDLE_W / HANDLE_ASPECT),
+        );
+        let ink = if response.dragged() {
+            RUBY
+        } else {
+            Color32::from_gray(150)
+        };
+        painter.rect_filled(handle, 1.0, theme::CHROME);
+        painter.rect_stroke(handle, 1.0, Stroke::new(1.0, ink), egui::StrokeKind::Inside);
+    }
+    // The number box egui would have drawn after the rail, in the same place.
+    let value_box = ui.add(
+        egui::DragValue::new(value)
+            .range(range.clone())
+            .fixed_decimals(0)
+            .speed(((*range.end() - *range.start()) / response.rect.width().max(1.0)).max(0.01)),
+    );
+    response = response.union(value_box);
     // Native slider tracks sense drags, not clicks. Inspect the pointer gesture
     // over their response so double-click works on the track as well as the value.
     if response.enabled()
@@ -1269,7 +1338,8 @@ pub fn zone_ruler(
     // trapezoid are the tones it selects.
     let step = 2.0f32.max(1.0);
     let mut x = ramp.left();
-    while x < ramp.right() {
+    // Print values, so exempt from the module re-grey.
+    crate::theme::true_colour(ui, || while x < ramp.right() {
         let lin = (0.18 * (to_ev(x + step * 0.5)).exp2()).min(1.0);
         let g = (lin.powf(1.0 / 2.2) * 255.0).round() as u8;
         painter.rect_filled(
@@ -1281,7 +1351,7 @@ pub fn zone_ruler(
             Color32::from_gray(g),
         );
         x += step;
-    }
+    });
 
     // The distribution, drawn INSIDE the ramp from its baseline rather than in a
     // band of its own. Ruby at low alpha: it is the one thing here that is neither
@@ -1589,6 +1659,44 @@ pub enum ZoneGrab {
     },
 }
 
+/// Fill the area under `line` down to `floor`, one rectangle per physical pixel
+/// column, each as tall as the line at that column's centre.
+///
+/// **Why columns, and why a pixel wide.** Two earlier fills each had a visible flaw:
+/// - one flat bar per *bin* stepped out from under the sloped outline, a jagged edge
+///   along it;
+/// - a triangle mesh following the outline exactly fixed that, but meshes are neither
+///   anti-aliased nor snapped to pixels, so as the data moved by fractions of a pixel
+///   during a drag the hard edge crawled — the histogram looked like it was jumping.
+///
+/// Rectangles snap to the pixel grid, so a column either stays or moves one clean
+/// pixel; at one pixel wide its top is within half a pixel of the line, which the
+/// line itself covers.
+///
+/// `line` must run left to right.
+fn fill_under(painter: &egui::Painter, line: &[Pos2], floor: f32, fill: Color32) {
+    let (Some(first), Some(last)) = (line.first(), line.last()) else {
+        return;
+    };
+    let px = 1.0 / painter.pixels_per_point();
+    let mut seg = 0;
+    let mut x = first.x;
+    while x < last.x {
+        let x1 = (x + px).min(last.x);
+        let c = 0.5 * (x + x1);
+        while seg + 2 < line.len() && line[seg + 1].x < c {
+            seg += 1;
+        }
+        let (a, b) = (line[seg], line[(seg + 1).min(line.len() - 1)]);
+        let t = if b.x > a.x { ((c - a.x) / (b.x - a.x)).clamp(0.0, 1.0) } else { 0.0 };
+        let y = a.y + (b.y - a.y) * t;
+        if y < floor {
+            painter.rect_filled(Rect::from_min_max(pos2(x, y), pos2(x1, floor)), 0.0, fill);
+        }
+        x = x1;
+    }
+}
+
 pub fn histogram(
     ui: &mut egui::Ui,
     bins: usize,
@@ -1609,20 +1717,10 @@ pub fn histogram(
 
     let draw = |b: &[u32], color: Color32, fill: bool| {
         let c = curve(b);
-        if fill {
-            // Per-bin bars: a histogram outline is concave, so convex_polygon would
-            // fill its hull and swallow the dips.
-            for (i, h) in c.iter().enumerate() {
-                let x0 = x_at(i);
-                let x1 = x_at(i + 1).min(rect.right());
-                painter.rect_filled(
-                    Rect::from_min_max(pos2(x0, y_at(*h)), pos2(x1, rect.bottom())),
-                    0.0,
-                    color.linear_multiply(0.28),
-                );
-            }
-        }
         let line: Vec<Pos2> = (0..bins).map(|i| pos2(x_at(i), y_at(c[i]))).collect();
+        if fill {
+            fill_under(&painter, &line, rect.bottom(), color.linear_multiply(0.28));
+        }
         painter.add(egui::Shape::line(line, Stroke::new(1.0, color)));
     };
 
@@ -1830,7 +1928,8 @@ pub fn placement_editor(
     // The tone ramp along the bottom edge, so the axis says what it is without a legend
     // — the same trick the zone ruler uses, and the reason neither needs labelling.
     let strip = 6.0;
-    {
+    // Print values, so exempt from the module re-grey.
+    crate::theme::true_colour(ui, || {
         let steps = 48;
         for i in 0..steps {
             let t = i as f32 / steps as f32;
@@ -1847,7 +1946,7 @@ pub fn placement_editor(
                 egui::Color32::from_gray(g),
             );
         }
-    }
+    });
 
     // **The print's own distribution, behind the curve**, which is where it belongs and
     // where it did not used to be: it was drawn over the toned ramp in the module above,
@@ -1870,24 +1969,20 @@ pub fn placement_editor(
         let floor = rect.bottom() - strip;
         let top = rect.top() + 1.0;
 
-        // **Bars, not a filled outline.** It was `Shape::convex_polygon`, and a
-        // distribution is the least convex shape there is — egui's tessellator fans it
-        // from a single vertex, so every trough sent a triangle back across the graph.
-        // That is the criss-crossing the maintainer reported, and it was the drawing, not the
-        // data.
-        //
-        // One rect per bin cannot self-intersect at all, which makes the whole class of
-        // failure unreachable rather than fixed.
-        let step = rect.width() / smooth.len() as f32;
-        for (i, &v) in smooth.iter().enumerate() {
-            let x = rect.left() + i as f32 * step;
-            let h = (v / peak) * (floor - top) * 0.9;
-            painter.rect_filled(
-                Rect::from_min_max(pos2(x, floor - h), pos2(x + step + 0.5, floor)),
-                0.0,
-                egui::Color32::from_white_alpha(20),
-            );
-        }
+        // **Filled per pixel column, not as a polygon.** It was `Shape::convex_polygon`,
+        // and a distribution is the least convex shape there is — egui's tessellator
+        // fans it from a single vertex, so every trough sent a triangle back across the
+        // graph. See [`fill_under`] for why columns rather than bars or a mesh.
+        let step = rect.width() / (smooth.len() - 1) as f32;
+        let line: Vec<Pos2> = smooth
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let h = (v / peak) * (floor - top) * 0.9;
+                pos2(rect.left() + i as f32 * step, floor - h)
+            })
+            .collect();
+        fill_under(&painter, &line, floor, egui::Color32::from_white_alpha(20));
     }
 
     // **The datum, drawn through the middle.** Flat is where the module opens, so the

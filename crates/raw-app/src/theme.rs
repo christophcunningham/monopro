@@ -349,6 +349,288 @@ pub fn background_of(display_encoded: f32) -> Color32 {
     let v = (display_encoded.clamp(0.0, 1.0) * 255.0).round() as u8;
     Color32::from_gray(v)
 }
+/// The module ground the user has chosen, as a grey level. [`CHROME`] until the
+/// settings are applied.
+///
+/// A static rather than a parameter because every module frame reads it and none of
+/// them is handed the settings; the floating panels are separate viewports of the same
+/// process and want the same value.
+static MODULE_GROUND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(38);
+
+pub fn set_module_ground(display_encoded: f32) {
+    MODULE_GROUND.store(
+        background_of(display_encoded).r(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn module_ground() -> u8 {
+    MODULE_GROUND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where a grey drawn for a [`CHROME`] module lands on a module of grey `ground`.
+///
+/// **Every grey keeps its distance from the ground; on a light ground, the sign flips.**
+/// The module's whole palette — label greys, wells, widget fills, strokes — was tuned as
+/// offsets from `CHROME`, so moving the ground and keeping the offsets keeps the
+/// hierarchy, and flipping them past mid-grey is what keeps the text readable when the
+/// ground is lighter than the text was. Bright hues (ruby, the labels, the dodge/burn
+/// pair) are inks and are left alone; dark tints are grounds and move — see below.
+#[cfg(test)]
+pub fn regrey(ground: u8, c: Color32) -> Color32 {
+    Ground::module(ground).apply(c)
+}
+
+/// A re-grey: colours designed against grey `design`, moved to grey `to`.
+///
+/// Develop's modules were designed on [`CHROME`]; Lightbox's panels on
+/// [`CHROME_DEEP`] and its grid on `CHROME`. The rule is the same for all of them —
+/// only the grey they were drawn against differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ground {
+    pub design: u8,
+    pub to: u8,
+}
+
+impl Ground {
+    pub fn module(to: u8) -> Self {
+        Self {
+            design: CHROME.r(),
+            to,
+        }
+    }
+
+    fn is_identity(self) -> bool {
+        self.design == self.to
+    }
+
+    pub fn apply(self, c: Color32) -> Color32 {
+        regrey_in(self, c)
+    }
+}
+
+fn regrey_in(ground: Ground, c: Color32) -> Color32 {
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    if a == 0 {
+        return c;
+    }
+    if is_grey(c) {
+        let v = move_value(ground, (r as i32 + g as i32 + b as i32) / 3);
+        return Color32::from_rgba_unmultiplied(v, v, v, a);
+    }
+    // **A dark tint is a ground, not an ink.** `RUBY_FILL` behind the export buttons,
+    // `RUBY_GROUND` behind a selected chip: each is the module grey with a little hue
+    // in it, and ruby text is written on top. Left dark on a light card, that is ruby
+    // on maroon inside white, which is unreadable. So its value moves the way a grey
+    // would and its hue — its offset from its own mean — rides along. Bright hues are
+    // inks and stay exactly as they are.
+    //
+    // **A pale hue on a light card is an ink that has lost its ground.** The dodge
+    // and burn inks were made light to read on near-black; on white they vanish. On
+    // a light ground they are mirrored the way a grey is, keeping their hue. Ruby is
+    // mid-value and reads on either, so it never reaches this branch.
+    let mean = (r as i32 + g as i32 + b as i32) / 3;
+    if r.max(g).max(b) < 128 || (ground.to > 127 && mean > 150) {
+        let to = move_value(ground, mean) as i32;
+        let ch = |k: u8| (to + k as i32 - mean).clamp(0, 255) as u8;
+        return Color32::from_rgba_unmultiplied(ch(r), ch(g), ch(b), a);
+    }
+    c
+}
+
+/// A grey level drawn against `ground.design`, moved to the same distance from
+/// `ground.to` — on the other side of it when the new ground is light.
+fn move_value(ground: Ground, v: i32) -> u8 {
+    let d = v - ground.design as i32;
+    let d = if ground.to > 127 { -d } else { d };
+    (ground.to as i32 + d).clamp(0, 255) as u8
+}
+
+/// Visible and without a hue — a colour [`regrey`] moves.
+fn is_grey(c: Color32) -> bool {
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    a > 0 && r.max(g).max(b) - r.min(g).min(b) <= 8
+}
+
+/// Run `add` and re-grey whatever it painted for the module ground. What a module
+/// card is drawn inside; anything else built on `CHROME` that should read as a
+/// module — the Dodge & Burn bench — uses it too.
+pub fn module_ground_ui<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    reground_ui(ui, Ground::module(module_ground()), add)
+}
+
+/// Run `add` and re-grey whatever it painted from `ground.design` to `ground.to`.
+/// Shapes painted inside [`true_colour`] are left as they are.
+pub fn reground_ui<R>(
+    ui: &mut egui::Ui,
+    ground: Ground,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let layer = ui.layer_id();
+    let next = |ui: &egui::Ui, or: egui::layers::ShapeIdx| {
+        ui.ctx().graphics(|g| g.get(layer).map_or(or, |l| l.next_idx()))
+    };
+    let start = next(ui, egui::layers::ShapeIdx(0));
+    let out = add(ui);
+    let end = next(ui, start);
+    regrey_shapes(ui.ctx(), layer, start, end, ground);
+    out
+}
+
+/// Paint whose colours are **the picture's, not the chrome's** — a tone ramp, a zone
+/// strip, a toned swatch, a mount colour — and must reach the screen as given.
+///
+/// [`module_ground_ui`] re-greys everything a module paints, which is right for text
+/// and widgets and wrong for these: a grey ramp that says "this is print value 0.8"
+/// would come out inverted on a light card, and a toning swatch would change colour.
+/// Shapes painted inside `paint` are recorded and skipped.
+pub fn true_colour<R>(ui: &egui::Ui, paint: impl FnOnce() -> R) -> R {
+    let layer = ui.layer_id();
+    let next = || {
+        ui.ctx()
+            .graphics(|g| g.get(layer).map_or(0, |l| l.next_idx().0))
+    };
+    let start = next();
+    let out = paint();
+    let end = next();
+    let pass = ui.ctx().cumulative_pass_nr();
+    ui.ctx().data_mut(|d| {
+        let list = d.get_temp_mut_or_default::<TrueColour>(egui::Id::new(TRUE_COLOUR));
+        if list.pass != pass {
+            *list = TrueColour { pass, ranges: Vec::new() };
+        }
+        list.ranges.push((layer, start, end));
+    });
+    out
+}
+
+const TRUE_COLOUR: &str = "theme-true-colour";
+
+/// This pass's [`true_colour`] ranges. Keyed by pass so a range from a frame that
+/// painted it outside any module cannot exempt a shape in a later frame.
+#[derive(Clone, Default)]
+struct TrueColour {
+    pass: u64,
+    ranges: Vec<(egui::LayerId, usize, usize)>,
+}
+
+/// Re-grey shapes `start..end` of `layer`. A no-op when the ground has not moved,
+/// which is the case the colours were written for.
+fn regrey_shapes(
+    ctx: &egui::Context,
+    layer: egui::LayerId,
+    start: egui::layers::ShapeIdx,
+    end: egui::layers::ShapeIdx,
+    ground: Ground,
+) {
+    if ground.is_identity() {
+        return;
+    }
+    let pass = ctx.cumulative_pass_nr();
+    let exempt: Vec<(usize, usize)> = ctx.data(|d| {
+        d.get_temp::<TrueColour>(egui::Id::new(TRUE_COLOUR))
+            .filter(|t| t.pass == pass)
+            .map(|t| {
+                t.ranges
+                    .iter()
+                    .filter(|(l, _, _)| *l == layer)
+                    .map(|(_, a, b)| (*a, *b))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    ctx.graphics_mut(|g| {
+        let list = g.entry(layer);
+        for i in start.0..end.0 {
+            if exempt.iter().any(|(a, b)| (*a..*b).contains(&i)) {
+                continue;
+            }
+            list.mutate_shape(egui::layers::ShapeIdx(i), |c| {
+                regrey_shape(ground, &mut c.shape)
+            });
+        }
+    });
+}
+
+fn regrey_shape(ground: Ground, shape: &mut egui::Shape) {
+    use egui::epaint::{ColorMode, Shape};
+    let path_stroke = |s: &mut egui::epaint::PathStroke| {
+        if let ColorMode::Solid(c) = &mut s.color {
+            *c = regrey_in(ground, *c);
+        }
+    };
+    match shape {
+        Shape::Noop | Shape::Callback(_) => {}
+        Shape::Vec(v) => v.iter_mut().for_each(|s| regrey_shape(ground, s)),
+        Shape::Circle(c) => {
+            c.fill = regrey_in(ground, c.fill);
+            c.stroke.color = regrey_in(ground, c.stroke.color);
+        }
+        Shape::Ellipse(e) => {
+            e.fill = regrey_in(ground, e.fill);
+            e.stroke.color = regrey_in(ground, e.stroke.color);
+        }
+        Shape::LineSegment { stroke, .. } => stroke.color = regrey_in(ground, stroke.color),
+        Shape::Path(p) => {
+            p.fill = regrey_in(ground, p.fill);
+            path_stroke(&mut p.stroke);
+        }
+        Shape::Rect(r) => {
+            // **egui paints an image as a rect with a texture brush**, its fill being
+            // the tint. Tinted pure white it is a picture — a thumbnail, the loupe —
+            // and its pixels are image data; re-greying the white tint is what turned
+            // every thumbnail black once the canvas passed mid-grey. A tinted icon
+            // still follows the ground.
+            let picture = r.brush.is_some() && r.fill == Color32::WHITE;
+            if !picture {
+                r.fill = regrey_in(ground, r.fill);
+            }
+            r.stroke.color = regrey_in(ground, r.stroke.color);
+        }
+        Shape::QuadraticBezier(b) => {
+            b.fill = regrey_in(ground, b.fill);
+            path_stroke(&mut b.stroke);
+        }
+        Shape::CubicBezier(b) => {
+            b.fill = regrey_in(ground, b.fill);
+            path_stroke(&mut b.stroke);
+        }
+        Shape::Text(t) => {
+            // A galley's colours are baked into its mesh, so the only lever is the
+            // override, which recolours every glyph. Taken only when every run is a
+            // grey (or the fallback): a line with a ruby word in it keeps its colours.
+            let fallback = t.fallback_color;
+            let mut runs = t.galley.job.sections.iter().map(|s| {
+                if s.format.color == Color32::PLACEHOLDER {
+                    fallback
+                } else {
+                    s.format.color
+                }
+            });
+            let ink = t.override_text_color.or_else(|| runs.next());
+            if let Some(ink) = ink
+                && is_grey(ink)
+                && (t.override_text_color.is_some() || runs.all(is_grey))
+            {
+                t.override_text_color = Some(regrey_in(ground, ink));
+            }
+            t.underline.color = regrey_in(ground, t.underline.color);
+        }
+        Shape::Mesh(m) => {
+            // A textured mesh tinted pure white is a picture — the print loupe — and
+            // its pixels are image data. Anything else textured is a tinted icon.
+            let picture = m.texture_id != egui::TextureId::default()
+                && m.vertices.iter().all(|v| v.color == Color32::WHITE);
+            if !picture {
+                let m = std::sync::Arc::make_mut(m);
+                for v in &mut m.vertices {
+                    v.color = regrey_in(ground, v.color);
+                }
+            }
+        }
+    }
+}
+
 /// Dim label grey for section headers.
 pub const DIM: Color32 = Color32::from_gray(122);
 
@@ -1047,6 +1329,59 @@ mod tests {
             let body = &style.text_styles[&egui::TextStyle::Body];
             assert_eq!(body.size, size::BODY, "{theme:?} kept egui's own body size");
         }
+    }
+
+    #[test]
+    fn a_module_regreys_to_its_ground_and_keeps_its_hues() {
+        // At the design ground nothing moves.
+        assert_eq!(regrey(CHROME.r(), DIM), DIM);
+        // On a light card, text that sat above the ground now sits below it by the
+        // same distance, and the card fill itself lands exactly on the ground.
+        assert_eq!(regrey(230, CHROME), Color32::from_gray(230));
+        let text = regrey(230, DIM);
+        assert!(
+            text.r() < 230 - 60,
+            "{text:?} is not dark enough to read on white"
+        );
+        assert!(
+            regrey(230, BRIGHT).r() < text.r(),
+            "the hierarchy must survive the flip"
+        );
+        // A darker card keeps the offsets without flipping.
+        assert_eq!(regrey(23, DIM).r(), DIM.r() - 15);
+        // Ruby is a mid-value ink and reads on either ground.
+        assert_eq!(regrey(230, RUBY), RUBY);
+        // …but a dark tint is a ground: on a light card it goes light and keeps its
+        // hue, so ruby text on it stays readable.
+        let fill = regrey(230, RUBY_FILL);
+        assert!(fill.r() > 200 && fill.r() > fill.g(), "{fill:?} should be a pale ruby");
+        assert!(regrey(230, RUBY_GROUND).g() > 180);
+        // A pale ink goes dark on a light card and keeps its hue; on a dark card it
+        // is left alone.
+        let dodge = regrey(230, DODGE);
+        assert!(dodge.b() < 160 && dodge.b() > dodge.r(), "{dodge:?}");
+        assert_eq!(regrey(23, DODGE), DODGE);
+    }
+
+    #[test]
+    fn a_picture_survives_a_light_ground() {
+        // egui paints an image as a white-tinted rect with a texture brush. Re-greying
+        // that tint turned every Lightbox thumbnail black past mid-grey.
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0));
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let tex = egui::TextureId::Managed(7);
+        let mut picture = egui::Shape::Rect(
+            egui::epaint::RectShape::filled(rect, 0.0, Color32::WHITE).with_texture(tex, uv),
+        );
+        regrey_shape(Ground::module(230), &mut picture);
+        let egui::Shape::Rect(r) = picture else { unreachable!() };
+        assert_eq!(r.fill, Color32::WHITE, "a picture's tint is not chrome");
+
+        // A plain white rect is chrome and does move.
+        let mut chrome = egui::Shape::Rect(egui::epaint::RectShape::filled(rect, 0.0, BRIGHT));
+        regrey_shape(Ground::module(230), &mut chrome);
+        let egui::Shape::Rect(r) = chrome else { unreachable!() };
+        assert_ne!(r.fill, BRIGHT);
     }
 
     #[test]

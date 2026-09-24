@@ -289,6 +289,13 @@ pub(crate) fn normalise_shares<T>(tree: &mut egui_tiles::Tree<T>) {
 /// squeezed to the stop is cramped rather than a sliver.
 pub(crate) const MIN_PANE: f32 = 180.0;
 
+/// How far past its stop a side column's seam has to be dragged before the column
+/// tucks away. Far enough that meeting the stop is not the same gesture as leaving.
+const TUCK_PAST: f32 = 60.0;
+
+/// The width of the strip a tucked column leaves at the window's edge.
+const TUCK_STRIP: f32 = 6.0;
+
 /// The seam between two tiles, in points. One constant rather than a literal in
 /// `Behavior::gap_width`, because `keep_panel_sizes` has to subtract exactly the space
 /// the layout will spend on seams or every panel drifts by a point per neighbour.
@@ -358,6 +365,15 @@ pub struct Layout {
     /// What each tile measured last frame. See [`Layout::keep_panel_sizes`].
     measured: std::collections::HashMap<TileId, egui::Vec2>,
     restore_pixels: bool,
+    /// Edge columns dragged off the side of the window, and the width each goes back
+    /// to. Hidden like a closed panel but reached by the strip left at the edge, not
+    /// by `tab`. Not persisted: a column that came back tucked after a restart would
+    /// look like a column that had gone missing.
+    tucked: Vec<(TileId, f32)>,
+    /// Where the edge seams were, and how wide their columns, when the pointer last
+    /// went down. A tuck only fires for a drag that *started* on that column's seam —
+    /// dragging the other seam across the window must not take this column with it.
+    press: [Option<(f32, f32)>; 2],
 }
 
 mod memory_keys {
@@ -376,6 +392,8 @@ impl Default for Layout {
             restructured: false,
             measured: Default::default(),
             restore_pixels: true,
+            tucked: Vec::new(),
+            press: [None; 2],
         }
     }
 }
@@ -444,6 +462,8 @@ impl Layout {
             restructured: false,
             measured: eframe::get_value(storage, memory_keys::PIXELS).unwrap_or_default(),
             restore_pixels: true,
+            tucked: Vec::new(),
+            press: [None; 2],
         };
         if !layout.heal() {
             return Self::default();
@@ -826,6 +846,10 @@ impl Layout {
         self.restructured = true;
         if self.shown.is_empty() {
             self.shown = Pane::PANELS.to_vec();
+            // "Every panel back" includes the ones tucked at the edge.
+            for (id, width) in std::mem::take(&mut self.tucked) {
+                self.remember_width(id, width);
+            }
         } else {
             self.shown.clear();
         }
@@ -900,6 +924,16 @@ impl Layout {
             self.restructured = true;
         }
         if let Some(tile) = self.tree.tiles.find_pane(&pane) {
+            // A mode opening onto a tucked column has to bring the column out, for
+            // the same reason it reopens a closed one.
+            let mut at = Some(tile);
+            while let Some(id) = at {
+                if self.tucked.iter().any(|(t, _)| *t == id) {
+                    self.untuck(id);
+                    break;
+                }
+                at = self.tree.tiles.parent_of(id);
+            }
             self.tree.make_active(|id, _| id == tile);
         }
     }
@@ -929,6 +963,169 @@ impl Layout {
         }
         if let Some(root) = self.tree.root {
             settle_container(&mut self.tree, root);
+        }
+        // A tuck belongs to a column on the window's edge. One that has since been
+        // dropped somewhere else, or whose tile is gone, is simply let go.
+        let edges = self.edge_columns();
+        self.tucked
+            .retain(|(id, _)| edges.iter().any(|e| e.map(|(t, _)| t) == Some(*id)));
+        for (id, _) in &self.tucked {
+            self.tree.set_visible(*id, false);
+        }
+    }
+
+    /// The root row's first and last children — `[left, right]` — when they are not
+    /// the column holding the image. Tucked ones included, so a tucked column is still
+    /// found to bring it back. Anything but a horizontal root has no side columns.
+    fn edge_columns(&self) -> [Option<(TileId, egui::Rect)>; 2] {
+        let none = [None, None];
+        let Some(root) = self.tree.root else {
+            return none;
+        };
+        let Some(Tile::Container(Container::Linear(row))) = self.tree.tiles.get(root) else {
+            return none;
+        };
+        if row.dir != LinearDir::Horizontal || row.children.len() < 2 {
+            return none;
+        }
+        let Some(image) = self.tree.tiles.find_pane(&Pane::Image) else {
+            return none;
+        };
+        let holds_image = |mut id: TileId| loop {
+            if id == image {
+                return true;
+            }
+            match self.tree.tiles.parent_of(id) {
+                Some(p) if p != root => id = p,
+                _ => return false,
+            }
+        };
+        // Only children that are showing or tucked count as the edge: a closed column
+        // at the end of the row is not what is at the window's edge.
+        let tucked = |id: TileId| self.tucked.iter().any(|(t, _)| *t == id);
+        let on_edge: Vec<TileId> = row
+            .children
+            .iter()
+            .copied()
+            .filter(|c| tucked(*c) || self.tree.is_visible(*c))
+            .collect();
+        let pick = |id: Option<&TileId>| {
+            let id = *id?;
+            if holds_image(id) {
+                return None;
+            }
+            Some((id, self.tree.tiles.rect(id).unwrap_or(egui::Rect::NOTHING)))
+        };
+        [pick(on_edge.first()), pick(on_edge.last())]
+    }
+
+    /// The width a hidden tile should come back at, for `keep_panel_sizes`.
+    fn remember_width(&mut self, id: TileId, width: f32) {
+        let h = self.measured.get(&id).map_or(0.0, |s| s.y);
+        self.measured.insert(id, egui::vec2(width, h));
+        self.restructured = true;
+        self.dirty = true;
+    }
+
+    fn tuck(&mut self, id: TileId, width: f32) {
+        if !self.tucked.iter().any(|(t, _)| *t == id) {
+            self.tucked.push((id, width));
+            self.restructured = true;
+            self.dirty = true;
+        }
+    }
+
+    fn untuck(&mut self, id: TileId) {
+        if let Some(i) = self.tucked.iter().position(|(t, _)| *t == id) {
+            let (_, width) = self.tucked.remove(i);
+            self.remember_width(id, width);
+        }
+    }
+
+    /// **Drag a side column past its stop and it tucks away.** `min_size` holds the
+    /// seam at [`MIN_PANE`]; carry on dragging toward the window's edge by
+    /// [`TUCK_PAST`] and the column goes, leaving the strip [`Layout::tuck_strips`]
+    /// draws. It comes back at the width it had before the drag.
+    fn tuck_from_drag(&mut self, input: &egui::InputState, resizing: bool) {
+        let edges = self.edge_columns();
+        if input.pointer.primary_pressed() {
+            // Seam and width as they were at the press, before the drag moved them.
+            self.press = [0, 1].map(|side| {
+                edges[side].filter(|(_, r)| r.is_positive()).map(|(_, r)| {
+                    (if side == 0 { r.right() } else { r.left() }, r.width())
+                })
+            });
+        }
+        if !resizing || !input.pointer.primary_down() {
+            return;
+        }
+        let (Some(origin), Some(at)) = (input.pointer.press_origin(), input.pointer.interact_pos())
+        else {
+            return;
+        };
+        for (side, (edge, press)) in edges.into_iter().zip(self.press).enumerate() {
+            let (Some((id, rect)), Some((seam, width))) = (edge, press) else {
+                continue;
+            };
+            if (origin.x - seam).abs() > 6.0 || rect.width() > MIN_PANE + 1.0 {
+                continue;
+            }
+            let past = if side == 0 {
+                rect.right() - at.x
+            } else {
+                at.x - rect.left()
+            };
+            if past > TUCK_PAST {
+                self.tuck(id, width.max(MIN_PANE));
+            }
+        }
+    }
+
+    /// The strip a tucked column leaves at the window's edge. A click or a drag on it
+    /// brings the column back.
+    fn tuck_strips(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        let edges = self.edge_columns();
+        for (side, edge) in edges.into_iter().enumerate() {
+            let Some((id, _)) = edge else {
+                continue;
+            };
+            if !self.tucked.iter().any(|(t, _)| *t == id) {
+                continue;
+            }
+            let rect = if side == 0 {
+                egui::Rect::from_min_size(area.left_top(), egui::vec2(TUCK_STRIP, area.height()))
+            } else {
+                egui::Rect::from_min_size(
+                    egui::pos2(area.right() - TUCK_STRIP, area.top()),
+                    egui::vec2(TUCK_STRIP, area.height()),
+                )
+            };
+            let resp = ui
+                .interact(rect, ui.id().with(("tuck", side)), egui::Sense::click_and_drag())
+                .on_hover_cursor(if side == 0 {
+                    egui::CursorIcon::ResizeEast
+                } else {
+                    egui::CursorIcon::ResizeWest
+                })
+                .on_hover_text(theme::tip("Click or drag to bring the panel back"));
+            let ink = if resp.hovered() || resp.dragged() {
+                theme::DIM
+            } else {
+                egui::Color32::from_gray(72)
+            };
+            ui.painter().rect_filled(rect, 0.0, theme::CHROME_DEEP);
+            let line = if side == 0 {
+                rect.right() - 1.5
+            } else {
+                rect.left() + 1.5
+            };
+            ui.painter().line_segment(
+                [egui::pos2(line, rect.top()), egui::pos2(line, rect.bottom())],
+                egui::Stroke::new(3.0, ink),
+            );
+            if resp.clicked() || resp.drag_started() {
+                self.untuck(id);
+            }
         }
     }
 
@@ -1131,6 +1328,8 @@ struct Panes<'a> {
     close: Option<Pane>,
     edited: bool,
     dropped: bool,
+    /// A seam was dragged this frame. See [`Layout::tuck_from_drag`].
+    resizing: bool,
     /// Which of the two tone/brush panes the tree actually drew this frame. Read by
     /// [`App::tile_tree`], which drops paint mode when the Dodge/Burn pane is neither
     /// drawn nor floating — the branch on `brush_gone`. **Untested**: the rule lives
@@ -1155,6 +1354,7 @@ fn head_for(tree_id: egui::Id, tabbed: &[TileId], tile_id: TileId) -> Head {
 impl egui_tiles::Behavior<Pane> for Panes<'_> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, tile_id: TileId, pane: &mut Pane) -> UiResponse {
         let head = head_for(self.tree_id, &self.tabbed, tile_id);
+        let panel = theme::background_of(self.app.settings.panel_background());
         match *pane {
             Pane::Image => {
                 // The letterbox and the shader's fill are one colour with a seam
@@ -1167,39 +1367,39 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                 UiResponse::None
             }
             Pane::Develop => {
-                ui.painter().rect_filled(ui.max_rect(), 0.0, theme::CHROME);
+                ui.painter().rect_filled(ui.max_rect(), 0.0, panel);
                 self.drew_develop = true;
                 let clicks = self.app.develop_column(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::Develop));
                 drag(clicks.dragged)
             }
             Pane::DodgeBurn => {
-                ui.painter().rect_filled(ui.max_rect(), 0.0, theme::CHROME);
+                ui.painter().rect_filled(ui.max_rect(), 0.0, panel);
                 self.drew_dodgeburn = true;
                 let clicks = self.app.dodgeburn_panel(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::DodgeBurn));
                 drag(clicks.dragged)
             }
             Pane::Toning => {
-                ui.painter().rect_filled(ui.max_rect(), 0.0, theme::CHROME);
+                ui.painter().rect_filled(ui.max_rect(), 0.0, panel);
                 let clicks = self.app.toning_panel(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::Toning));
                 drag(clicks.dragged)
             }
             Pane::Info => {
-                ui.painter().rect_filled(ui.max_rect(), 0.0, theme::CHROME);
+                ui.painter().rect_filled(ui.max_rect(), 0.0, panel);
                 let clicks = self.app.info_panel(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::Info));
                 drag(clicks.dragged)
             }
             Pane::Snapshots => {
-                ui.painter().rect_filled(ui.max_rect(), 0.0, theme::CHROME);
+                ui.painter().rect_filled(ui.max_rect(), 0.0, panel);
                 let clicks = self.app.snapshot_panel(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::Snapshots));
                 drag(clicks.dragged)
             }
             Pane::History => {
-                ui.painter().rect_filled(ui.max_rect(), 0.0, theme::CHROME);
+                ui.painter().rect_filled(ui.max_rect(), 0.0, panel);
                 let clicks = self.app.history_panel(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::History));
                 drag(clicks.dragged)
@@ -1436,6 +1636,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         // A resize writes shares from measured widths and is the user setting a width
         // directly; only a drop changes which children a container has.
         self.dropped |= action == egui_tiles::EditAction::TileDropped;
+        self.resizing |= action == egui_tiles::EditAction::TileResized;
     }
 }
 
@@ -1555,9 +1756,11 @@ impl App {
             close: None,
             edited: false,
             dropped: false,
+            resizing: false,
             drew_develop: false,
             drew_dodgeburn: false,
         };
+        let area = ui.available_rect_before_wrap();
         tree.ui(&mut panes, ui);
         if let Some(at) = ui.input(|input| {
             input
@@ -1572,7 +1775,10 @@ impl App {
         let (float, close, edited, dropped) =
             (panes.float, panes.close, panes.edited, panes.dropped);
         let (drew_develop, drew_dodgeburn) = (panes.drew_develop, panes.drew_dodgeburn);
+        let resizing = panes.resizing;
         self.layout.tree = tree;
+        ui.input(|i| self.layout.tuck_from_drag(i, resizing));
+        self.layout.tuck_strips(ui, area);
 
         // **Leaving the brush behind leaves paint mode.** the maintainer's ask, and the default
         // layout is why it is needed: Develop and Dodge & Burn are two tabs of one
@@ -1722,6 +1928,8 @@ mod tests {
             restructured: false,
             measured: Default::default(),
             restore_pixels: true,
+            tucked: Vec::new(),
+            press: [None; 2],
         }
     }
 
@@ -1907,6 +2115,51 @@ mod tests {
         assert!(
             layout.is_out(Pane::Develop),
             "and brings the floating one back floating"
+        );
+    }
+
+    #[test]
+    fn a_tucked_column_hides_and_comes_back_at_its_width() {
+        let mut layout = Layout::default();
+        layout.before_ui();
+        let [Some((left, _)), Some((right, _))] = layout.edge_columns() else {
+            panic!("the default layout has a column on each side");
+        };
+        layout.tuck(left, 312.0);
+        layout.before_ui();
+        assert!(!layout.tree.is_visible(left), "tucked means off screen");
+        assert!(layout.tree.is_visible(right), "and only that side");
+        assert_eq!(
+            layout.edge_columns()[0].map(|(id, _)| id),
+            Some(left),
+            "a tucked column is still found, or its strip could not bring it back"
+        );
+        layout.untuck(left);
+        layout.before_ui();
+        assert!(layout.tree.is_visible(left));
+        assert_eq!(layout.measured[&left].x, 312.0, "back at the width it left at");
+    }
+
+    #[test]
+    fn tab_and_a_mode_both_bring_a_tucked_column_back() {
+        let mut layout = Layout::default();
+        layout.before_ui();
+        let [Some((left, _)), _] = layout.edge_columns() else {
+            panic!("the default layout has a left column");
+        };
+        layout.tuck(left, 300.0);
+        layout.toggle_panels();
+        layout.toggle_panels();
+        layout.before_ui();
+        assert!(layout.tree.is_visible(left), "`tab` restores every panel");
+
+        layout.tuck(left, 300.0);
+        layout.before_ui();
+        layout.bring_forward(Pane::DodgeBurn);
+        layout.before_ui();
+        assert!(
+            layout.tree.is_visible(left),
+            "a mode opening onto a tucked panel brings it out"
         );
     }
 
