@@ -553,7 +553,10 @@ pub fn sized(
 /// glyph, and outline it in ruby if it is a toggle that is on.
 ///
 /// `pad_x` is extra width, split evenly either side of the content — see [`WIDE`].
-#[expect(clippy::too_many_arguments, reason = "the one drawing routine behind every icon button; each argument is a variation some caller uses")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the one drawing routine behind every icon button; each argument is a variation some caller uses"
+)]
 fn button_in(
     ui: &mut egui::Ui,
     icons: &Icons,

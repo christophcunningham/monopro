@@ -943,8 +943,12 @@ impl Settings {
                 self.module_background(),
             ]
         } else {
-            [self.lightbox_canvas, self.lightbox_panel, self.lightbox_module]
-                .map(|v| (v / 100.0).clamp(0.0, 1.0))
+            [
+                self.lightbox_canvas,
+                self.lightbox_panel,
+                self.lightbox_module,
+            ]
+            .map(|v| (v / 100.0).clamp(0.0, 1.0))
         }
     }
 

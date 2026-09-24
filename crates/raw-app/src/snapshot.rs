@@ -279,7 +279,10 @@ mod tests {
             "a bypassed exposure was drawn in the compare grid"
         );
         assert!(
-            snapshots.pinned().iter().any(|s| s.params.exposure.ev == 1.5),
+            snapshots
+                .pinned()
+                .iter()
+                .any(|s| s.params.exposure.ev == 1.5),
             "resolving the bypass lost the stored edit"
         );
     }

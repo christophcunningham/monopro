@@ -185,9 +185,10 @@ fn parse_render(rest: &[String]) -> Result<Render, String> {
             "--proof" => r.proof = true,
             "--format" => {
                 let v = value(&mut it, arg)?;
-                r.format = Some(container_named(v).ok_or_else(|| {
-                    format!("unknown format {v:?}; have tiff, png, jpeg")
-                })?);
+                r.format = Some(
+                    container_named(v)
+                        .ok_or_else(|| format!("unknown format {v:?}; have tiff, png, jpeg"))?,
+                );
             }
             "--bits" => {
                 r.bits = Some(match value(&mut it, arg)? {
@@ -418,7 +419,9 @@ fn render_one(
         sidecar::Loaded::Ok(s) => s.params,
         sidecar::Loaded::Absent => Params::default(),
         sidecar::Loaded::Corrupt(e) => {
-            return Err(format!("sidecar unreadable, not rendering at defaults: {e}"));
+            return Err(format!(
+                "sidecar unreadable, not rendering at defaults: {e}"
+            ));
         }
     };
     r.overrides.apply(&mut params);
@@ -595,7 +598,11 @@ mod tests {
     fn paths_and_no_arguments_open_the_window() {
         assert_eq!(run(&[]), None, "no arguments is the window");
         assert_eq!(run(&args("/photos/a.RAF")), None, "a path is the window");
-        assert_eq!(run(&args("./render")), None, "a file named render is reachable");
+        assert_eq!(
+            run(&args("./render")),
+            None,
+            "a file named render is reachable"
+        );
     }
 
     #[test]
@@ -617,7 +624,11 @@ mod tests {
             "info",
             "info --json a.RAF",
         ] {
-            assert_eq!(run(&args(bad)), Some(USAGE), "{bad:?} should be a usage error");
+            assert_eq!(
+                run(&args(bad)),
+                Some(USAGE),
+                "{bad:?} should be a usage error"
+            );
         }
     }
 

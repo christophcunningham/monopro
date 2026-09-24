@@ -106,7 +106,10 @@ impl Primaries {
 /// OKLab → XYZ, D65. Ottosson's inverse matrices, transcribed rather than recalled.
 pub fn oklab_to_xyz_d65(l: f32, a: f32, b: f32) -> [f32; 3] {
     // M2^-1: Lab -> nonlinear LMS.
-    #[expect(clippy::excessive_precision, reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source")]
+    #[expect(
+        clippy::excessive_precision,
+        reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source"
+    )]
     let lms_ = [
         l + 0.3963377774 * a + 0.2158037573 * b,
         l - 0.1055613458 * a - 0.0638541728 * b,
@@ -117,7 +120,10 @@ pub fn oklab_to_xyz_d65(l: f32, a: f32, b: f32) -> [f32; 3] {
     // Exempted rather than trimmed: these are Ottosson's published constants,
     // transcribed so they can be diffed against the reference. Rounding them to f32's
     // shortest distinct form would make that diff fail for a reader holding the paper.
-    #[expect(clippy::excessive_precision, reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source")]
+    #[expect(
+        clippy::excessive_precision,
+        reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source"
+    )]
     const M1_INV: [[f32; 3]; 3] = [
         [1.2270138511, -0.5577999807, 0.2812561490],
         [-0.0405801784, 1.1122568696, -0.0716766787],
@@ -295,7 +301,10 @@ pub fn srgb_of_lab([l, a, b]: [f32; 3]) -> [u8; 3] {
 /// XYZ (D65) → OKLab. The forward matrix sits beside its inverse so Lab input and
 /// display output cannot acquire a second, subtly different colour transform.
 fn xyz_d65_to_oklab(xyz: [f32; 3]) -> (f32, f32, f32) {
-    #[expect(clippy::excessive_precision, reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source")]
+    #[expect(
+        clippy::excessive_precision,
+        reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source"
+    )]
     const M1: [[f32; 3]; 3] = [
         [0.8189330101, 0.3618667424, -0.1288597137],
         [0.0329845436, 0.9293118715, 0.0361456387],
@@ -303,7 +312,10 @@ fn xyz_d65_to_oklab(xyz: [f32; 3]) -> (f32, f32, f32) {
     ];
     let lms = apply(M1, xyz);
     let c = [lms[0].cbrt(), lms[1].cbrt(), lms[2].cbrt()];
-    #[expect(clippy::excessive_precision, reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source")]
+    #[expect(
+        clippy::excessive_precision,
+        reason = "Ottosson's published OKLab constants, kept digit for digit so they can be checked against the source"
+    )]
     (
         0.2104542553 * c[0] + 0.7936177850 * c[1] - 0.0040720468 * c[2],
         1.9779984951 * c[0] - 2.4285922050 * c[1] + 0.4505937099 * c[2],

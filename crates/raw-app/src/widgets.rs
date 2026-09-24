@@ -293,7 +293,10 @@ const STROKE: f32 = 1.0;
 
 /// All three `show`s. `modified` is `None` for a plain section — no dot and no
 /// reset — and `enabled` is `None` for a module without a switch.
-#[expect(clippy::too_many_arguments, reason = "the one drawing routine behind all three module `show`s; each flag is one of their differences")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the one drawing routine behind all three module `show`s; each flag is one of their differences"
+)]
 fn draw(
     name: &str,
     modified: Option<bool>,
@@ -334,61 +337,62 @@ fn draw(
     // at `CHROME` and then re-greyed to the chosen module ground — see
     // `theme::regrey` — so every colour inside is written once, for one ground.
     crate::theme::module_ground_ui(ui, |ui| {
-    egui::Frame::new()
-        .fill(crate::theme::CHROME)
-        .stroke(Stroke::new(STROKE, Color32::from_gray(52)))
-        .corner_radius(2.0)
-        .inner_margin(egui::Margin::symmetric(PAD_X, 7))
-        .show(ui, |ui| {
-            // A touch more air between control rows. Kept local to Develop module
-            // frames so Lightbox grids, Settings rows and footer chrome do not grow
-            // with it.
-            ui.spacing_mut().item_spacing.y += 1.0;
-            ui.set_width(content_w);
-            ui.horizontal(|ui| {
-                match enabled {
-                    // Indented by exactly the dot's own box, so the names line up
-                    // down the panel whether or not a section has one.
-                    _ if !has_dot => ui.add_space(13.0),
-                    Some(on) => {
-                        out.bypass = dot(ui, modified, on, true)
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(theme::tip(if on {
-                                "click to bypass"
-                            } else {
-                                "bypassed — click to switch back on"
-                            }))
-                            .clicked();
+        egui::Frame::new()
+            .fill(crate::theme::CHROME)
+            .stroke(Stroke::new(STROKE, Color32::from_gray(52)))
+            .corner_radius(2.0)
+            .inner_margin(egui::Margin::symmetric(PAD_X, 7))
+            .show(ui, |ui| {
+                // A touch more air between control rows. Kept local to Develop module
+                // frames so Lightbox grids, Settings rows and footer chrome do not grow
+                // with it.
+                ui.spacing_mut().item_spacing.y += 1.0;
+                ui.set_width(content_w);
+                ui.horizontal(|ui| {
+                    match enabled {
+                        // Indented by exactly the dot's own box, so the names line up
+                        // down the panel whether or not a section has one.
+                        _ if !has_dot => ui.add_space(13.0),
+                        Some(on) => {
+                            out.bypass = dot(ui, modified, on, true)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(theme::tip(if on {
+                                    "click to bypass"
+                                } else {
+                                    "bypassed — click to switch back on"
+                                }))
+                                .clicked();
+                        }
+                        // Not switchable, so it does not offer to be clicked and does
+                        // not light up under the pointer. A control that looks live and
+                        // does nothing is worse than no control.
+                        None => {
+                            dot(ui, modified, true, false);
+                        }
                     }
-                    // Not switchable, so it does not offer to be clicked and does
-                    // not light up under the pointer. A control that looks live and
-                    // does nothing is worse than no control.
-                    None => {
-                        dot(ui, modified, true, false);
+                    ui.add_space(2.0);
+                    let title = theme::module_header_label(ui, name)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(theme::tip(if open {
+                            "click to collapse"
+                        } else {
+                            "click to expand"
+                        }));
+                    if title.clicked() {
+                        open = !open;
                     }
-                }
-                ui.add_space(2.0);
-                let title = theme::module_header_label(ui, name)
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text(theme::tip(if open {
-                        "click to collapse"
-                    } else {
-                        "click to expand"
-                    }));
-                if title.clicked() {
-                    open = !open;
-                }
-                if resettable {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        out.reset = theme::reset_button(ui, "reset", "back to default").clicked();
-                    });
+                    if resettable {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            out.reset =
+                                theme::reset_button(ui, "reset", "back to default").clicked();
+                        });
+                    }
+                });
+                if open {
+                    ui.add_space(5.0);
+                    body(ui);
                 }
             });
-            if open {
-                ui.add_space(5.0);
-                body(ui);
-            }
-        });
     });
 
     ui.data_mut(|d| d.insert_temp(id, open));
@@ -1339,18 +1343,20 @@ pub fn zone_ruler(
     let step = 2.0f32.max(1.0);
     let mut x = ramp.left();
     // Print values, so exempt from the module re-grey.
-    crate::theme::true_colour(ui, || while x < ramp.right() {
-        let lin = (0.18 * (to_ev(x + step * 0.5)).exp2()).min(1.0);
-        let g = (lin.powf(1.0 / 2.2) * 255.0).round() as u8;
-        painter.rect_filled(
-            Rect::from_min_max(
-                pos2(x, ramp.top()),
-                pos2((x + step).min(ramp.right()), ramp.bottom()),
-            ),
-            0.0,
-            Color32::from_gray(g),
-        );
-        x += step;
+    crate::theme::true_colour(ui, || {
+        while x < ramp.right() {
+            let lin = (0.18 * (to_ev(x + step * 0.5)).exp2()).min(1.0);
+            let g = (lin.powf(1.0 / 2.2) * 255.0).round() as u8;
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(x, ramp.top()),
+                    pos2((x + step).min(ramp.right()), ramp.bottom()),
+                ),
+                0.0,
+                Color32::from_gray(g),
+            );
+            x += step;
+        }
     });
 
     // The distribution, drawn INSIDE the ramp from its baseline rather than in a
@@ -1688,7 +1694,11 @@ fn fill_under(painter: &egui::Painter, line: &[Pos2], floor: f32, fill: Color32)
             seg += 1;
         }
         let (a, b) = (line[seg], line[(seg + 1).min(line.len() - 1)]);
-        let t = if b.x > a.x { ((c - a.x) / (b.x - a.x)).clamp(0.0, 1.0) } else { 0.0 };
+        let t = if b.x > a.x {
+            ((c - a.x) / (b.x - a.x)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let y = a.y + (b.y - a.y) * t;
         if y < floor {
             painter.rect_filled(Rect::from_min_max(pos2(x, y), pos2(x1, floor)), 0.0, fill);
@@ -1853,7 +1863,10 @@ pub fn title_strip(
     let (ground, ink) = if badge.failed {
         (crate::theme::RUBY_FILL_DIM, RUBY)
     } else {
-        (crate::theme::AMBER.linear_multiply(0.22), crate::theme::AMBER)
+        (
+            crate::theme::AMBER.linear_multiply(0.22),
+            crate::theme::AMBER,
+        )
     };
     let whole = body.union(close);
     painter.rect_filled(whole, 0.0, ground);
@@ -1868,7 +1881,13 @@ pub fn title_strip(
         close.y_range().shrink(3.0),
         egui::Stroke::new(1.0, ink.linear_multiply(0.35)),
     );
-    painter.text(body.center(), egui::Align2::CENTER_CENTER, &badge.text, font.clone(), ink);
+    painter.text(
+        body.center(),
+        egui::Align2::CENTER_CENTER,
+        &badge.text,
+        font.clone(),
+        ink,
+    );
     painter.text(close.center(), egui::Align2::CENTER_CENTER, "×", font, ink);
     if close_response.clicked() {
         BadgeClick::Dismiss

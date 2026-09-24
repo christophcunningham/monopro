@@ -3404,8 +3404,7 @@ impl eframe::App for App {
                     .as_ref()
                     .and_then(|updates| updates.badge())
                     .filter(|b| {
-                        self.update_badge_dismissed.as_ref()
-                            != Some(&(b.text.clone(), b.failed))
+                        self.update_badge_dismissed.as_ref() != Some(&(b.text.clone(), b.failed))
                     })
                     .map(|b| widgets::UpdateBadge {
                         text: b.text,
@@ -3421,8 +3420,7 @@ impl eframe::App for App {
                     widgets::BadgeClick::None => {}
                     widgets::BadgeClick::Open => self.update_sheet_open = true,
                     widgets::BadgeClick::Dismiss => {
-                        self.update_badge_dismissed =
-                            badge.map(|b| (b.text, b.failed));
+                        self.update_badge_dismissed = badge.map(|b| (b.text, b.failed));
                     }
                 }
             });
@@ -4537,86 +4535,86 @@ impl App {
         // Built on `CHROME` like a module and re-greyed like one, so it follows the
         // module value rather than staying dark under a light stack.
         theme::module_ground_ui(ui, |ui| {
-        egui::containers::panel::Panel::bottom("db-add")
-            .frame(
-                egui::Frame::NONE
-                    .fill(theme::CHROME)
-                    .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 10,
-                        top: 8,
-                        bottom: 10,
-                    }),
-            )
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                theme::rule(ui, theme::DIM.gamma_multiply(0.5));
-                ui.add_space(8.0);
+            egui::containers::panel::Panel::bottom("db-add")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::CHROME)
+                        .inner_margin(egui::Margin {
+                            left: 10,
+                            right: 10,
+                            top: 8,
+                            bottom: 10,
+                        }),
+                )
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    theme::rule(ui, theme::DIM.gamma_multiply(0.5));
+                    ui.add_space(8.0);
 
-                // **The two verbs first, as one wide filled pair.** the maintainer's mockup,
-                // and the change from the previous arrangement is that they are now
-                // unmistakably the *action* — everything below them describes what
-                // the action will make. Before, the verbs sat inline with the shape
-                // brackets and read as four peers of which two happened to commit.
-                //
-                // Equal widths, computed rather than measured: see `theme::wide_button`.
-                let gap = 8.0;
-                let w = ((ui.available_width() - gap) * 0.5).max(40.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    for (sign, label) in [
-                        (raw_core::Sign::Dodge, "+ DODGE"),
-                        (raw_core::Sign::Burn, "+ BURN"),
-                    ] {
-                        let dodge = sign == raw_core::Sign::Dodge;
-                        // **The text is the layer hue itself**, not a second saturated
-                        // pair. the maintainer's grounds are darker than his inks, so the button
-                        // can be set in the same `DODGE`/`BURN` a layer's kind is
-                        // written in — the button and the rows it makes now agree.
-                        let fill = if dodge {
-                            theme::DODGE_FILL
-                        } else {
-                            theme::BURN_FILL
-                        };
-                        let text = if dodge { theme::DODGE } else { theme::BURN };
-                        if theme::wide_button(ui, label, fill, text, w, !full)
-                            .on_hover_text(theme::tip(if full {
-                                "eight layers is the limit"
+                    // **The two verbs first, as one wide filled pair.** the maintainer's mockup,
+                    // and the change from the previous arrangement is that they are now
+                    // unmistakably the *action* — everything below them describes what
+                    // the action will make. Before, the verbs sat inline with the shape
+                    // brackets and read as four peers of which two happened to commit.
+                    //
+                    // Equal widths, computed rather than measured: see `theme::wide_button`.
+                    let gap = 8.0;
+                    let w = ((ui.available_width() - gap) * 0.5).max(40.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for (sign, label) in [
+                            (raw_core::Sign::Dodge, "+ DODGE"),
+                            (raw_core::Sign::Burn, "+ BURN"),
+                        ] {
+                            let dodge = sign == raw_core::Sign::Dodge;
+                            // **The text is the layer hue itself**, not a second saturated
+                            // pair. the maintainer's grounds are darker than his inks, so the button
+                            // can be set in the same `DODGE`/`BURN` a layer's kind is
+                            // written in — the button and the rows it makes now agree.
+                            let fill = if dodge {
+                                theme::DODGE_FILL
                             } else {
-                                "make a layer of the shape selected below"
-                            }))
-                            .clicked()
-                        {
-                            create = Some(sign);
+                                theme::BURN_FILL
+                            };
+                            let text = if dodge { theme::DODGE } else { theme::BURN };
+                            if theme::wide_button(ui, label, fill, text, w, !full)
+                                .on_hover_text(theme::tip(if full {
+                                    "eight layers is the limit"
+                                } else {
+                                    "make a layer of the shape selected below"
+                                }))
+                                .clicked()
+                            {
+                                create = Some(sign);
+                            }
                         }
-                    }
-                });
+                    });
 
-                ui.add_space(10.0);
-                // **One row of four shapes**, not a tool row with a nib row under it.
-                // See `paint::Pick` for why the two collapsed into one.
-                ui.horizontal(|ui| {
-                    theme::tracked(ui, "SHAPE", theme::DIM);
-                    ui.label(theme::caption(">"));
-                    ui.add_space(4.0);
-                    let current = paint::Pick::of(tool, brush.nib);
-                    for p in paint::Pick::ALL {
-                        if theme::bracket(ui, p.label(), current == p, theme::size::CAPTION)
-                            .on_hover_text(theme::tip(p.tooltip()))
-                            .clicked()
-                        {
-                            pick_shape = Some(p);
+                    ui.add_space(10.0);
+                    // **One row of four shapes**, not a tool row with a nib row under it.
+                    // See `paint::Pick` for why the two collapsed into one.
+                    ui.horizontal(|ui| {
+                        theme::tracked(ui, "SHAPE", theme::DIM);
+                        ui.label(theme::caption(">"));
+                        ui.add_space(4.0);
+                        let current = paint::Pick::of(tool, brush.nib);
+                        for p in paint::Pick::ALL {
+                            if theme::bracket(ui, p.label(), current == p, theme::size::CAPTION)
+                                .on_hover_text(theme::tip(p.tooltip()))
+                                .clicked()
+                            {
+                                pick_shape = Some(p);
+                            }
                         }
-                    }
+                    });
+                    ui.add_space(2.0);
+                    // **Nothing else lives here.** the maintainer's rule: the bench makes a layer
+                    // and the layer holds its own options, which is how Radial already
+                    // worked and is now how all four do. A shape's settings sitting under
+                    // the button that creates it meant the controls for the thing you were
+                    // editing were nowhere near it — the same complaint that moved the
+                    // tonal range inside the layer rows in the first place.
                 });
-                ui.add_space(2.0);
-                // **Nothing else lives here.** the maintainer's rule: the bench makes a layer
-                // and the layer holds its own options, which is how Radial already
-                // worked and is now how all four do. A shape's settings sitting under
-                // the button that creates it meant the controls for the thing you were
-                // editing were nowhere near it — the same complaint that moved the
-                // tonal range inside the layer rows in the first place.
-            });
         });
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -4789,7 +4787,10 @@ impl App {
     /// It does not need to know whether it is the selected one — the red rules and
     /// the expansion are drawn by the caller, which is what keeps them wrapped
     /// around the whole block rather than around the row.
-    #[expect(clippy::too_many_arguments, reason = "a layer row reads the tab and reports three separate outcomes to its caller")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a layer row reads the tab and reports three separate outcomes to its caller"
+    )]
     fn layer_row(
         ui: &mut egui::Ui,
         tab: &mut tabs::Tab,
@@ -9408,7 +9409,10 @@ impl App {
 
     /// One-shot Curve point sampler. Its cursor is Triopro's white-point cursor:
     /// crosshair for the exact sampled pixel, eyedropper for the operation.
-    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn curve_point_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -9503,7 +9507,10 @@ impl App {
     /// Screen → frame → source going in, source → frame → screen coming out. Pins are
     /// stored against the **negative** — see [`tabs::Pin`] — so every read and write
     /// crosses `Frame`, and a pin stays on its subject through a rotation or a crop.
-    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn pin_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -9802,7 +9809,10 @@ impl App {
     /// in and the space `Viewport::patch` takes. Screen → frame is one line and its
     /// inverse is one line; there is no source-space step here, unlike the brush,
     /// because the loupe samples the *composed* picture rather than the negative.
-    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn print_loupe(
         &mut self,
         ui: &mut egui::Ui,
@@ -9973,7 +9983,10 @@ impl App {
     /// own density like the crop handles — chrome, not pixels. It is the only thing
     /// that says what radius the brush currently is, and it is why `[` and `]` need
     /// no readout to be usable.
-    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn paint_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -10288,7 +10301,10 @@ impl App {
     /// chrome, not pixels, the same way the curve editor's control points are. That
     /// is also what keeps them crisp: they are painted in points at the window's own
     /// density rather than resampled with the picture.
-    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn crop_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -10495,7 +10511,10 @@ impl App {
     /// Manual perspective guides. Their four points are authored in the oriented
     /// photograph and drawn over that unwarped photograph while the tool is open;
     /// leaving the tool applies the correction in one step.
-    #[expect(clippy::too_many_arguments, reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn keystone_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -12197,10 +12216,7 @@ impl App {
         // sidecar write needs no gate here: it is synchronous, settled before the
         // sheet can be interacted with. See `guard_quit` for the quit-time pair.
         let busy = self.export_rx.is_some() || self.confirm_quit.is_some();
-        let restart_ready = self
-            .updates
-            .as_ref()
-            .is_some_and(|u| u.restart_now_ready());
+        let restart_ready = self.updates.as_ref().is_some_and(|u| u.restart_now_ready());
         let skipped = updater::Updates::skipped_version(&self.settings).map(str::to_owned);
 
         let mut close = false;
@@ -12275,9 +12291,7 @@ impl App {
                     });
                 });
             }
-            if !skip_warning
-                && let Some(v) = &skipped
-            {
+            if !skip_warning && let Some(v) = &skipped {
                 ui.add_space(4.0);
                 ui.label(theme::caption(format!("skipping monopro {v}")));
             }
@@ -13447,11 +13461,10 @@ impl App {
             }
             self.update_sheet_open = true;
         }
-        if stop_skipping
-            && let Some(updates) = &mut self.updates
-        {
+        if stop_skipping && let Some(updates) = &mut self.updates {
             updates.stop_skipping(&mut self.settings);
-            self.pending_note = Some("stopped skipping — the next check offers the feed again".into());
+            self.pending_note =
+                Some("stopped skipping — the next check offers the feed again".into());
         }
         // Acted on out here, because the panel that asked was holding the borrow the
         // purge needs — and because deleting ten thousand files in the middle of laying

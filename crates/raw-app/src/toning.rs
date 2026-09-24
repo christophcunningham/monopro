@@ -321,18 +321,20 @@ fn ramp(ui: &mut egui::Ui, t: &ToningParams) {
 
     let n = (w.max(2.0) as usize).clamp(2, 512);
     // The process's own colours: never re-greyed for the module ground.
-    theme::true_colour(ui, || for (i, toned) in t.bake(n).iter().enumerate() {
-        let x0 = rect.left() + i as f32 / n as f32 * rect.width();
-        let x1 = rect.left() + (i + 1) as f32 / n as f32 * rect.width();
-        let l = raw_core::colour::oklab_lightness(toned.y);
-        let (a, b) = toned.ab();
-        let lin = raw_core::colour::oklab_to_display_srgb(l, a, b);
-        let enc = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8;
-        painter.rect_filled(
-            Rect::from_min_max(pos2(x0, rect.top()), pos2(x1, rect.bottom())),
-            0.0,
-            Color32::from_rgb(enc(lin[0]), enc(lin[1]), enc(lin[2])),
-        );
+    theme::true_colour(ui, || {
+        for (i, toned) in t.bake(n).iter().enumerate() {
+            let x0 = rect.left() + i as f32 / n as f32 * rect.width();
+            let x1 = rect.left() + (i + 1) as f32 / n as f32 * rect.width();
+            let l = raw_core::colour::oklab_lightness(toned.y);
+            let (a, b) = toned.ab();
+            let lin = raw_core::colour::oklab_to_display_srgb(l, a, b);
+            let enc = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8;
+            painter.rect_filled(
+                Rect::from_min_max(pos2(x0, rect.top()), pos2(x1, rect.bottom())),
+                0.0,
+                Color32::from_rgb(enc(lin[0]), enc(lin[1]), enc(lin[2])),
+            );
+        }
     });
 }
 

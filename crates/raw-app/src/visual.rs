@@ -203,7 +203,10 @@ fn scene_develop(ground: Ground) {
     };
     let mut h = launch(Some(path), ground);
     settle(&mut h, &name, develop_ready);
-    assert!(develop_ready(h.state()), "{name}: the photograph never arrived");
+    assert!(
+        develop_ready(h.state()),
+        "{name}: the photograph never arrived"
+    );
     save(&mut h, &name);
 }
 
@@ -215,7 +218,10 @@ fn scene_lightbox(ground: Ground) {
         return;
     };
     let mut h = launch(Some(folder), ground);
-    assert!(h.state().lightbox.active, "{name}: a folder should open in Lightbox");
+    assert!(
+        h.state().lightbox.active,
+        "{name}: a folder should open in Lightbox"
+    );
     settle(&mut h, &name, |app| app.lightbox.tiles_settled());
     save(&mut h, &name);
 }

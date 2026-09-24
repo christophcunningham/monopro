@@ -458,7 +458,10 @@ pub fn window_rect(viewer: egui::Rect, sample: egui::Rect, window_size: egui::Ve
 /// **"Clean" means before the whole export tail, not before grain.** Both modules that
 /// run down here are export-only and invisible to the viewport, so the useful
 /// comparison is the print with them and the print without — one checkbox, not two.
-#[expect(clippy::too_many_arguments, reason = "the export tail's inputs for one tile, passed as the export passes them")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the export tail's inputs for one tile, passed as the export passes them"
+)]
 fn compose(
     scene: &[f32],
     pw: u32,
@@ -514,7 +517,10 @@ fn compose(
 /// of milliseconds at the default settings and hundreds at sixty layers. That split
 /// is the same one `App::export` makes and for the same reason: the slow half must
 /// not be on the frame.
-#[expect(clippy::too_many_arguments, reason = "device, queue and context are borrowed app state beside the real inputs; a struct would move the count, not the coupling")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "device, queue and context are borrowed app state beside the real inputs; a struct would move the count, not the coupling"
+)]
 pub fn refresh(
     loupe: &mut Loupe,
     ctx: &egui::Context,
