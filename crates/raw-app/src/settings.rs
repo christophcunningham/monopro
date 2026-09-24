@@ -180,8 +180,10 @@ pub struct Settings {
     // -- 1. File naming
     /// Appended to the stem on export. Empty means no suffix.
     ///
-    /// The defaults say what the file *is*: `_mono` is the master, `_monoproof` a
-    /// proof. That the two differ is the point — a TIFF and a PNG exported from one
+    /// The defaults say what the file *is*: `_monopro` is the master, `_monoproof` a
+    /// proof. A master is always a TIFF and a proof always a PNG or JPEG, so the keys
+    /// keep their container names from when the choice was per container; renaming
+    /// them would reset every custom suffix. That the two differ is the point — a TIFF and a PNG exported from one
     /// frame land in the same folder, and identical stems would make the second
     /// silently offer to overwrite nothing while looking like it might.
     pub tiff_suffix: String,
@@ -189,20 +191,12 @@ pub struct Settings {
 
     // -- 2. Output
     pub output_folder: Option<PathBuf>,
-    /// Container profile keys. Only `monostar` is implemented; see the menu.
-    /// The colour space a **master** is written in, per container. See
-    /// [`Settings::space_for`], which is what the export module seeds itself from.
+    /// The colour space a **master** is written in. See [`Settings::master_space`].
     ///
-    /// Per container rather than one key, because the containers are chosen for
-    /// different jobs: a TIFF is the print master and a PNG is often the thing being
-    /// handed to somebody else. Somebody who wants `monostar` for one and `eciRGB v2`
-    /// for the other should not have to change a setting between exports.
+    /// Named for TIFF because a master is one; the key predates masters being TIFF
+    /// only, when PNG and JPEG had keys of their own. Those are gone — a PNG or JPEG
+    /// is a proof, and a proof has `proof_space`.
     pub tiff_color_space: String,
-    pub png_color_space: String,
-    /// JPEG's, which today only a **proof** can be written in — see `Container::Jpeg`.
-    /// Stored beside the other two so the three read as one decision, and so the key
-    /// already exists if JPEG ever becomes a master container.
-    pub jpeg_color_space: String,
 
     // -- 3. Default pipeline options, as stable keys. See `Settings::params`.
     pub sampling: String,
@@ -212,8 +206,6 @@ pub struct Settings {
     pub weighting_mix: [f32; 3],
     pub contrast_mask: bool,
     pub tone_map: String,
-    pub dither: bool,
-    pub export_depth: String,
     /// `in` or `cm`. **A display preference, not a stored size** — every print size in
     /// the app is canonically inches, and this only decides how they are shown and
     /// typed. It lives here rather than in `Params` because it is a property of the
@@ -244,11 +236,17 @@ pub struct Settings {
     /// uniform in lightness, so moving hue does not change how bright the mount
     /// reads against the print.
     pub surround_okhsl: [f32; 3],
+    /// TPDF dither on the **screen**. The viewer draws into an 8-bit texture, where a
+    /// smooth gradient bands visibly although the file does not; about one level of
+    /// noise, locked to the photograph's pixels, breaks the bands up. A property of
+    /// the monitor rather than of any picture, so it is a preference and not in the
+    /// sidecar. Files have their own: see `proof_dither`.
+    pub screen_dither: bool,
 
     // -- 5. Behaviour
     /// **On means today's behaviour.** Off makes a new file inherit the develop
     /// settings of the tab that was active when it opened — but never over its own
-    /// sidecar. See `docs/decisions.md`.
+    /// sidecar.
     pub reset_on_open: bool,
     /// Whether authored IPTC, subject keywords, rating and label travel with an
     /// exported file.
@@ -430,6 +428,20 @@ pub struct Settings {
     pub proof_scale: String,
     /// 8 or 16. Forced to 8 whenever the container is JPEG.
     pub proof_depth: String,
+    /// TPDF dither on an **8-bit** proof. A master is 16-bit and never dithered, and a
+    /// 16-bit proof ignores this: a 16-bit step is already below what anyone can see.
+    pub proof_dither: bool,
+}
+
+/// A proof's format, size and dither — the preferences the EXPORT module shows.
+///
+/// Global rather than per image, like every other export preference: a proof is a
+/// way of handing pictures to someone, and that does not change from frame to frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProofPrefs {
+    pub target: export::Target,
+    pub scale: export::ProofScale,
+    pub dither: bool,
 }
 
 /// How wide a window the footer readout and the Inspector's pins average over.
@@ -556,16 +568,12 @@ impl Default for Settings {
             png_suffix: "_monoproof".into(),
             output_folder: None,
             tiff_color_space: "monostar".into(),
-            png_color_space: "monostar".into(),
-            jpeg_color_space: export::Space::Srgb.key().into(),
             sampling: sampling_key(p.luminance.sampling).into(),
             demosaic: DemosaicAlgo::default().key().into(),
             weighting: weighting_key(p.luminance.weighting).into(),
             weighting_mix: [1.0, 1.0, 1.0],
             contrast_mask: p.contrast_mask.enabled,
             tone_map: tone_map_key(p.display.tone_map).into(),
-            dither: p.display.dither,
-            export_depth: export::Depth::Sixteen.key().into(),
             print_unit: Unit::default().key().into(),
             print_ppi: p.output.ppi,
             viewer_background: DEFAULT_VIEWER_BACKGROUND,
@@ -576,6 +584,7 @@ impl Default for Settings {
             // Mathematical white, matching the direct White button in the Viewer
             // page and the Frame module. Rising boards remain measured alternatives.
             surround_okhsl: [0.0, 0.0, 1.0],
+            screen_dither: true,
             reset_on_open: true,
             export_metadata: true,
             lightbox_xmp_thumbnails: false,
@@ -611,6 +620,7 @@ impl Default for Settings {
             proof_space: proof.space.key().into(),
             proof_depth: proof.depth.key().into(),
             proof_scale: export::ProofScale::default().key().into(),
+            proof_dither: true,
         }
     }
 }
@@ -642,6 +652,27 @@ impl Settings {
 
     pub fn proof_scale(&self) -> export::ProofScale {
         export::ProofScale::from_key(&self.proof_scale).unwrap_or_default()
+    }
+
+    /// Everything about a proof, as one value the EXPORT module edits and hands back.
+    pub fn proof_prefs(&self) -> ProofPrefs {
+        ProofPrefs {
+            target: self.proof_target(),
+            scale: self.proof_scale(),
+            dither: self.proof_dither,
+        }
+    }
+
+    /// Store `p`, made legal first: a 16-bit JPEG is a state a control can pass
+    /// through on its way somewhere and the writer must never be handed.
+    pub fn set_proof_prefs(&mut self, p: ProofPrefs) {
+        let mut target = p.target;
+        target.settle();
+        self.proof_container = target.container.key().into();
+        self.proof_depth = target.depth.key().into();
+        self.proof_space = target.space.key().into();
+        self.proof_scale = p.scale.key().into();
+        self.proof_dither = p.dither;
     }
 
     /// The sample window, resolved from its stable key.
@@ -798,10 +829,6 @@ impl Settings {
         self.tone_map = tone_map_key(t).into();
     }
 
-    pub fn export_depth(&self) -> export::Depth {
-        export::Depth::from_key(&self.export_depth).unwrap_or(export::Depth::Sixteen)
-    }
-
     pub fn print_unit(&self) -> Unit {
         Unit::from_key(&self.print_unit).unwrap_or_default()
     }
@@ -828,20 +855,24 @@ impl Settings {
         (!dest.exists()).then_some(dest)
     }
 
-    /// The space a master in `c` opens at. **The accessor the export module seeds from.**
+    /// The space a master is written in.
     ///
     /// An unrecognised key falls back to `Space::default()` rather than to a named
     /// space, on the rule `sampling` follows: a hand-edited typo should land wherever
     /// the shipped default is, not on whichever variant was written here last.
-    pub fn space_for(&self, c: export::Container) -> export::Space {
-        let key = match c {
-            export::Container::Tiff => &self.tiff_color_space,
-            export::Container::Png => &self.png_color_space,
-            export::Container::Jpeg => &self.jpeg_color_space,
-        };
-        export::Space::from_key(key)
+    pub fn master_space(&self) -> export::Space {
+        export::Space::from_key(&self.tiff_color_space)
             .unwrap_or_default()
             .selectable()
+    }
+
+    pub fn set_master_space(&mut self, space: export::Space) {
+        self.tiff_color_space = space.key().into();
+    }
+
+    /// What a master is: a 16-bit uncompressed TIFF in [`Self::master_space`].
+    pub fn master_target(&self) -> export::Target {
+        export::Target::master(self.master_space())
     }
 
     pub fn set_print_unit(&mut self, u: Unit) {
@@ -858,7 +889,6 @@ impl Settings {
         p.luminance.weighting = self.weighting();
         p.contrast_mask.enabled = self.contrast_mask;
         p.display.tone_map = self.tone_map();
-        p.display.dither = self.dither;
         // Only the resolution. A print *size* is a decision about one picture and
         // must not be inherited by the next file that opens — a preference that
         // silently resampled every new image would be the worst kind.
@@ -943,8 +973,12 @@ impl Settings {
                 self.module_background(),
             ]
         } else {
-            [self.lightbox_canvas, self.lightbox_panel, self.lightbox_module]
-                .map(|v| (v / 100.0).clamp(0.0, 1.0))
+            [
+                self.lightbox_canvas,
+                self.lightbox_panel,
+                self.lightbox_module,
+            ]
+            .map(|v| (v / 100.0).clamp(0.0, 1.0))
         }
     }
 
@@ -1606,16 +1640,14 @@ mod tests {
             png_suffix: "_proof".into(),
             output_folder: Some("/Volumes/Prints".into()),
             tiff_color_space: "ecirgb".into(),
-            png_color_space: "prostar".into(),
-            jpeg_color_space: "monostar".into(),
             sampling: "superpixel".into(),
             demosaic: "amaze".into(),
             weighting: "weighted".into(),
             weighting_mix: [0.7, 0.2, 0.1],
             contrast_mask: true,
             tone_map: "agx".into(),
-            dither: false,
-            export_depth: "8".into(),
+            screen_dither: false,
+            proof_dither: false,
             print_unit: "cm".into(),
             print_ppi: 360.0,
             viewer_background: 42.5,
@@ -1706,8 +1738,15 @@ mod tests {
         assert_eq!(t.depth, export::Depth::Eight);
         assert_eq!(t.space, export::Space::Srgb);
         assert_eq!(s.proof_scale(), export::ProofScale::Half);
+        assert!(
+            s.proof_dither,
+            "an 8-bit proof is dithered unless asked otherwise"
+        );
         // And the master is untouched by any of it.
-        assert_eq!(s.export_depth(), export::Depth::Sixteen);
+        assert_eq!(
+            s.master_target(),
+            export::Target::master(export::Space::Monostar)
+        );
     }
 
     #[test]
@@ -1729,10 +1768,7 @@ mod tests {
             tiff_color_space: "prostar".into(),
             ..Settings::default()
         };
-        assert_eq!(
-            settings.space_for(export::Container::Tiff),
-            export::Space::EciRgbV2
-        );
+        assert_eq!(settings.master_space(), export::Space::EciRgbV2);
     }
 
     #[test]
@@ -1752,7 +1788,7 @@ mod tests {
         // The rule the whole menu ships under: turning it on must not alter a single
         // rendering until something is moved.
         assert_eq!(Settings::default().params(), Params::default());
-        assert_eq!(Settings::default().export_depth(), export::Depth::Sixteen);
+        assert!(Settings::default().screen_dither);
         // Authored metadata travels unless someone says otherwise: these are fields a
         // person filled in on purpose. See `Settings::export_metadata`.
         assert!(Settings::default().export_metadata);
@@ -1891,7 +1927,7 @@ mod tests {
         let s: Settings = toml::from_str(text).expect("a partial file must parse");
         assert_eq!(s.tiff_suffix, "_master");
         assert_eq!(s.viewer_background, 30.0);
-        assert_eq!(s.dither, Settings::default().dither);
+        assert_eq!(s.screen_dither, Settings::default().screen_dither);
         assert_eq!(s.sampling(), Sampling::default());
         assert_eq!(
             s.lightbox_folder_root, None,
@@ -1900,15 +1936,56 @@ mod tests {
     }
 
     #[test]
+    fn proof_preferences_round_trip_and_are_made_legal() {
+        let mut s = Settings::default();
+        let mut p = s.proof_prefs();
+        p.target.container = export::Container::Jpeg;
+        p.target.depth = export::Depth::Sixteen;
+        p.scale = export::ProofScale::Full;
+        p.dither = false;
+        s.set_proof_prefs(p);
+        let back = s.proof_prefs();
+        assert_eq!(back.target.container, export::Container::Jpeg);
+        assert_eq!(
+            back.target.depth,
+            export::Depth::Eight,
+            "a JPEG proof is 8-bit"
+        );
+        assert_eq!(back.scale, export::ProofScale::Full);
+        assert!(!back.dither);
+    }
+
+    #[test]
+    fn a_file_from_before_masters_were_tiff_only_still_opens() {
+        // The keys retired when a master became a 16-bit TIFF and dither split into
+        // screen and proof. They are ignored, and the screen keeps dithering even
+        // where the old per-image default had been switched off.
+        let text = r#"
+            tiff_color_space = "ecirgb"
+            png_color_space = "monostar"
+            jpeg_color_space = "srgb"
+            export_depth = "8"
+            dither = false
+        "#;
+        let s: Settings = toml::from_str(text).expect("retired keys must be ignored");
+        assert_eq!(s.master_space(), export::Space::EciRgbV2);
+        assert!(s.screen_dither);
+        assert_eq!(
+            s.master_target(),
+            export::Target::master(export::Space::EciRgbV2)
+        );
+    }
+
+    #[test]
     fn a_newer_file_with_unknown_keys_still_opens() {
         // The other direction: a setting added in a later version must not stop an
         // earlier build from reading the rest.
         let text = r#"
-            dither = false
+            screen_dither = false
             some_setting_from_the_future = "hello"
         "#;
         let s: Settings = toml::from_str(text).expect("unknown keys must be ignored");
-        assert!(!s.dither);
+        assert!(!s.screen_dither);
     }
 
     #[test]
@@ -1918,13 +1995,13 @@ mod tests {
             sampling = "supperpixel"
             weighting = "chartreuse"
             tone_map = "filmic"
-            export_depth = "12"
+            tiff_color_space = "pantone"
         "#;
         let s: Settings = toml::from_str(text).expect("parse");
         assert_eq!(s.sampling(), Sampling::default());
         assert_eq!(s.weighting(), Weighting::Photosite);
         assert_eq!(s.tone_map(), ToneMap::default());
-        assert_eq!(s.export_depth(), export::Depth::Sixteen);
+        assert_eq!(s.master_space(), export::Space::default());
     }
 
     #[test]

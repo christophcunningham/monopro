@@ -40,7 +40,10 @@ impl SceneImage {
     /// coordinate. Do not remove the snap.
     #[inline]
     pub fn color_at(&self, row: usize, col: usize) -> CfaColor {
-        debug_assert!(self.geom.crop_x.is_multiple_of(2) && self.geom.crop_y.is_multiple_of(2));
+        debug_assert!(
+            self.geom.crop_x.is_multiple_of(2) && self.geom.crop_y.is_multiple_of(2),
+            "the crop origin must sit on a 2x2 CFA tile boundary"
+        );
         self.geom.pattern[row & 1][col & 1]
     }
 }
@@ -61,18 +64,16 @@ pub enum Sampling {
     Demosaic(DemosaicAlgo),
 }
 
-/// **Demosaic, at RCD.** the maintainer's call, 2026-08-06, reversing `docs/decisions.md`'s
-/// "SuperPixel is confirmed as the working default" — see that entry, which is kept
-/// with the date its reasoning stopped applying.
+/// **Demosaic, at RCD.** the maintainer's call, 2026-08-06, reversing an earlier
+/// decision that SuperPixel was the working default.
 ///
 /// The old reason was a fact about one photographer rather than about the app: *the
 /// mode the maintainer actually edits in, because he prints smaller.* Against that, SuperPixel
-/// halves each dimension and `decisions.md` records that the halving reaches the export
+/// halves each dimension, and the halving reaches the export
 /// too, so the default put a permanent ceiling on print size — 13 x 8.7 inches from a
 /// Leica M10-R against 26 x 17. A default nobody knows to change is the one that decides
 /// what most files are printed at.
 ///
-/// Historical timing and the default decision are in `docs/decisions.md`.
 /// The app prepares luminance on a bounded worker; downstream edits reuse it.
 impl Default for Sampling {
     fn default() -> Self {
@@ -298,8 +299,7 @@ pub struct DecodeOptions {
 /// 2026-08-28. Reconstruction produced solarized Bayer-block boundaries even after
 /// conservative evidence gating; TCA resampled the mosaic without showing a reliable
 /// benefit in real-image review. Neither belongs in the active decode path. Keep the
-/// clipping mask for diagnosis and use tonal controls for highlight rendering. The
-/// complete decision and screenshots are recorded in `docs/decisions.md`.
+/// clipping mask for diagnosis and use tonal controls for highlight rendering.
 pub fn decode(sensor: &SensorImage, opts: DecodeOptions) -> (SceneImage, ClipMask) {
     to_scene(sensor, opts.unity_wb)
 }

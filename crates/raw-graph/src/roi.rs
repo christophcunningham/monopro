@@ -121,7 +121,7 @@ pub struct Roi {
     pub w: u32,
     pub h: u32,
     /// This grid's pixels per source pixel. 1.0 is 100% — one grid pixel per
-    /// output pixel, NOT per photosite, per `docs/decisions.md`.
+    /// output pixel, NOT per photosite.
     pub scale: f32,
 }
 

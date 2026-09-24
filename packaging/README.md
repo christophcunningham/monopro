@@ -98,7 +98,9 @@ Publishing a release:
    `monopro-<version>-macos.zip.ed.sig` — the EdDSA signature over the ZIP
    bytes from `sign_update`.
 2. Publish both assets on the GitHub release, together with release notes as a
-   plain-text file named after the ZIP (`monopro-<version>-macos.txt`).
+   plain-text file named after the ZIP (`monopro-<version>-macos.txt`). The notes
+   are the release's section of [`CHANGELOG.md`](../CHANGELOG.md): rename its
+   **Unreleased** heading to the version and date, and copy that section's text.
 3. Extend the feed with `packaging/macos/appcast <archives-dir>
    --download-url-prefix https://github.com/christophcunningham/monopro/releases/download/v<version>/
    [--ed-key-file <key>]`: a staging directory holding the new ZIP, its notes

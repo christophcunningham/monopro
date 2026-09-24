@@ -151,8 +151,8 @@ impl Default for SharpenParams {
     /// characteristic failure of output sharpening, so defaulting it off would ship the
     /// known-bad configuration.
     ///
-    /// **0.5 is the knee**, measured by `sharpen-sweep`; the table is in
-    /// `docs/decisions.md`. The metric keeps improving past it, and that is why the
+    /// **0.5 is the knee**, measured by the `sharpen-sweep` example, which
+    /// prints the table. The metric keeps improving past it, and that is why the
     /// metric does not decide it — a shield driven hard sharpens flat texture and leaves
     /// real edges alone, and a print wants its edges crisp too.
     fn default() -> Self {

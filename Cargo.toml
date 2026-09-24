@@ -17,11 +17,26 @@ exclude = ["vendor/sparkle-updater", "vendor/egui_tiles"]
 # earns its complexity. Contrast Mask is what earned it — it forks and joins, so
 # it cannot be expressed as a line.
 
+# Stricter than clippy's defaults in two places, both from the Linebender set. Each
+# crate opts in with `[lints] workspace = true`; CI denies warnings, so these hold.
+#
+# `cast_possible_truncation` was tried and left off: 363 hits, almost all a
+# dimension already bounded by `OutputParams::MAX_EDGE` or a value clamped to 0-255
+# on the same line, and float-to-int `as` saturates rather than wrapping. A real
+# truncation would have been one line among three hundred exemptions.
+[workspace.lints.clippy]
+# An exemption says why, and `expect` rather than `allow` so it is flagged once the
+# lint stops firing and the exemption has become a stale claim.
+allow_attributes_without_reason = "warn"
+allow_attributes = "warn"
+# A debug_assert that fires in a decode should say what it was guarding.
+missing_assert_message = "warn"
+
 [workspace.package]
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.92"
-license = "GPL-3.0-or-later" # rawler is LGPL-2.1; see docs/decisions.md
+license = "GPL-3.0-or-later" # rawler is LGPL-2.1; the ported demosaics are GPL
 
 [workspace.dependencies]
 raw-core = { path = "crates/raw-core" }
@@ -43,7 +58,7 @@ egui-wgpu = "0.35"
 # version pinned above** — a docking crate that forced the egui/eframe/wgpu stack
 # forward would have been the largest risk in milestone 8, and this retires it
 # before the first line. Its `serde` feature is on by default and is what lets the
-# tile tree persist through eframe storage. See `docs/decisions.md`.
+# tile tree persist through eframe storage.
 egui_tiles = "0.16"
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"

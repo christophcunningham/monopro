@@ -650,8 +650,10 @@ enum Tile {
 /// The folder tree's own state: what is open, and what each open folder contains.
 ///
 /// Listings are cached because a tree redraws every frame and `read_dir` on a
-/// network volume is not free. They are read once when a folder is first expanded;
-/// there is no watcher, and collapsing and re-expanding is the refresh.
+/// network volume is not free. They are read once when a folder is first expanded,
+/// and again after the Refresh command (`Lightbox::refresh`), which forgets them.
+/// There is no watcher: a watcher cannot see changes another machine makes on a
+/// network volume, which is where it would be needed most.
 pub struct FolderTree {
     /// The configured local root. `None` resolves to Home; external volumes are not
     /// stored here because they are discovered live whenever the panel is drawn.
@@ -985,7 +987,58 @@ pub struct Lightbox {
     search_offline: HashSet<u32>,
     /// IPTC context for results that matched metadata rather than only their path.
     search_metadata: HashMap<u32, String>,
+    /// A re-read of the open folder running off the main thread. See [`Self::refresh`].
+    relist: Option<Relist>,
+    /// When the last re-read began, so switching back and forth between apps does
+    /// not queue one per switch.
+    relist_at: Option<std::time::Instant>,
 }
+
+/// A re-read of the open folder, in flight on its own thread.
+///
+/// Carries what the listing was read *under*, because the app can change the folder,
+/// the listing settings or the entries themselves while it runs, and a listing of a
+/// state that no longer holds must not be applied to the one that does.
+struct Relist {
+    dir: PathBuf,
+    /// `Lightbox::generation` when the read began. Everything the app does to the
+    /// entries itself — open, rename, search — retires the generation, so a match
+    /// here means nothing has touched them since.
+    generation: u32,
+    /// Subfolders, folders, other files: the three things that decide what a
+    /// listing contains.
+    flags: (bool, bool, bool),
+    /// Asked for by the Refresh command, which reports what it found; the automatic
+    /// re-read on focus stays silent.
+    manual: bool,
+    rx: std::sync::mpsc::Receiver<Vec<(PathBuf, Kind)>>,
+}
+
+/// What a re-read changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Reconciled {
+    pub added: usize,
+    pub removed: usize,
+}
+
+impl Reconciled {
+    fn note(self) -> String {
+        match (self.added, self.removed) {
+            (0, 0) => "Folder is up to date".to_owned(),
+            (a, 0) => format!("{a} new {}", files(a)),
+            (0, r) => format!("{r} {} gone", files(r)),
+            (a, r) => format!("{a} new, {r} gone"),
+        }
+    }
+}
+
+fn files(n: usize) -> &'static str {
+    if n == 1 { "file" } else { "files" }
+}
+
+/// How soon an automatic re-read may follow the last one. Switching to another app
+/// and straight back is a gesture, not a request to read a network folder twice.
+const RELIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Default for Lightbox {
     fn default() -> Self {
@@ -1010,6 +1063,8 @@ impl Lightbox {
             developed_wanted: std::collections::VecDeque::new(),
             frame: 0,
             reset_scroll: false,
+            relist: None,
+            relist_at: None,
             last_avail: 0.0,
             selected: None,
             head: None,
@@ -2540,6 +2595,14 @@ impl Lightbox {
     /// Everything from the previous folder is dropped and its generation retired —
     /// see [`Key`]. The sort and filters carry over, because they are how *you* look
     /// at a folder rather than a property of the one you left.
+    /// Whether the grid has finished arriving: at least one tile drawn and none
+    /// still queued. `visual` waits on this so a Lightbox frame is not captured
+    /// half-filled.
+    #[cfg(test)]
+    pub fn tiles_settled(&self) -> bool {
+        !self.tiles.is_empty() && !self.tiles.values().any(|t| matches!(t, Tile::Pending))
+    }
+
     pub fn open_folder(&mut self, dir: &Path) {
         let mut entries: Vec<Entry> = list_entries(
             dir,
@@ -2571,6 +2634,202 @@ impl Lightbox {
         if self.sort == Sort::Captured {
             self.sweep_dates();
         }
+    }
+
+    /// Re-read the open folder in the background, and fold what changed into the grid
+    /// when it arrives. See [`Self::reconcile`] for what "fold in" preserves.
+    ///
+    /// **Automatic** (`manual == false`) on the window coming back to the front and on
+    /// switching into Lightbox — the moments files are most likely to have arrived from
+    /// somewhere else — and at most once per [`RELIST_INTERVAL`]. **Manual** is the
+    /// Refresh command: it is never throttled, reports what it found, and also forgets
+    /// the folder tree's cached subfolders so they are read again as they are drawn.
+    ///
+    /// Off the main thread because a folder on a network volume can take a noticeable
+    /// fraction of a second to list, and the first of these runs on every window focus.
+    /// Nothing happens while search results are showing: those entries are not the
+    /// folder's.
+    pub fn refresh(&mut self, manual: bool) {
+        let Some(dir) = self.folder.clone() else {
+            return;
+        };
+        if self.search_showing || self.relist.is_some() {
+            return;
+        }
+        if !manual
+            && self
+                .relist_at
+                .is_some_and(|at| at.elapsed() < RELIST_INTERVAL)
+        {
+            return;
+        }
+        if manual {
+            self.folders.children.clear();
+        }
+        self.relist_at = Some(std::time::Instant::now());
+        let flags = (
+            self.filters.subfolders,
+            self.show_folders,
+            self.show_other_files,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let read = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(list_entries(&read, flags.0, flags.1, flags.2));
+        });
+        self.relist = Some(Relist {
+            dir,
+            generation: self.generation,
+            flags,
+            manual,
+            rx,
+        });
+    }
+
+    /// Apply a finished re-read, if it still describes the grid on screen.
+    fn poll_relist(&mut self, ctx: &egui::Context) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(relist) = &self.relist else {
+            return;
+        };
+        let listing = match relist.rx.try_recv() {
+            Ok(listing) => listing,
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.relist = None;
+                return;
+            }
+        };
+        let Some(relist) = self.relist.take() else {
+            return;
+        };
+        // Stale is dropped rather than applied: the next focus or Refresh reads again,
+        // while a listing from before a rename would put the old name back.
+        let current = self.folder.as_deref() == Some(relist.dir.as_path())
+            && self.generation == relist.generation
+            && relist.flags
+                == (
+                    self.filters.subfolders,
+                    self.show_folders,
+                    self.show_other_files,
+                )
+            && !self.search_showing
+            && self.drag.is_none();
+        if !current {
+            return;
+        }
+        let change = self.reconcile(listing);
+        if relist.manual {
+            self.action_note = Some(change.note());
+        }
+    }
+
+    /// Bring `entries` into line with a fresh listing of the same folder **without
+    /// disturbing anything that is still there**.
+    ///
+    /// Every thumbnail, the selection, the batch, Quick Look and the scroll are keyed
+    /// by an entry's index, so `open_folder`'s answer — rebuild and clear — would blank
+    /// the grid and lose your place on every window focus. Instead:
+    ///
+    /// - nothing added or removed changes nothing, which is almost every call;
+    /// - surviving entries keep their relative order and new ones go on the end, so
+    ///   the display order still comes from the sort alone (`entries` is never the
+    ///   display order; see [`Self::reindex`]);
+    /// - every index-keyed field is carried across one remap, and whatever pointed at
+    ///   a removed file is dropped;
+    /// - the generation is retired, so a thumbnail job still running under an old
+    ///   index cannot land on the entry that now holds it. Only tiles still *pending*
+    ///   are lost to that, and the grid asks for those again as it draws.
+    ///
+    /// Sidecar changes are not this function's business — `refresh_edited` covers
+    /// them and runs at the same moments.
+    fn reconcile(&mut self, listing: Vec<(PathBuf, Kind)>) -> Reconciled {
+        let listed: HashSet<&Path> = listing.iter().map(|(p, _)| p.as_path()).collect();
+        let mut added: Vec<(PathBuf, Kind)> = {
+            let known: HashSet<&Path> = self.entries.iter().map(|e| e.path.as_path()).collect();
+            listing
+                .iter()
+                .filter(|(p, _)| !known.contains(p.as_path()))
+                .cloned()
+                .collect()
+        };
+        let removed = self
+            .entries
+            .iter()
+            .filter(|e| !listed.contains(e.path.as_path()))
+            .count();
+        if added.is_empty() && removed == 0 {
+            return Reconciled::default();
+        }
+
+        // Old index -> new index, `None` for a file that is gone.
+        let mut remap: Vec<Option<u32>> = Vec::with_capacity(self.entries.len());
+        let mut kept: Vec<Entry> = Vec::with_capacity(self.entries.len() + added.len());
+        for entry in std::mem::take(&mut self.entries) {
+            if listed.contains(entry.path.as_path()) {
+                remap.push(Some(kept.len() as u32));
+                kept.push(entry);
+            } else {
+                remap.push(None);
+            }
+        }
+        // The same base order `open_folder` gives a whole folder, among the newcomers.
+        added.sort_by_cached_key(|(p, _)| name_of(p).to_lowercase());
+        let result = Reconciled {
+            added: added.len(),
+            removed,
+        };
+        kept.extend(added.into_iter().map(|(p, kind)| entry_for(p, kind)));
+        self.entries = kept;
+        let map = |i: u32| remap.get(i as usize).copied().flatten();
+
+        // Queued jobs that never started would be wasted work under the old
+        // generation; stop them before retiring it.
+        for (idx, tile) in &self.tiles {
+            if matches!(tile, Tile::Pending) {
+                self.queue.cancel(Key {
+                    generation: self.generation,
+                    idx: *idx,
+                    full: false,
+                });
+            }
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let rekey = |key: Key| {
+            Some(Key {
+                generation,
+                idx: map(key.idx)?,
+                ..key
+            })
+        };
+
+        self.tiles = std::mem::take(&mut self.tiles)
+            .into_iter()
+            .filter(|(_, tile)| !matches!(tile, Tile::Pending))
+            .filter_map(|(idx, tile)| Some((map(idx)?, tile)))
+            .collect();
+        self.preview_textures = std::mem::take(&mut self.preview_textures)
+            .into_iter()
+            .filter_map(|(key, texture)| Some((rekey(key)?, texture)))
+            .collect();
+        self.preview_failed.clear();
+        self.preview_focus = self.preview_focus.and_then(rekey);
+        self.selected = self.selected.and_then(map);
+        self.head = self.head.and_then(map);
+        self.preview = self.preview.and_then(map);
+        self.batch = self.batch.iter().filter_map(|i| map(*i)).collect();
+        self.drag = None;
+
+        // Also rebuilds `developed_wanted`, newcomers included, from the new indices.
+        self.reindex();
+        if self.sort == Sort::Captured {
+            self.sweep_dates();
+        }
+        result
     }
 
     /// Rebuild the display order from the sort and the filters.
@@ -2808,6 +3067,7 @@ impl Lightbox {
 
     /// Accept only the current folder generation and keep failures out of busy state.
     pub fn collect(&mut self, ctx: &egui::Context) {
+        self.poll_relist(ctx);
         self.preview_failed
             .retain(|key| key.generation == self.generation);
         if self.queue.in_flight() > 0 || self.preview_queue.in_flight() > 0 {
@@ -5922,7 +6182,7 @@ impl Lightbox {
                 }
                 ui.separator();
 
-                // **American, like every other label.** `decisions.md` settled it:
+                // **American, like every other label.** That is settled:
                 // the user reads "color" and "gray", while identifiers, persistence
                 // keys and comments keep the British form — which is why `self.grey`
                 // and `theme::label_colour` are spelt the way they are two lines from
@@ -7782,6 +8042,203 @@ mod tests {
         assert!(badge("worked.dng"), "a file with a sidecar is marked");
         assert!(!badge("untouched.dng"), "and one without is not");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------ refresh
+
+    /// A folder of raw-named files, opened in a fresh Lightbox.
+    fn opened(tag: &str, names: &[&str]) -> (Lightbox, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("monopro-lb-relist-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in names {
+            std::fs::write(dir.join(name), b"not really a raw").unwrap();
+        }
+        let mut lb = Lightbox::new();
+        lb.open_folder(&dir);
+        (lb, dir)
+    }
+
+    fn relisted(lb: &mut Lightbox, dir: &Path) -> Reconciled {
+        lb.reconcile(list_entries(
+            dir,
+            false,
+            lb.show_folders,
+            lb.show_other_files,
+        ))
+    }
+
+    fn index_of(lb: &Lightbox, name: &str) -> u32 {
+        lb.entries
+            .iter()
+            .position(|e| e.name == name)
+            .expect("entry is listed") as u32
+    }
+
+    fn name_at(lb: &Lightbox, idx: u32) -> &str {
+        &lb.entries[idx as usize].name
+    }
+
+    #[test]
+    fn a_refresh_that_finds_nothing_new_touches_nothing() {
+        let (mut lb, dir) = opened("same", &["a.dng", "b.dng", "c.dng"]);
+        lb.tiles.insert(0, Tile::Missing);
+        lb.tiles.insert(1, Tile::Pending);
+        lb.selected = Some(2);
+        let before = lb.generation;
+
+        assert_eq!(relisted(&mut lb, &dir), Reconciled::default());
+        assert_eq!(
+            lb.generation, before,
+            "no change must not retire a single tile"
+        );
+        assert_eq!(lb.tiles.len(), 2, "not even the pending one");
+        assert_eq!(lb.selected, Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_files_join_without_moving_anything_already_there() {
+        let (mut lb, dir) = opened("added", &["a.dng", "b.dng", "c.dng"]);
+        for i in 0..3 {
+            lb.tiles.insert(i, Tile::Missing);
+        }
+        lb.selected = Some(index_of(&lb, "b.dng"));
+        std::fs::write(dir.join("0-first-by-name.dng"), b"x").unwrap();
+
+        let change = relisted(&mut lb, &dir);
+        assert_eq!(
+            change,
+            Reconciled {
+                added: 1,
+                removed: 0
+            }
+        );
+        assert_eq!(
+            lb.entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a.dng", "b.dng", "c.dng", "0-first-by-name.dng"],
+            "survivors keep their index; the newcomer goes on the end"
+        );
+        assert_eq!(lb.tiles.len(), 3, "every thumbnail already drawn is kept");
+        assert_eq!(name_at(&lb, lb.selected.unwrap()), "b.dng");
+        assert_eq!(
+            lb.visible.first().map(|i| name_at(&lb, *i)),
+            Some("0-first-by-name.dng"),
+            "and the sort, not the storage order, decides where it shows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_removed_file_takes_its_own_state_and_the_rest_follow_their_files() {
+        let (mut lb, dir) = opened("removed", &["a.dng", "b.dng", "c.dng", "d.dng"]);
+        let [a, b, c, d] = ["a.dng", "b.dng", "c.dng", "d.dng"].map(|n| index_of(&lb, n));
+        for i in [a, b, c, d] {
+            lb.tiles.insert(i, Tile::Missing);
+        }
+        lb.selected = Some(b);
+        lb.head = Some(d);
+        lb.preview = Some(c);
+        lb.batch = [a, b, d].into_iter().collect();
+        std::fs::remove_file(dir.join("b.dng")).unwrap();
+
+        let change = relisted(&mut lb, &dir);
+        assert_eq!(
+            change,
+            Reconciled {
+                added: 0,
+                removed: 1
+            }
+        );
+        assert_eq!(lb.entries.len(), 3);
+        assert_eq!(lb.tiles.len(), 3, "b's tile went with it");
+        assert_eq!(lb.selected, None, "the selection was the file that left");
+        assert_eq!(name_at(&lb, lb.head.unwrap()), "d.dng");
+        assert_eq!(name_at(&lb, lb.preview.unwrap()), "c.dng");
+        let mut batch: Vec<&str> = lb.batch.iter().map(|i| name_at(&lb, *i)).collect();
+        batch.sort();
+        assert_eq!(batch, ["a.dng", "d.dng"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_retires_the_generation_and_asks_again_for_pending_tiles() {
+        // A job running under an old index would land on whichever file holds that
+        // index now. Retiring the generation is what makes `collect` drop it.
+        let (mut lb, dir) = opened("pending", &["a.dng", "b.dng"]);
+        lb.tiles.insert(0, Tile::Missing);
+        lb.tiles.insert(1, Tile::Pending);
+        let before = lb.generation;
+        std::fs::remove_file(dir.join("a.dng")).unwrap();
+
+        relisted(&mut lb, &dir);
+        assert_ne!(lb.generation, before);
+        assert!(
+            lb.tiles.is_empty(),
+            "a's tile left with a, and b's pending one is forgotten so the grid asks again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Drive a background re-read to completion the way the frame loop does.
+    fn finish_relist(lb: &mut Lightbox) {
+        let ctx = egui::Context::default();
+        let start = std::time::Instant::now();
+        while lb.relist.is_some() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "re-read hung"
+            );
+            lb.collect(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn refresh_finds_new_files_in_the_background_and_says_so() {
+        let (mut lb, dir) = opened("manual", &["a.dng"]);
+        std::fs::write(dir.join("b.dng"), b"x").unwrap();
+        std::fs::write(dir.join("c.dng"), b"x").unwrap();
+
+        lb.refresh(true);
+        finish_relist(&mut lb);
+        assert_eq!(lb.entries.len(), 3);
+        assert_eq!(lb.action_note.as_deref(), Some("2 new files"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_listing_read_before_the_app_changed_the_entries_is_dropped() {
+        // A rename, a search or a new folder all retire the generation. A listing
+        // read before one of them describes a folder that is no longer on screen —
+        // applied, it would put a renamed file's old name back.
+        let (mut lb, dir) = opened("stale", &["a.dng"]);
+        std::fs::write(dir.join("b.dng"), b"x").unwrap();
+        lb.refresh(true);
+        lb.generation = lb.generation.wrapping_add(1);
+        finish_relist(&mut lb);
+        assert_eq!(lb.entries.len(), 1, "the stale listing was not applied");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn automatic_refreshes_are_spaced_out_and_the_command_is_not() {
+        let (mut lb, dir) = opened("throttle", &["a.dng"]);
+        lb.refresh(false);
+        finish_relist(&mut lb);
+        lb.refresh(false);
+        assert!(
+            lb.relist.is_none(),
+            "a second focus straight after is not a second read"
+        );
+        lb.refresh(true);
+        assert!(lb.relist.is_some(), "asking for it is always honoured");
+        finish_relist(&mut lb);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

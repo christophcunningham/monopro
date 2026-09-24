@@ -3,7 +3,6 @@
 //!
 //! A closed enum rather than a trait object, because the graph is a pure function of
 //! `Params` — no node editor, no user-authored topology, nothing loaded at runtime.
-//! See `docs/decisions.md`.
 
 use crate::roi::Apron;
 

@@ -55,8 +55,8 @@
 //!
 //! This does not reproduce the prototype's pixels and could not: `rand_distr`'s normal
 //! sampler is a ziggurat whose stream needs the crate. The *distributions* match, which
-//! is what the algorithm is specified in terms of, and `docs/decisions.md` holds the
-//! tonal-profile comparison that checked it.
+//! is what the algorithm is specified in terms of, and a tonal-profile
+//! comparison against the prototype checked it.
 //!
 //! At the defaults the grain is heavy — a fifth of local density in the shadows — and
 //! that is Pierre's model rather than a port that slipped a factor. What quietens it is
@@ -141,8 +141,8 @@ impl Default for GrainParams {
     ///
     /// 2.5% RMS: deliberately not the quietest the module can do, because a default you
     /// cannot see is a default that looks broken the other way. **Layers stay at 30** —
-    /// sixty is indistinguishable at 1:1 and doubles every export. Measurements in
-    /// `docs/decisions.md`.
+    /// sixty is indistinguishable at 1:1 and doubles every export. The cost is
+    /// measured by `tests/grain_cost.rs`.
     ///
     /// The seed is fixed rather than drawn from the clock, so a file with no grain block
     /// in its sidecar and a file written today grain the same way.
@@ -516,7 +516,10 @@ fn create_crystal(width: usize, n_verts: f32, rotation: f32) -> Vec<f32> {
 /// The coefficients carry more digits than an `f32` holds, and they are kept that
 /// way on purpose: they are a citation, and a reader checking this against the paper
 /// should find the same numbers rather than their rounded shadows.
-#[allow(clippy::excessive_precision)]
+#[expect(
+    clippy::excessive_precision,
+    reason = "Pierre's published fit, kept digit for digit as a citation"
+)]
 fn filling_to_rand_variable(p: f32) -> f32 {
     let p = p.clamp(1e-6, 0.9999);
     1.107_247_14 * p.powf(1.048_773_89) / (p - 1.0).abs().powf(0.372_074_05)
@@ -558,7 +561,10 @@ fn phi(z: f32) -> f32 {
 }
 
 #[cfg(test)]
-#[allow(clippy::excessive_precision)] // published coefficients; see `filling_to_rand_variable`
+#[expect(
+    clippy::excessive_precision,
+    reason = "Pierre's published coefficients; see `filling_to_rand_variable`"
+)]
 fn erf(x: f32) -> f32 {
     // A&S 7.1.26; |error| < 1.5e-7, which is well below the erfinv approximation
     // this exists to measure, so it can serve as the reference for it.

@@ -12,7 +12,10 @@ use crate::settings::Settings;
 
 /// What the macOS module calls a stage. Always idle here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "mirrors the macOS updater's stages; only Idle exists without an updater"
+)]
 pub enum Stage {
     Idle,
     Available,
@@ -22,7 +25,6 @@ pub enum Stage {
 
 /// The badge the title strip would draw. Never constructed here.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 pub struct Badge {
     pub text: String,
     pub detail: String,

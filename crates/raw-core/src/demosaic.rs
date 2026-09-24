@@ -24,8 +24,8 @@
 //! These are ports of published algorithms, transcribed from the reference
 //! implementations rather than from recollection. Each carries its attribution at
 //! the function that implements it. They are GPL, which is compatible with this
-//! workspace's `GPL-3.0-or-later` — and which deepens the closed-source debt
-//! recorded at the top of `docs/decisions.md`.
+//! workspace's `GPL-3.0-or-later`, and each would have to be replaced for any
+//! closed-source build.
 //!
 //! # Two adaptations every port here shares
 //!
@@ -847,8 +847,7 @@ fn median3(a: f32, b: f32, c: f32) -> f32 {
 /// Every step above is spent deciding **direction** and **chroma**. The weighted sum
 /// to grey then discards the chroma half. What survives into a monochrome render is
 /// the aliasing and zipper handling of step 3 — which is real, and is the reason this
-/// is worth having at all, but it is a fraction of what the algorithm does. See
-/// `docs/decisions.md` for the measurement.
+/// is worth having at all, but it is a fraction of what the algorithm does.
 fn amaze(scene: &SceneImage, weighting: Weighting) -> LumaImage {
     const EPS: f32 = 1e-5;
     const EPSSQ: f32 = 1e-10;

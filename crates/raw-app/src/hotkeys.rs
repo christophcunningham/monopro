@@ -83,6 +83,8 @@ pub enum Action {
     RenameFiles,
     /// Open the Contact Sheet PDF dialog for the current Lightbox selection or view.
     ContactSheet,
+    /// Re-read the open Lightbox folder for files that arrived or left.
+    RefreshFolder,
     Rating(u8),
     ColourLabel(u8),
     // -- Composition
@@ -150,8 +152,8 @@ pub enum Mods {
     /// the key simply never arrived. the maintainer chose `⌃Tab`, which is the other
     /// cross-platform convention for walking a tab strip and is not reserved.
     ///
-    /// Bare backtick still flicks A/B — see `docs/decisions.md`, "Both tab keys stay".
-    /// That half of the decision is untouched and is the half that was working.
+    /// Bare backtick still flicks A/B. That half of keeping both tab keys is untouched,
+    /// and is the half that was working.
     Ctrl,
     CtrlShift,
 }
@@ -814,6 +816,17 @@ pub const TABLE: &[Binding] = &[
         Lightbox,
         true,
     ),
+    // The window coming back to the front re-reads the folder quietly; this is for
+    // files that land while monopro stays in front, and it says what it found.
+    b(
+        Action::RefreshFolder,
+        Key::R,
+        Cmd,
+        "r",
+        "Refresh folder",
+        Lightbox,
+        true,
+    ),
     b(
         Action::Rating(1),
         Key::Num1,
@@ -914,7 +927,15 @@ pub const TABLE: &[Binding] = &[
         Files,
         true,
     ),
-    b(Action::Export, Key::E, Cmd, "e", "Export", Files, true),
+    b(
+        Action::Export,
+        Key::E,
+        Cmd,
+        "e",
+        "Export master",
+        Files,
+        true,
+    ),
     b(
         Action::ExportProof,
         Key::E,
@@ -1564,8 +1585,8 @@ mod tests {
         // focus to next window" and takes the event before the app or its menu bar sees
         // it, so both were dead keys that read as implemented. See `Mods::Ctrl`.
         //
-        // **Bare backtick keeps the flick**, which is the half of `docs/decisions.md`
-        // "Both tab keys stay" that was always working, and the A/B gesture the
+        // **Bare backtick keeps the flick**, which is the half of keeping both tab
+        // keys that was always working, and the A/B gesture the
         // `WARM = 2` decision rests on.
         let ticks: Vec<&Binding> = TABLE
             .iter()

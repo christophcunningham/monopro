@@ -27,6 +27,19 @@ history to undo or redo changes.
 
 Press `,` for Settings and `.` for the hotkey reference.
 
+The same program runs without its window, for scripts and batch work:
+
+```sh
+monopro render *.RAF --out-dir exports     # masters, as each sidecar describes them
+monopro render a.RAF --proof               # a proof, beside the raw
+monopro info a.RAF                         # camera, sensor, exposure, sidecar state
+monopro help
+```
+
+In the macOS app the executable is `monopro.app/Contents/MacOS/monopro`. Exit
+status is 0 when every file was written, 1 when any failed, and 2 for a bad
+command line.
+
 On macOS the app checks the stable release feed once a day, quietly: nothing
 appears while it is current, a badge appears at the right of the title strip
 when an update exists, and clicking it offers *Update on quit* (default),
@@ -88,8 +101,11 @@ the print loupe previews them at the selected output scale. Grain uses stochasti
 silver-halide crystal synthesis. Toning models material conversion and optical density;
 its coefficients are currently adjusted by eye rather than measured.
 
-Export supports TIFF, PNG, and JPEG. Grayscale masters can use L* encoding with the
-[monostar ICC profile](profiles/MONOSTAR.md). Toning introduces color after the
+Export writes two kinds of file. A **master** is the archival file a print is made
+from: always a 16-bit uncompressed TIFF at the print size, by default grayscale and
+L*-encoded with the [monostar ICC profile](profiles/MONOSTAR.md). A **proof** is
+anything else: a PNG or JPEG, at full resolution or a fraction of it, usually sRGB
+for screens. The format says which is which. Toning introduces color after the
 monochrome processing stages. Edits and metadata are stored in `.mono.xmp` sidecars.
 
 ## Dependencies
@@ -159,6 +175,11 @@ package and desktop validation remain pending. See [packaging](packaging/README.
 [platform status](docs/cross-platform-release.md), and the
 [release checklist](docs/release-smoke-test.md).
 
+Frames of the real interface can be drawn without a window, for looking at a UI
+change: `cargo test -p raw-app visual -- --ignored` writes them to `target/visual/`
+(see [`visual.rs`](crates/raw-app/src/visual.rs)).
+
+[Architecture](ARCHITECTURE.md) · [Changelog](CHANGELOG.md) · [Known limitations](docs/known-limitations.md) ·
 [Keyboard shortcuts](docs/hotkeys.md) · [Optional test fixtures](docs/private-fixtures.md)
 
 ## Licence

@@ -1051,9 +1051,9 @@ impl Layout {
         if input.pointer.primary_pressed() {
             // Seam and width as they were at the press, before the drag moved them.
             self.press = [0, 1].map(|side| {
-                edges[side].filter(|(_, r)| r.is_positive()).map(|(_, r)| {
-                    (if side == 0 { r.right() } else { r.left() }, r.width())
-                })
+                edges[side]
+                    .filter(|(_, r)| r.is_positive())
+                    .map(|(_, r)| (if side == 0 { r.right() } else { r.left() }, r.width()))
             });
         }
         if !resizing || !input.pointer.primary_down() {
@@ -1101,7 +1101,11 @@ impl Layout {
                 )
             };
             let resp = ui
-                .interact(rect, ui.id().with(("tuck", side)), egui::Sense::click_and_drag())
+                .interact(
+                    rect,
+                    ui.id().with(("tuck", side)),
+                    egui::Sense::click_and_drag(),
+                )
                 .on_hover_cursor(if side == 0 {
                     egui::CursorIcon::ResizeEast
                 } else {
@@ -1120,7 +1124,10 @@ impl Layout {
                 rect.left() + 1.5
             };
             ui.painter().line_segment(
-                [egui::pos2(line, rect.top()), egui::pos2(line, rect.bottom())],
+                [
+                    egui::pos2(line, rect.top()),
+                    egui::pos2(line, rect.bottom()),
+                ],
                 egui::Stroke::new(3.0, ink),
             );
             if resp.clicked() || resp.drag_started() {
@@ -2137,7 +2144,10 @@ mod tests {
         layout.untuck(left);
         layout.before_ui();
         assert!(layout.tree.is_visible(left));
-        assert_eq!(layout.measured[&left].x, 312.0, "back at the width it left at");
+        assert_eq!(
+            layout.measured[&left].x, 312.0,
+            "back at the width it left at"
+        );
     }
 
     #[test]

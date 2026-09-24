@@ -1357,9 +1357,9 @@ mod tests {
     // ── The hard clamp ───────────────────────────────────────────────────────
     //
     // the maintainer's decision, 2026-08-06, and it reverses the one this tool shipped with:
-    // no gesture may leave an empty corner inside the crop. What was there before —
+    // no gesture may leave an empty corner inside the crop. What was there before was
     // auto-crop on straighten, with a handle free to drag back out and reclaim the
-    // corners — is recorded in `docs/decisions.md` along with why it changed.
+    // corners.
 
     #[test]
     fn no_handle_can_drag_the_crop_into_a_corner_the_rotation_emptied() {

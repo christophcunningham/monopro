@@ -1354,7 +1354,10 @@ impl Viewport {
     /// back. `target_changed` is per target and is captured onto the cell, or the host
     /// re-registers a reallocation on the viewport and a cell draws from a freed
     /// `TextureId`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "device, queue and context are borrowed app state beside the real inputs; a struct would move the count, not the coupling"
+    )]
     pub fn render_into(
         &mut self,
         cell: &mut Cell,
@@ -1648,7 +1651,10 @@ impl Viewport {
     // Device, queue, and context are all borrowed app state rather than
     // parameters in any meaningful sense; bundling them into a struct would move
     // the argument count rather than reduce the coupling.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "device, queue and context are borrowed app state beside the real inputs; a struct would move the count, not the coupling"
+    )]
     pub fn render(
         &mut self,
         ctx: &mut GpuContext,
@@ -1674,7 +1680,10 @@ impl Viewport {
     /// approach of re-deriving it from `params.curve.is_identity()`, which was
     /// the same decision made in a second place and would have gone wrong the
     /// moment a fourth node landed.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "device, queue and context are borrowed app state beside the real inputs; a struct would move the count, not the coupling"
+    )]
     fn run(
         &mut self,
         ctx: &mut GpuContext,
@@ -1705,7 +1714,10 @@ impl Viewport {
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "device, queue and context are borrowed app state beside the real inputs; a struct would move the count, not the coupling"
+    )]
     fn run_inner(
         &mut self,
         ctx: &mut GpuContext,
@@ -2168,7 +2180,10 @@ impl Viewport {
     ///
     /// Blocking GPU readback. The loupe re-renders when its inputs change; do not
     /// call this every frame or assume its latency is independent of the graph.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "device, queue and context are borrowed app state beside the real inputs; a struct would move the count, not the coupling"
+    )]
     pub fn patch(
         &mut self,
         ctx: &mut GpuContext,
@@ -2200,7 +2215,6 @@ impl Viewport {
     }
 
     /// Accumulate final display luminance through a bounded full-frame proxy.
-    #[allow(clippy::too_many_arguments)]
     pub fn begin_histogram(
         &mut self,
         ctx: &mut GpuContext,
@@ -2239,7 +2253,10 @@ impl Viewport {
 
     /// Submit one export-tap region for asynchronous readback. Rendering and the
     /// copy are queued immediately; [`PendingPatch::poll`] never waits for them.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "device, queue and context are borrowed app state beside the real inputs; a struct would move the count, not the coupling"
+    )]
     pub fn begin_patch(
         &mut self,
         ctx: &mut GpuContext,
@@ -2307,7 +2324,10 @@ impl Viewport {
 
     /// Read the scene-referred value out of a retained intermediate, dropping
     /// coverage. Blocking; used by export.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a readback region is its lease, origin and extent; each argument is one of those"
+    )]
     fn read_working(
         &self,
         device: &wgpu::Device,
@@ -2335,7 +2355,10 @@ impl Viewport {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a readback region is its lease, origin and extent; each argument is one of those"
+)]
 fn working_values(
     raw: &[u8],
     padded: u32,

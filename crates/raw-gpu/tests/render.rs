@@ -1780,7 +1780,7 @@ fn the_mask_holds_middle_grey_and_compresses_everything_toward_it() {
     // own local mean and the mask compresses the broad range. That is the
     // operation working, not a brightness bug — but it does mean enabling the
     // mask shifts overall level on any frame whose local means sit away from
-    // 0.18. See docs/decisions.md for why that is still open.
+    // 0.18, and whether it should is still an open question.
     let (device, queue) = gpu!(headless_device());
     let mut ctx = GpuContext::new(&device);
     let luma = flat(0.18, 128, 32);

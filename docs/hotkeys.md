@@ -92,6 +92,7 @@ Letter shortcuts are suppressed while typing into text fields.
 | `Cmd+Shift+V` | Paste Develop settings |
 | `Cmd+Shift+R` | Rename selected file(s) |
 | `Cmd+Shift+P` | Contact Sheet |
+| `Cmd+R` | Refresh folder: pick up files added or removed while it was open |
 | `Cmd+1` | One star |
 | `Cmd+2` | Two stars |
 | `Cmd+3` | Three stars |
@@ -108,8 +109,8 @@ Letter shortcuts are suppressed while typing into text fields.
 | Key | Action |
 |---|---|
 | `Cmd+O` | Open a raw |
-| `Cmd+E` | Export |
-| `Cmd+Shift+E` | Export proof |
+| `Cmd+E` | Export master (16-bit TIFF) |
+| `Cmd+Shift+E` | Export proof (PNG or JPEG) |
 | `Cmd+S` | Save duplicate file |
 | `Cmd+D` | Duplicate this tab |
 | `Cmd+W` | Close tab |

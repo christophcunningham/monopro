@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 # Node graph: executor topology, typed connectors, ROI propagation.
 #
 # No wgpu, deliberately. The ROI arithmetic is the most bug-prone part of the

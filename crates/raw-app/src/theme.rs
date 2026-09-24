@@ -276,7 +276,7 @@ pub fn caption(text: impl Into<String>) -> egui::RichText {
 /// in, and now what every other control's is too.
 ///
 /// This exists because half the rule was already written down and the other half was
-/// not. `docs/decisions.md` says *a label for a control is body; caption is for
+/// not. The written half: *a label for a control is body; caption is for
 /// explanatory prose*, and Composition's Ratio and Guides and Output's Resolution, Size
 /// and Colour space were duly moved off `caption` — onto a bare `ui.label`, which takes
 /// egui's `noninteractive` grey at **180**. A checkbox label takes `inactive` at **200**,
@@ -468,7 +468,8 @@ pub fn reground_ui<R>(
 ) -> R {
     let layer = ui.layer_id();
     let next = |ui: &egui::Ui, or: egui::layers::ShapeIdx| {
-        ui.ctx().graphics(|g| g.get(layer).map_or(or, |l| l.next_idx()))
+        ui.ctx()
+            .graphics(|g| g.get(layer).map_or(or, |l| l.next_idx()))
     };
     let start = next(ui, egui::layers::ShapeIdx(0));
     let out = add(ui);
@@ -497,7 +498,10 @@ pub fn true_colour<R>(ui: &egui::Ui, paint: impl FnOnce() -> R) -> R {
     ui.ctx().data_mut(|d| {
         let list = d.get_temp_mut_or_default::<TrueColour>(egui::Id::new(TRUE_COLOUR));
         if list.pass != pass {
-            *list = TrueColour { pass, ranges: Vec::new() };
+            *list = TrueColour {
+                pass,
+                ranges: Vec::new(),
+            };
         }
         list.ranges.push((layer, start, end));
     });
@@ -1354,7 +1358,10 @@ mod tests {
         // …but a dark tint is a ground: on a light card it goes light and keeps its
         // hue, so ruby text on it stays readable.
         let fill = regrey(230, RUBY_FILL);
-        assert!(fill.r() > 200 && fill.r() > fill.g(), "{fill:?} should be a pale ruby");
+        assert!(
+            fill.r() > 200 && fill.r() > fill.g(),
+            "{fill:?} should be a pale ruby"
+        );
         assert!(regrey(230, RUBY_GROUND).g() > 180);
         // A pale ink goes dark on a light card and keeps its hue; on a dark card it
         // is left alone.
@@ -1374,13 +1381,17 @@ mod tests {
             egui::epaint::RectShape::filled(rect, 0.0, Color32::WHITE).with_texture(tex, uv),
         );
         regrey_shape(Ground::module(230), &mut picture);
-        let egui::Shape::Rect(r) = picture else { unreachable!() };
+        let egui::Shape::Rect(r) = picture else {
+            unreachable!()
+        };
         assert_eq!(r.fill, Color32::WHITE, "a picture's tint is not chrome");
 
         // A plain white rect is chrome and does move.
         let mut chrome = egui::Shape::Rect(egui::epaint::RectShape::filled(rect, 0.0, BRIGHT));
         regrey_shape(Ground::module(230), &mut chrome);
-        let egui::Shape::Rect(r) = chrome else { unreachable!() };
+        let egui::Shape::Rect(r) = chrome else {
+            unreachable!()
+        };
         assert_ne!(r.fill, BRIGHT);
     }
 

@@ -391,6 +391,10 @@ pub struct DisplayParams {
     /// Plain gamma, 2.2 by default. NOT called sRGB: that name imports a whole
     /// colorimetric spec of which only the EOTF is wanted.
     pub gamma: f32,
+    /// Whether the **screen** is dithered. Not an edit: the app sets it from its
+    /// viewer preference on the way to the GPU (`Tab::render_params`), and the sidecar
+    /// does not store it. It used to be a per-image switch that also governed 8-bit
+    /// files; those now take the proof's own dither, so the two are separate choices.
     pub dither: bool,
 }
 
@@ -416,9 +420,7 @@ impl DisplayParams {
 
     pub fn is_modified(&self) -> bool {
         let default = Self::default();
-        self.tone_map != default.tone_map
-            || self.gamma != default.gamma
-            || self.dither != default.dither
+        self.tone_map != default.tone_map || self.gamma != default.gamma
     }
 }
 
@@ -488,7 +490,7 @@ pub struct Params {
     /// It sits beside `grain` rather than up with the tone modules because that is
     /// where it runs — `resample` → `grain` → **sharpen** → encode — and because the
     /// print loupe is what watches both. The output position was chosen over the
-    /// prototype's scene-linear one; `docs/decisions.md` has the argument.
+    /// prototype's scene-linear one; `export::write` has the argument.
     pub sharpen: SharpenParams,
     /// Print resolution, output size and what metadata travels.
     ///
@@ -991,7 +993,6 @@ impl Params {
                     (a.display.enabled != b.display.enabled, "bypass"),
                     (a.display.tone_map != b.display.tone_map, "Tone map"),
                     (a.display.gamma != b.display.gamma, "Monitor gamma"),
-                    (a.display.dither != b.display.dither, "TPDF dither"),
                 ]),
             ));
         }
@@ -1404,7 +1405,7 @@ mod tests {
         // is a row that sends you looking for something that is not there.
         let base = Params::default();
         type Edit = fn(&mut Params);
-        let cases: [(Edit, &str, &str); 9] = [
+        let cases: [(Edit, &str, &str); 8] = [
             (|p| p.exposure.ev = 1.0, "Exposure", "Exposure"),
             (|p| p.exposure.black = 0.05, "Exposure", "Black corr."),
             (|p| p.exposure.enabled = false, "Exposure", "bypass"),
@@ -1414,11 +1415,6 @@ mod tests {
                 "Spacer distance",
             ),
             (|p| p.display.gamma = 1.9, "Display", "Monitor gamma"),
-            (
-                |p| p.display.dither = !p.display.dither,
-                "Display",
-                "TPDF dither",
-            ),
             (|p| p.grain.seed = 7, "Grain", "Seed"),
             (|p| p.grain.size = 9, "Grain", "Crystal size"),
             (

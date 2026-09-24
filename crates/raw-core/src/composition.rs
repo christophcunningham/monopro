@@ -46,8 +46,7 @@
 //! `frame` grows with the straighten angle, so fractions normalised against it mean
 //! something different at every angle: the crop changed size and shape under its own
 //! feet as the slider moved, and the auto-crop fought the growth every frame. Two of
-//! the bugs the maintainer reported in testing were this one defect; `docs/decisions.md` has the
-//! measurements. `oriented` does not move, so a crop's pixel size, aspect and exported
+//! the bugs the maintainer reported in testing were this one defect. `oriented` does not move, so a crop's pixel size, aspect and exported
 //! dimensions do not depend on the angle at all.
 //!
 //! A consequence worth stating: a straightened crop may legitimately sit **outside**

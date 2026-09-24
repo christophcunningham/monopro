@@ -1,0 +1,39 @@
+# cargo-deny, advisories only. Run in `Native CI` as
+#
+#     cargo deny --locked check advisories
+#
+# **Why only advisories.** macOS builds now update themselves through Sparkle, so a
+# dependency with a published vulnerability reaches people's machines without them
+# choosing to install anything. Checking the lockfile against the RustSec database is
+# the cheap half of that insurance. Licence and duplicate-version policy are separate
+# decisions, and are deliberately not switched on here by accident of copying a
+# template.
+#
+# There are no git dependencies to pin: the two patched crates are vendored path
+# dependencies (vendor/sparkle-updater, vendor/egui_tiles), each with a LOCAL-PATCH.md.
+
+[graph]
+# Every shipped target, so a Windows- or Linux-only dependency (windows-sys, the
+# Wayland stack) is checked from a macOS or Linux runner alike.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+# Unmaintained notices fail only for crates this workspace depends on directly: those
+# are the ones a change here can act on. Transitive ones still print as warnings.
+unmaintained = "workspace"
+yanked = "warn"
+# Each accepted advisory is listed with the reason it does not apply, never bare.
+ignore = [
+    # ttf-parser: contact_sheet.rs reads font names and glyph advances with it and
+    # embeds the face in PDF contact sheets. The notice is that it is unmaintained,
+    # not that it is vulnerable, and it has no fixed release. egui's stack pulls it
+    # in on Linux too (winit -> sctk-adwaita -> ab_glyph), so dropping our direct use
+    # would not remove it from the lockfile. Revisit when egui moves off it.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained, not vulnerable; no fixed release, and egui's Linux stack depends on it regardless" },
+]

@@ -53,7 +53,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use objc2_foundation::{NSUserDefaults, NSString};
+use objc2_foundation::{NSString, NSUserDefaults};
 use sparkle_updater::{
     EventCallback, GentleReminders, MainThreadMarker, RelaunchContinuation, RelaunchHandler,
     SkipOutcome, SparkleUpdater, UpdateEvent, UpdaterConfig,
@@ -137,7 +137,10 @@ enum Notice {
     /// A download or verification attempt failed. One line.
     Failed(String),
     /// The user answered one of Sparkle's own dialogs (the manual-check route).
-    Choice { choice: &'static str, version: String },
+    Choice {
+        choice: &'static str,
+        version: String,
+    },
 }
 
 /// The cached found update, so an offline launch still shows the badge and the
@@ -299,11 +302,7 @@ fn write_sparkle_skip(version: Option<&str>) {
             unsafe { defaults.setObject_forKey(Some(&value), &key) };
         }
         None => {
-            for key in [
-                SKIPPED_KEY,
-                SKIPPED_MAJOR_KEY,
-                SKIPPED_MAJOR_SUBRELEASE_KEY,
-            ] {
+            for key in [SKIPPED_KEY, SKIPPED_MAJOR_KEY, SKIPPED_MAJOR_SUBRELEASE_KEY] {
                 defaults.removeObjectForKey(&NSString::from_str(key));
             }
         }
@@ -568,8 +567,7 @@ impl Updates {
                 Notice::StagedForQuit => {
                     self.staged_seen = true;
                     self.stage = Stage::Staged;
-                    self.status =
-                        Some("update staged — it installs when monopro quits".to_owned());
+                    self.status = Some("update staged — it installs when monopro quits".to_owned());
                 }
                 Notice::Installing => {
                     self.staged_seen = true;
@@ -598,8 +596,7 @@ impl Updates {
                         self.notes.clear();
                         self.date = None;
                         Cache::discard();
-                        self.status =
-                            Some(format!("skipping monopro {version}").to_owned());
+                        self.status = Some(format!("skipping monopro {version}").to_owned());
                         note.get_or_insert_with(|| self.status.clone().expect("just set"));
                     }
                 }
@@ -735,8 +732,7 @@ impl Updates {
             .check_for_updates()
         {
             Ok(()) => {
-                self.status =
-                    Some("checking with the update feed…".to_owned());
+                self.status = Some("checking with the update feed…".to_owned());
                 None
             }
             Err(e) => Some(format!("could not check for updates: {e}")),
@@ -861,9 +857,8 @@ impl Updates {
         if self.busy.swap(false, Ordering::Relaxed)
             && let Some(continuation) = self.pending_relaunch.borrow_mut().take()
         {
-            continuation.resume(
-                MainThreadMarker::new().expect("export_settled runs on the main thread"),
-            );
+            continuation
+                .resume(MainThreadMarker::new().expect("export_settled runs on the main thread"));
         }
     }
 }
@@ -1045,7 +1040,10 @@ mod tests {
 
         let badge = updates.badge().expect("a failed update keeps the badge up");
         assert!(badge.failed, "a rejected update reads as {:?}", badge.text);
-        assert!(!updates.restart_now_ready(), "Restart now offered for a rejected update");
+        assert!(
+            !updates.restart_now_ready(),
+            "Restart now offered for a rejected update"
+        );
     }
 
     #[test]
@@ -1060,7 +1058,10 @@ mod tests {
 
         updates.poll(&mut Settings::default());
 
-        assert_eq!(updates.badge().map(|b| b.text), Some("0.2.0 ready".to_owned()));
+        assert_eq!(
+            updates.badge().map(|b| b.text),
+            Some("0.2.0 ready".to_owned())
+        );
         assert!(updates.restart_now_ready());
     }
 

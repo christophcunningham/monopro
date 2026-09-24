@@ -3,7 +3,10 @@
 use crate::hotkeys::Action;
 use crate::layout::Pane;
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the macOS menu's command type, never produced where there is no native menu"
+)]
 #[derive(Clone, Copy, PartialEq)]
 pub enum Command {
     Key(Action),

@@ -30,6 +30,7 @@
 //! The pool being app-level is what made tabs cheap; see
 //! `raw_gpu::pool`.
 
+mod cli;
 mod contact_sheet;
 mod crop;
 mod curve_presets;
@@ -62,6 +63,8 @@ mod updater;
 #[cfg(not(target_os = "macos"))]
 #[path = "updater_stub.rs"]
 mod updater;
+#[cfg(test)]
+mod visual;
 mod widgets;
 
 use std::path::{Path, PathBuf};
@@ -80,55 +83,11 @@ use layout::{Head, HeadClicks, Layout, Pane};
 use tabs::{Image, Render, Tab, TabId, Tabs};
 
 fn main() -> eframe::Result<()> {
-    // Headless export: `raw-app --export <raw> <out.tif|out.png>`. No window, no
-    // dialog. Exists so the export path can be exercised end to end without a GUI —
-    // which is also what makes it usable for batch work.
+    // `monopro render …` and `monopro info …` run here and exit, before a window
+    // or an event loop exists. See `cli`.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == "--export") {
-        if args.len() < 3 {
-            eprintln!(
-                "usage: raw-app --export <raw> <out.tif|out.png> \
-                 [--agx] [--8bit] [--mask <spacer_pct>] [--demosaic <algo>]"
-            );
-            std::process::exit(2);
-        }
-        // `--mask <spacer>` turns Contrast Mask on at its default gamma. Exists so
-        // the module can be judged on real frames, and timed, without a window.
-        // The value is a percentage of the frame diagonal, matching the slider.
-        let mask = args
-            .iter()
-            .position(|a| a == "--mask")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|v| v.parse::<f32>().ok());
-        // `--demosaic <algo>` switches to full-resolution sampling with that
-        // algorithm. The demosaic modes are exactly the ones that have to be
-        // compared at 1:1 on real frames, which is not something a window is good
-        // at doing reproducibly.
-        let algo = args
-            .iter()
-            .position(|a| a == "--demosaic")
-            .and_then(|i| args.get(i + 1))
-            .map(|name| {
-                DemosaicAlgo::UI_ORDER
-                    .into_iter()
-                    .find(|a| a.label().eq_ignore_ascii_case(name))
-                    .unwrap_or_else(|| {
-                        eprintln!(
-                            "unknown demosaic algorithm {name:?}; have {:?}",
-                            DemosaicAlgo::UI_ORDER.map(|a| a.label())
-                        );
-                        std::process::exit(2);
-                    })
-            });
-        headless_export(
-            &args[1],
-            &args[2],
-            args.iter().any(|a| a == "--agx"),
-            args.iter().any(|a| a == "--8bit"),
-            mask,
-            algo,
-        );
-        return Ok(());
+    if let Some(code) = cli::run(&args) {
+        std::process::exit(code);
     }
 
     let options = eframe::NativeOptions {
@@ -179,175 +138,18 @@ fn main() -> eframe::Result<()> {
 fn wgpu_config() -> egui_wgpu::WgpuConfiguration {
     let mut cfg = egui_wgpu::WgpuConfiguration::default();
     if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut cfg.wgpu_setup {
-        setup.device_descriptor = Arc::new(|adapter: &wgpu::Adapter| wgpu::DeviceDescriptor {
-            label: Some("monopro device"),
-            required_limits: raw_gpu::limits(adapter),
-            ..Default::default()
-        });
+        setup.device_descriptor = Arc::new(device_descriptor);
     }
     cfg
 }
 
-/// Run the whole pipeline once and write a file. Same code path as the GUI export,
-/// minus the window.
-fn headless_export(
-    input: &str,
-    output: &str,
-    agx: bool,
-    eight: bool,
-    mask: Option<f32>,
-    algo: Option<DemosaicAlgo>,
-) {
-    let out = std::path::Path::new(output);
-    let target = export::Target {
-        container: match out.extension().and_then(|e| e.to_str()) {
-            Some("png") => export::Container::Png,
-            _ => export::Container::Tiff,
-        },
-        depth: if eight {
-            export::Depth::Eight
-        } else {
-            export::Depth::Sixteen
-        },
-        compression: export::Compression::None,
-        // The headless path writes masters. A proof is a thing you look at, and this
-        // one has nobody looking at it.
-        space: export::Space::Monostar,
-    };
-
-    // Start from the sidecar when there is one, so a batch export renders what was
-    // actually edited rather than defaults. The flags below then override it, which
-    // is what a flag on top of a saved state should do.
-    let mut params = match sidecar::read(std::path::Path::new(input)) {
-        sidecar::Loaded::Ok(s) => {
-            println!(
-                "read {} (schema {})",
-                sidecar::path_for(input.as_ref()).display(),
-                s.schema
-            );
-            s.params
-        }
-        sidecar::Loaded::Corrupt(e) => {
-            // Exporting at defaults from a file the user believes carries their
-            // edits would silently ship the wrong picture.
-            eprintln!("sidecar unreadable, refusing to export at defaults: {e}");
-            std::process::exit(1);
-        }
-        sidecar::Loaded::Absent => Params::default(),
-    };
-    let metadata = sidecar::effective_metadata(std::path::Path::new(input)).unwrap_or_default();
-    if agx {
-        params.display.enabled = true;
-        params.display.tone_map = ToneMap::AGX_DEFAULT;
-    }
-    if let Some(spacer) = mask {
-        params.contrast_mask.enabled = true;
-        params.contrast_mask.spacer = spacer;
-    }
-    if let Some(algo) = algo {
-        params.luminance.sampling = Sampling::Demosaic(algo);
-    }
-    // Headless follows the same bypass resolution as a live tab. In particular,
-    // DISPLAY-off means Clip while retaining the required transfer function.
-    params = params.effective();
-
-    let sensor = match SensorImage::load(std::path::Path::new(input)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("load failed: {e}");
-            std::process::exit(1);
-        }
-    };
-    let (sc, _) = scene::decode(&sensor, params.decode);
-    let luma = scene::derive_luminance(&sc, params.luminance.sampling, params.luminance.weighting);
-    // The composition from the sidecar, over the file's own orientation tag —
-    // exactly what the app resolves, so a headless export is the picture the
-    // viewport showed and not the negative it was cut from.
-    let frame = raw_core::Frame::resolve(
-        luma.output_dims,
-        sensor.meta.orientation,
-        &params.composition,
-    );
-    println!(
-        "{} · {} x {}{}",
-        sc.camera,
-        frame.crop.w,
-        frame.crop.h,
-        if frame.is_uncropped() {
-            String::new()
-        } else {
-            format!(" (cropped from {} x {})", frame.frame.w, frame.frame.h)
-        }
-    );
-
-    let Some((device, queue)) = raw_gpu::headless_device() else {
-        eprintln!("no usable GPU adapter");
-        std::process::exit(1);
-    };
-    let mut ctx = GpuContext::new(&device);
-    let mut vp = Viewport::new(&device, &queue, &luma);
-    let Some((w, h, data)) = vp.export(&mut ctx, &device, &queue, &params, &frame, |d, t| {
-        if t > 1 {
-            println!("  tile {d}/{t}");
-        }
-    }) else {
-        eprintln!("export render failed");
-        std::process::exit(1);
-    };
-
-    // The size, the resolution and the metadata all come from the sidecar's Output
-    // section, so a headless export writes the file the GUI would have written. The
-    // literal `300` that used to sit here is exactly the failure the brief warned
-    // about: three readouts moved with a setting and the file's own tag did not.
-    // The preference, read here as the app reads it. A headless export that ignored it
-    // would put the credit line back on a file someone had deliberately stripped —
-    // and a batch export is exactly where that would go unnoticed.
-    let include = match settings::Settings::load() {
-        sidecar::Loaded::Ok(s) => s.export_metadata,
-        _ => settings::Settings::default().export_metadata,
-    };
-    let mut spec = export::Spec::new(
-        target,
-        params.display.tone_map,
-        params.output,
-        // `effective`, so a bypassed grain does not cost the emulsion it would then
-        // throw away, and a bypassed sharpen does not cost a wavelet decomposition.
-        // Headless is where that would go unnoticed: a batch of forty.
-        export::Tail::of(&params),
-        include.then_some(&metadata),
-    );
-    spec.dither = params.display.dither;
-    let picture = raw_core::geometry::Dims {
-        w: w as usize,
-        h: h as usize,
-    };
-    let image_d = spec.image_dims(picture);
-    if image_d != picture {
-        println!(
-            "  resampling {w}x{h} -> {}x{} ({})",
-            image_d.w,
-            image_d.h,
-            spec.output.scale_note(picture)
-        );
-    }
-    let d = spec.dims(picture);
-    match export::write(out, w, h, &data, &spec) {
-        Ok(()) => println!(
-            "wrote {output} · {} · {}x{} · {:.0} ppi{}",
-            target.label(),
-            d.w,
-            d.h,
-            spec.output.ppi,
-            if spec.metadata.is_some() {
-                " · metadata"
-            } else {
-                ""
-            }
-        ),
-        Err(e) => {
-            eprintln!("write failed: {e}");
-            std::process::exit(1);
-        }
+/// The device the window asks for. Shared with `visual`, whose frames would
+/// otherwise be drawn on a device that cannot hold the working image.
+fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
+        label: Some("monopro device"),
+        required_limits: raw_gpu::limits(adapter),
+        ..Default::default()
     }
 }
 
@@ -427,10 +229,6 @@ struct App {
     /// every route in — the button, the menu, `⌘E` — is inside a borrow of `self`
     /// that exporting needs mutably. See `ExportKind`.
     export_requested: Option<(TabId, ExportKind)>,
-    /// Container and depth. View state, not image state: not undoable and not part
-    /// of the render, so it stays off `Params`. App-level rather than per-tab
-    /// because it is a preference about files, not a property of one image.
-    export_target: export::Target,
     /// Shown when no tab is open.
     status: String,
     /// Where the open dialog last landed. App memory, not a setting — nobody
@@ -593,7 +391,7 @@ struct App {
     /// stored state rather than against the top of the frame, because some of it is
     /// set during construction — before any frame runs — and a frame-local
     /// comparison would never see that change.
-    persisted: (export::Target, Option<PathBuf>),
+    persisted: Option<PathBuf>,
 }
 
 impl Drop for App {
@@ -627,7 +425,6 @@ impl App {
             export_thread: None,
             export_owner: None,
             export_requested: None,
-            export_target: export::Target::default(),
             status: "drop a raw file on the window, or pass one on the command line".to_owned(),
             last_dir: None,
             settings: settings::Settings::default(),
@@ -658,7 +455,7 @@ impl App {
             layout: Layout::restore(cc.storage),
             toggle_panels: false,
             readout: None,
-            persisted: (export::Target::default(), None),
+            persisted: None,
         };
 
         // Preferences. Absent is a first run; corrupt is reported and the app still
@@ -671,7 +468,6 @@ impl App {
                 app.status = format!("settings could not be read, using defaults — {e}");
             }
         }
-        app.export_target.depth = app.settings.export_depth();
 
         let (curve_presets, preset_note) = curve_presets::Store::load();
         app.curve_presets = curve_presets;
@@ -683,29 +479,10 @@ impl App {
         // the default: this is a convenience, and it must never be the reason the
         // app will not start.
         //
-        // **Seeded from what settings just produced, not from `Target::default`.** A
-        // missing key has to fall back to the configured default and not past it —
-        // starting from `default()` here threw away the depth set one line above, so a
-        // user whose Settings said 8-bit got 16 until they had exported once and given
-        // the key something to hold.
+        // The EXPORT module's container, depth and compression used to be remembered
+        // here. A master is now always a 16-bit uncompressed TIFF and a proof's format
+        // is a setting, so those keys are left unread in old stores.
         if let Some(storage) = cc.storage {
-            let mut t = app.export_target;
-            if let Some(v) = storage.get_string(memory_keys::EXPORT_CONTAINER)
-                && let Some(c) = export::Container::from_key(&v)
-            {
-                t.container = c;
-            }
-            if let Some(v) = storage.get_string(memory_keys::EXPORT_DEPTH)
-                && let Some(d) = export::Depth::from_key(&v)
-            {
-                t.depth = d;
-            }
-            if let Some(v) = storage.get_string(memory_keys::EXPORT_COMPRESSION)
-                && let Some(c) = export::Compression::from_key(&v)
-            {
-                t.compression = c;
-            }
-            app.export_target = t;
             app.last_dir = storage
                 .get_string(memory_keys::LAST_DIR)
                 .map(PathBuf::from)
@@ -1161,7 +938,7 @@ impl App {
             <Self as eframe::App>::save(self, storage);
             storage.flush();
         }
-        self.persisted = (self.export_target, self.last_dir.clone());
+        self.persisted = self.last_dir.clone();
     }
 
     fn priority_of(&self, id: TabId) -> u32 {
@@ -1464,7 +1241,7 @@ impl App {
         let settings = self.settings.clone();
         let proof = kind.is_proof().then(|| settings.proof_scale());
         let target = match kind {
-            ExportKind::Master => self.export_target,
+            ExportKind::Master => settings.master_target(),
             ExportKind::Proof => settings.proof_target(),
         };
         let Some(gpu) = &mut self.gpu else { return };
@@ -1545,31 +1322,7 @@ impl App {
         let export_metadata =
             sidecar::effective_metadata(&img.path).unwrap_or_else(|_| tab.metadata.clone());
         let meta = settings.export_metadata.then_some(&export_metadata);
-        let spec = match proof {
-            Some(scale) => export::Spec::proof(
-                target,
-                p.display.tone_map,
-                p.output,
-                export::Tail::of(&p),
-                meta,
-                scale,
-            ),
-            None => export::Spec::new(
-                target,
-                p.display.tone_map,
-                p.output,
-                export::Tail::of(&p),
-                meta,
-            ),
-        };
-        // **The EXPORT module's dither checkbox, which is `display.dither`.** One flag,
-        // one meaning — "break up the 8-bit quantisation" — governing the screen, which
-        // is an 8-bit surface, and every 8-bit file. It is inert at 16 bits either way;
-        // see `Spec::dither`.
-        let spec = export::Spec {
-            dither: p.display.dither,
-            ..spec
-        };
+        let spec = export::Spec::for_params(target, proof, &p, meta, settings.proof_dither);
         // `Spec::dims`, not `output.target_dims`: a proof ignores the master's
         // resample, and asking the spec is the one way the status line and the
         // encoder cannot disagree about the size of the file.
@@ -1864,8 +1617,12 @@ impl App {
         // one writes a `.mono.xmp` that the grid knows nothing about, so the edited rule
         // and the Developed sort were both answering from whenever the folder was last
         // read. See `Lightbox::refresh_edited` — a stat per entry, on a mode switch.
+        //
+        // And re-read the folder in the background: `monopro render`, a second window
+        // or a Finder copy can all have added files while Develop was up.
         if active {
             self.lightbox.refresh_edited();
+            self.lightbox.refresh(false);
         }
         // Compare and the loupe are viewport modes and the viewport is going away.
         // Closed rather than suspended, which is what `k` and the loupe's own key
@@ -2842,9 +2599,6 @@ enum StripAction {
 /// Storage keys for the app's own memory. Window geometry is eframe's and needs no
 /// key here; the tile tree keeps its own keys in `layout`.
 mod memory_keys {
-    pub const EXPORT_CONTAINER: &str = "export.container";
-    pub const EXPORT_DEPTH: &str = "export.depth";
-    pub const EXPORT_COMPRESSION: &str = "export.compression";
     pub const LAST_DIR: &str = "open.last_dir";
     pub const LIGHTBOX_SORT: &str = "lightbox.sort";
     pub const LIGHTBOX_SORT_DESC: &str = "lightbox.sort_desc";
@@ -2942,18 +2696,6 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string(
-            memory_keys::EXPORT_CONTAINER,
-            self.export_target.container.key().into(),
-        );
-        storage.set_string(
-            memory_keys::EXPORT_DEPTH,
-            self.export_target.depth.key().into(),
-        );
-        storage.set_string(
-            memory_keys::EXPORT_COMPRESSION,
-            self.export_target.compression.key().into(),
-        );
         if let Some(d) = &self.last_dir {
             storage.set_string(memory_keys::LAST_DIR, d.to_string_lossy().into_owned());
         }
@@ -2996,13 +2738,23 @@ impl eframe::App for App {
         if let Some(tab) = self.tabs.active_mut() {
             refresh_tab_mapping(tab);
         }
+        // The screen's dither is a Viewer preference, applied on the way to the GPU.
+        // Every tab, so a background tab is right the moment it is shown; the change
+        // reaches the render through `render_params` and the viewport's own diff.
+        for tab in self.tabs.iter_mut() {
+            tab.screen_dither = self.settings.screen_dither;
+        }
+        self.placeholder.screen_dither = self.settings.screen_dither;
         let ctx = ui.ctx().clone();
 
         // A sidecar can appear while the window is in the background. See
         // `window_focused`, and `Lightbox::refresh_edited` for what the stat buys.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        // The folder itself is re-read too, off the main thread and at most every few
+        // seconds — cards copied in from Finder arrive exactly while the window is away.
         if focused && !self.window_focused && self.lightbox.active {
             self.lightbox.refresh_edited();
+            self.lightbox.refresh(false);
         }
         self.window_focused = focused;
 
@@ -3055,7 +2807,11 @@ impl eframe::App for App {
         let modal = self.tabs.active().is_some_and(|t| t.mode.is_paint());
         // **Installed on the first frame**, which is the earliest `NSApp` exists —
         // eframe creates it during startup and offers no callback that says so.
-        if !self.menus_installed {
+        //
+        // Neither this nor the updater below exists in a test build. `visual` draws
+        // frames of this app off the main thread, where AppKit refuses to build a
+        // menu, and a test must never start checking the live update feed.
+        if !cfg!(test) && !self.menus_installed {
             self.menus_installed = true;
             self.menus = menu::Menus::install("monopro");
         }
@@ -3063,7 +2819,7 @@ impl eframe::App for App {
         // the AppKit pieces it drives exist. It runs silent scheduled checks on
         // the stable feed and turns into a badge when it finds something; see
         // `updater`. A failed install is not fatal — the app updates by hand.
-        if self.updates.is_none() {
+        if !cfg!(test) && self.updates.is_none() {
             self.updates = Some(updater::Updates::install(&self.settings, &ctx));
         }
         // Sparkle's events drain once per frame, next to the export worker's.
@@ -3177,7 +2933,7 @@ impl eframe::App for App {
                 hotkeys::Action::CycleTabsBack => self.tabs.step(-1),
                 // Not the same as cycling: this toggles a *pair*, which is what
                 // flicker comparison needs and what walking a strip of three or
-                // more cannot do. See `docs/decisions.md`.
+                // more cannot do.
                 hotkeys::Action::FlickTab => self.tabs.flicker(),
                 // Opens it, and closes it when the main window is the one with
                 // focus. The settings viewport handles its own copy of this key —
@@ -3571,6 +3327,9 @@ impl eframe::App for App {
                 hotkeys::Action::ContactSheet if self.lightbox.active => {
                     self.lightbox.begin_contact_sheet();
                 }
+                hotkeys::Action::RefreshFolder if self.lightbox.active => {
+                    self.lightbox.refresh(true);
+                }
                 // Zoom needs the viewport's anchor, so it is handled where that
                 // exists; see `viewport_panel` — except in Lightbox, where there is
                 // no viewport and the same pair sizes the tiles instead. One
@@ -3622,8 +3381,7 @@ impl eframe::App for App {
                     .as_ref()
                     .and_then(|updates| updates.badge())
                     .filter(|b| {
-                        self.update_badge_dismissed.as_ref()
-                            != Some(&(b.text.clone(), b.failed))
+                        self.update_badge_dismissed.as_ref() != Some(&(b.text.clone(), b.failed))
                     })
                     .map(|b| widgets::UpdateBadge {
                         text: b.text,
@@ -3639,8 +3397,7 @@ impl eframe::App for App {
                     widgets::BadgeClick::None => {}
                     widgets::BadgeClick::Open => self.update_sheet_open = true,
                     widgets::BadgeClick::Dismiss => {
-                        self.update_badge_dismissed =
-                            badge.map(|b| (b.text, b.failed));
+                        self.update_badge_dismissed = badge.map(|b| (b.text, b.failed));
                     }
                 }
             });
@@ -4314,9 +4071,7 @@ impl eframe::App for App {
         // fires on a drag, a resize or a tab click, which is every way the tree can
         // move, and it is cheaper and more honest than cloning a tree each frame to
         // diff it.
-        if (self.export_target, self.last_dir.clone()) != self.persisted
-            || std::mem::take(&mut self.layout.dirty)
-        {
+        if self.last_dir != self.persisted || std::mem::take(&mut self.layout.dirty) {
             self.persist(frame);
         }
     }
@@ -4755,86 +4510,86 @@ impl App {
         // Built on `CHROME` like a module and re-greyed like one, so it follows the
         // module value rather than staying dark under a light stack.
         theme::module_ground_ui(ui, |ui| {
-        egui::containers::panel::Panel::bottom("db-add")
-            .frame(
-                egui::Frame::NONE
-                    .fill(theme::CHROME)
-                    .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 10,
-                        top: 8,
-                        bottom: 10,
-                    }),
-            )
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                theme::rule(ui, theme::DIM.gamma_multiply(0.5));
-                ui.add_space(8.0);
+            egui::containers::panel::Panel::bottom("db-add")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::CHROME)
+                        .inner_margin(egui::Margin {
+                            left: 10,
+                            right: 10,
+                            top: 8,
+                            bottom: 10,
+                        }),
+                )
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    theme::rule(ui, theme::DIM.gamma_multiply(0.5));
+                    ui.add_space(8.0);
 
-                // **The two verbs first, as one wide filled pair.** the maintainer's mockup,
-                // and the change from the previous arrangement is that they are now
-                // unmistakably the *action* — everything below them describes what
-                // the action will make. Before, the verbs sat inline with the shape
-                // brackets and read as four peers of which two happened to commit.
-                //
-                // Equal widths, computed rather than measured: see `theme::wide_button`.
-                let gap = 8.0;
-                let w = ((ui.available_width() - gap) * 0.5).max(40.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    for (sign, label) in [
-                        (raw_core::Sign::Dodge, "+ DODGE"),
-                        (raw_core::Sign::Burn, "+ BURN"),
-                    ] {
-                        let dodge = sign == raw_core::Sign::Dodge;
-                        // **The text is the layer hue itself**, not a second saturated
-                        // pair. the maintainer's grounds are darker than his inks, so the button
-                        // can be set in the same `DODGE`/`BURN` a layer's kind is
-                        // written in — the button and the rows it makes now agree.
-                        let fill = if dodge {
-                            theme::DODGE_FILL
-                        } else {
-                            theme::BURN_FILL
-                        };
-                        let text = if dodge { theme::DODGE } else { theme::BURN };
-                        if theme::wide_button(ui, label, fill, text, w, !full)
-                            .on_hover_text(theme::tip(if full {
-                                "eight layers is the limit"
+                    // **The two verbs first, as one wide filled pair.** the maintainer's mockup,
+                    // and the change from the previous arrangement is that they are now
+                    // unmistakably the *action* — everything below them describes what
+                    // the action will make. Before, the verbs sat inline with the shape
+                    // brackets and read as four peers of which two happened to commit.
+                    //
+                    // Equal widths, computed rather than measured: see `theme::wide_button`.
+                    let gap = 8.0;
+                    let w = ((ui.available_width() - gap) * 0.5).max(40.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for (sign, label) in [
+                            (raw_core::Sign::Dodge, "+ DODGE"),
+                            (raw_core::Sign::Burn, "+ BURN"),
+                        ] {
+                            let dodge = sign == raw_core::Sign::Dodge;
+                            // **The text is the layer hue itself**, not a second saturated
+                            // pair. the maintainer's grounds are darker than his inks, so the button
+                            // can be set in the same `DODGE`/`BURN` a layer's kind is
+                            // written in — the button and the rows it makes now agree.
+                            let fill = if dodge {
+                                theme::DODGE_FILL
                             } else {
-                                "make a layer of the shape selected below"
-                            }))
-                            .clicked()
-                        {
-                            create = Some(sign);
+                                theme::BURN_FILL
+                            };
+                            let text = if dodge { theme::DODGE } else { theme::BURN };
+                            if theme::wide_button(ui, label, fill, text, w, !full)
+                                .on_hover_text(theme::tip(if full {
+                                    "eight layers is the limit"
+                                } else {
+                                    "make a layer of the shape selected below"
+                                }))
+                                .clicked()
+                            {
+                                create = Some(sign);
+                            }
                         }
-                    }
-                });
+                    });
 
-                ui.add_space(10.0);
-                // **One row of four shapes**, not a tool row with a nib row under it.
-                // See `paint::Pick` for why the two collapsed into one.
-                ui.horizontal(|ui| {
-                    theme::tracked(ui, "SHAPE", theme::DIM);
-                    ui.label(theme::caption(">"));
-                    ui.add_space(4.0);
-                    let current = paint::Pick::of(tool, brush.nib);
-                    for p in paint::Pick::ALL {
-                        if theme::bracket(ui, p.label(), current == p, theme::size::CAPTION)
-                            .on_hover_text(theme::tip(p.tooltip()))
-                            .clicked()
-                        {
-                            pick_shape = Some(p);
+                    ui.add_space(10.0);
+                    // **One row of four shapes**, not a tool row with a nib row under it.
+                    // See `paint::Pick` for why the two collapsed into one.
+                    ui.horizontal(|ui| {
+                        theme::tracked(ui, "SHAPE", theme::DIM);
+                        ui.label(theme::caption(">"));
+                        ui.add_space(4.0);
+                        let current = paint::Pick::of(tool, brush.nib);
+                        for p in paint::Pick::ALL {
+                            if theme::bracket(ui, p.label(), current == p, theme::size::CAPTION)
+                                .on_hover_text(theme::tip(p.tooltip()))
+                                .clicked()
+                            {
+                                pick_shape = Some(p);
+                            }
                         }
-                    }
+                    });
+                    ui.add_space(2.0);
+                    // **Nothing else lives here.** the maintainer's rule: the bench makes a layer
+                    // and the layer holds its own options, which is how Radial already
+                    // worked and is now how all four do. A shape's settings sitting under
+                    // the button that creates it meant the controls for the thing you were
+                    // editing were nowhere near it — the same complaint that moved the
+                    // tonal range inside the layer rows in the first place.
                 });
-                ui.add_space(2.0);
-                // **Nothing else lives here.** the maintainer's rule: the bench makes a layer
-                // and the layer holds its own options, which is how Radial already
-                // worked and is now how all four do. A shape's settings sitting under
-                // the button that creates it meant the controls for the thing you were
-                // editing were nowhere near it — the same complaint that moved the
-                // tonal range inside the layer rows in the first place.
-            });
         });
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -5007,7 +4762,10 @@ impl App {
     /// It does not need to know whether it is the selected one — the red rules and
     /// the expansion are drawn by the caller, which is what keeps them wrapped
     /// around the whole block rather than around the row.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a layer row reads the tab and reports three separate outcomes to its caller"
+    )]
     fn layer_row(
         ui: &mut egui::Ui,
         tab: &mut tabs::Tab,
@@ -5184,7 +4942,6 @@ impl App {
     }
 
     /// What a selected layer expands to show: its shape, then its tonal range.
-    #[allow(clippy::too_many_arguments)]
     fn layer_options(
         ui: &mut egui::Ui,
         tab: &mut tabs::Tab,
@@ -5692,7 +5449,7 @@ impl App {
     /// **Built from the primitives and adding none.** The row is the Dodge & Burn layer
     /// row's shape — a thumbnail where the dot is, the name, then the controls right —
     /// because a list of named things you pick from is a solved problem in this app and
-    /// a second answer to it would be the drift `docs/decisions.md` was written to stop.
+    /// a second answer to it would be drift.
     ///
     /// # Restore is a button, and that is a departure from the prototype
     ///
@@ -5955,7 +5712,7 @@ impl App {
     /// borrow of `self`.
     fn info_env(&self) -> InfoEnv {
         InfoEnv {
-            depth: self.persisted.0.depth,
+            depth: export::Depth::Sixteen,
             sample: self.settings.sample_area(),
             proof: self.settings.proof_target(),
             proof_scale: self.settings.proof_scale(),
@@ -6290,9 +6047,24 @@ impl App {
                 && t.output_dims()
                     .is_none_or(|d| export_layout(&t.params, d, None).is_ok())
         }) && self.export_rx.is_none();
+        // A proof is checked against the limits at its own scale: FRAME margins are
+        // physical, so even a quarter-size proof can outgrow them.
+        let proof_scale = self.settings.proof_scale();
+        let can_proof = self.tabs.active().is_some_and(|t| {
+            t.has_image()
+                && t.output_dims()
+                    .is_none_or(|d| export_layout(&t.params, d, Some(proof_scale)).is_ok())
+        }) && self.export_rx.is_none();
         let exporting = self.export_rx.is_some();
-        let export_target = &mut self.export_target;
-        let mut export_requested = false;
+        // **Preferences edited in the panel.** The master's colour space (OUTPUT's
+        // picker) and everything about a proof (EXPORT) are settings, not image state:
+        // read out here, edited as copies while the tab is borrowed, and written back
+        // after the panel if they moved — the same arrangement as `unit` below.
+        let mut master_space = self.settings.master_space();
+        let master_space_before = master_space;
+        let mut proof = self.settings.proof_prefs();
+        let proof_before = proof;
+        let mut export_requested: Option<ExportKind> = None;
         let mut save_duplicate = false;
         // Composition's two buttons act on the tab, which this function has borrowed
         // mutably for its whole body — the same reason `export_requested` is a flag
@@ -6322,11 +6094,6 @@ impl App {
         // borrow, the same way the composition buttons are.
         let unit = self.settings.print_unit();
         let settings_ppi = self.settings.print_ppi;
-        // Read here with `settings_ppi`, before the panel body borrows what it needs.
-        // See `space_defaults` below, which is where these are used.
-        let settings_space_tiff = self.settings.space_for(export::Container::Tiff);
-        let settings_space_png = self.settings.space_for(export::Container::Png);
-        let settings_space_jpeg = self.settings.space_for(export::Container::Jpeg);
         let mut new_unit: Option<Unit> = None;
 
         // **With nothing open the panel still draws its modules, disabled.** It used
@@ -7364,8 +7131,8 @@ impl App {
         // print size. That is the module working rather than a unit nobody converted,
         // and it is what the caption has to say.
         //
-        // Three controls, where the prototype has six plus a mode pill. What was cut
-        // and why is in `docs/decisions.md`; the short of it is that its own presets
+        // Three controls, where the prototype has six plus a mode pill. What was cut, in
+        // short: its own presets
         // never moved the radius and its band equaliser reaches scales that are local
         // contrast rather than output sharpening.
         // The same snapshot Grain takes, and for the same reason. See `widgets::arm`.
@@ -7920,22 +7687,6 @@ impl App {
         let tail = export::Tail::of(&tab.params);
         let toned = tail.toning.is_active();
         let output_needs_colour = toned || tail.frame.needs_colour();
-        // The per-container space defaults, read out before the panel body takes the
-        // borrows it needs — `settings_ppi` above is bound for the same reason. An array
-        // rather than three names, because the only question asked of it is "what does
-        // this container open at".
-        let space_defaults: [(export::Container, export::Space); 3] = [
-            (export::Container::Tiff, settings_space_tiff),
-            (export::Container::Png, settings_space_png),
-            (export::Container::Jpeg, settings_space_jpeg),
-        ];
-        let settings_space_for = |c: export::Container| {
-            space_defaults
-                .iter()
-                .find(|(k, _)| *k == c)
-                .map(|(_, v)| *v)
-                .unwrap_or_default()
-        };
         let picture = tab.output_dims();
         let out_modified = !tab.params.output.is_default();
         let output = widgets::Module::new("OUTPUT")
@@ -8093,24 +7844,24 @@ impl App {
                 // numbers. The line underneath says so when the two differ, rather than
                 // leaving the picker looking overruled for no stated reason.
                 ui.add_space(4.0);
-                let written = export_target.written_space(output_needs_colour);
+                // The master's colour space: a preference, and the one choice a master
+                // has. Also in Settings → Export; both edit the same value.
+                let master = export::Target::master(master_space);
+                let written = master.written_space(output_needs_colour);
                 ui.horizontal(|ui| {
                     ui.label(theme::label("Color space"));
                     egui::ComboBox::from_id_salt("output-space")
                         .width(190.0)
-                        .selected_text(export_target.space.label())
+                        .selected_text(master_space.label())
                         .show_ui(ui, |ui| {
                             for k in export::Space::UI_ORDER {
-                                if ui
-                                    .selectable_label(export_target.space == k, k.label())
-                                    .clicked()
-                                {
-                                    export_target.space = k;
+                                if ui.selectable_label(master_space == k, k.label()).clicked() {
+                                    master_space = k;
                                 }
                             }
                         });
                 });
-                if written != export_target.space {
+                if written != master.space {
                     let reason = if toned {
                         "toning carries chroma"
                     } else {
@@ -8608,114 +8359,6 @@ impl App {
         widgets::Plain::new("EXPORT")
             .open_on_start(false)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("container")
-                        .width(150.0)
-                        .selected_text(export_target.container.label())
-                        .show_ui(ui, |ui| {
-                            for c in export::Container::UI_ORDER {
-                                if ui
-                                    .selectable_label(export_target.container == c, c.label())
-                                    .clicked()
-                                {
-                                    // **Changing the container reseeds the space from that
-                                    // container's setting.** This is what makes the three
-                                    // settings keys mean anything: a TIFF default of
-                                    // eciRGB v2 and a PNG default of monostar are two
-                                    // answers to "what is this file for", and switching the
-                                    // container is switching the errand.
-                                    //
-                                    // It does overwrite a space chosen by hand for the
-                                    // previous container, which is the right way round —
-                                    // the alternative is a picker that silently keeps a
-                                    // space the new container was never meant to carry.
-                                    export_target.container = c;
-                                    export_target.space = settings_space_for(c);
-                                    // JPEG cannot hold 16 bits, so switching to it from a
-                                    // 16-bit TIFF has to leave a legal target rather than
-                                    // one the writer reinterprets. `Container::depths` is
-                                    // where the rule lives; `settle` is it being applied.
-                                    export_target.settle();
-                                }
-                            }
-                        });
-                    egui::ComboBox::from_id_salt("depth")
-                        .width(80.0)
-                        .selected_text(export_target.depth.label())
-                        .show_ui(ui, |ui| {
-                            for d in export::Depth::UI_ORDER {
-                                // Greyed rather than hidden, so the list does not change
-                                // length under the pointer and 16-bit's absence on a JPEG
-                                // reads as a fact about JPEG rather than as a missing row.
-                                let ok = export_target.container.supports(d);
-                                let hit = ui
-                                    .add_enabled_ui(ok, |ui| {
-                                        ui.selectable_label(export_target.depth == d, d.label())
-                                    })
-                                    .inner;
-                                if hit.clicked() {
-                                    export_target.depth = d;
-                                }
-                            }
-                        });
-                });
-                if export_target.container == export::Container::Jpeg {
-                    ui.label(theme::caption(export::Container::Jpeg.proof_note()));
-                }
-
-                // PNG has no uncompressed mode, so the control would be a lie there.
-                if export_target.container == export::Container::Tiff {
-                    egui::ComboBox::from_id_salt("compression")
-                        .width(150.0)
-                        .selected_text(export_target.compression.label())
-                        .show_ui(ui, |ui| {
-                            for c in export::Compression::UI_ORDER {
-                                if ui
-                                    .selectable_label(export_target.compression == c, c.label())
-                                    .clicked()
-                                {
-                                    export_target.compression = c;
-                                }
-                            }
-                        })
-                        .response
-                        .on_hover_text(theme::tip(
-                            "Both are lossless — deflate is the same coding as ZIP. \
-                         Uncompressed is larger, and what fussy print RIPs and older \
-                         software expect.",
-                        ));
-                }
-                // **TPDF dither, moved here from DISPLAY.** the maintainer asked for it in this
-                // module, and it belongs: what it protects is an 8-bit file, and 8-bit is a
-                // choice made two rows above. One flag with one meaning — break up the
-                // quantisation — governing the screen, which is an 8-bit surface, and every
-                // 8-bit file this app writes.
-                //
-                // Disabled at 16 bits rather than hidden, because "does this master have
-                // dither in it" is a question worth being able to answer by looking. The
-                // rule is structural on that side — `samples16` has no dither to switch off
-                // — so the control is reporting a fact rather than being greyed by policy.
-                // **The "why" is on hover, not on the page.** the maintainer's, and the rule it
-                // settles is one this panel needs: a caption earns its line by saying
-                // something you have to know *before* you touch the control. This one
-                // explains a control that is already visibly greyed — the state is on
-                // screen, only the reason is missing, and a reason is what a tooltip is
-                // for. Three lines of standing text under a checkbox that is off is the
-                // panel talking when nobody asked.
-                let dithers = export_target.depth == export::Depth::Eight;
-                ui.add_enabled_ui(dithers, |ui| {
-                    ui.checkbox(&mut tab.params.display.dither, theme::label("TPDF dither"))
-                        .on_hover_text(theme::tip(if dithers {
-                            "About one level of noise before quantizing, so a smooth gradient \
-                         breaks into texture instead of steps. Every 8-bit file, and the \
-                         screen."
-                        } else {
-                            "8-bit only. A 16-bit step is already below the visual threshold, \
-                         so this would add noise and nothing else. Still governs the \
-                         screen and every proof."
-                        }));
-                });
-
                 // Only a scratch duplicate has anything to save: every other tab already
                 // writes its sidecar on each settled gesture.
                 if tab.scratch {
@@ -8734,30 +8377,139 @@ impl App {
                     ui.add_space(8.0);
                 }
 
-                // **The panel's primary action, in the panel's primary form.** the maintainer's
-                // ask, and it is the same argument `theme::wide_button` already makes for
-                // `+ DODGE` and for SNAPSHOT: a fill is how the thing a module exists to
-                // reach says so. Export is the end of the pipeline the whole column
-                // describes, and it had been sitting there as an ordinary outlined button
-                // — indistinguishable from "Save duplicate…" above it, which is a
-                // housekeeping action.
+                // **The master has no choices here.** It is the archival file: a 16-bit
+                // uncompressed TIFF at OUTPUT's print size, in the colour space OUTPUT
+                // shows. The maintainer's rule — a master is a TIFF, and a TIFF is 16-bit —
+                // so the dropdowns that used to sit above this button, and the dither
+                // switch that made it look as if a TIFF could be dithered, are gone.
                 //
-                // `RUBY_FILL`, not `RUBY_FILL_DIM`: the dim one is for the second of a
-                // pair, and this button has no pair. Export Proof, which does, keeps it.
+                // `RUBY_FILL` for the primary action, `RUBY_FILL_DIM` for the second of
+                // the pair — the same pairing as the Info panel's two buttons.
                 let w = ui.available_width();
-                if theme::wide_button(ui, "Export…", theme::RUBY_FILL, theme::RUBY, w, can_export)
-                    .on_hover_text(theme::tip(
-                        "Full resolution grayscale, L*-encoded and tagged monostar.icc. \
-                     8-bit is dithered; 16-bit is not.  ⌘E",
-                    ))
-                    .clicked()
+                if theme::wide_button(
+                    ui,
+                    "Export Master",
+                    theme::RUBY_FILL,
+                    theme::RUBY,
+                    w,
+                    can_export,
+                )
+                .on_hover_text(theme::tip(
+                    "16-bit uncompressed TIFF at the print size, in the master color \
+                     space. Never dithered.  ⌘E",
+                ))
+                .clicked()
                 {
-                    export_requested = true;
+                    export_requested = Some(ExportKind::Master);
                 }
-                // Under the button rather than beside it. A full-width button has no
-                // "beside", and the spinner only ever appears while the button is
-                // disabled — `can_export` is false for the whole of an export — so the
-                // two never compete for the same row anyway.
+
+                // **A proof is anything that is not the archival file**, at any size.
+                // Its preferences live here and only here — they used to be a Settings
+                // page, which put the choice a screen away from the button it governs.
+                // They are still preferences, not image state: the next proof of any
+                // photograph is written the same way.
+                ui.add_space(10.0);
+                theme::section(ui, "PROOF");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("proof-format")
+                        .width(96.0)
+                        .selected_text(proof.target.container.label())
+                        .show_ui(ui, |ui| {
+                            for c in export::Container::PROOF_ORDER {
+                                // The trade each format makes, where the choice is made.
+                                if ui
+                                    .selectable_label(proof.target.container == c, c.label())
+                                    .on_hover_text(theme::tip(c.proof_note()))
+                                    .clicked()
+                                {
+                                    proof.target.container = c;
+                                    // JPEG cannot hold 16 bits; `Container::depths` is
+                                    // where that rule lives and `settle` applies it.
+                                    proof.target.settle();
+                                }
+                            }
+                        });
+                    egui::ComboBox::from_id_salt("proof-depth")
+                        .width(80.0)
+                        .selected_text(proof.target.depth.label())
+                        .show_ui(ui, |ui| {
+                            for d in export::Depth::UI_ORDER {
+                                // Greyed rather than hidden, so 16-bit's absence on a
+                                // JPEG reads as a fact about JPEG.
+                                let ok = proof.target.container.supports(d);
+                                let hit = ui
+                                    .add_enabled_ui(ok, |ui| {
+                                        ui.selectable_label(proof.target.depth == d, d.label())
+                                    })
+                                    .inner;
+                                if hit.clicked() {
+                                    proof.target.depth = d;
+                                }
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("proof-space")
+                        .width(150.0)
+                        .selected_text(proof.target.space.label())
+                        .show_ui(ui, |ui| {
+                            for k in export::Space::PROOF_ORDER {
+                                if ui
+                                    .selectable_label(proof.target.space == k, k.label())
+                                    .clicked()
+                                {
+                                    proof.target.space = k;
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(theme::tip(
+                            "sRGB is safest for screens nobody has profiled.",
+                        ));
+                    egui::ComboBox::from_id_salt("proof-scale")
+                        .width(96.0)
+                        .selected_text(proof.scale.label())
+                        .show_ui(ui, |ui| {
+                            for k in export::ProofScale::UI_ORDER {
+                                if ui.selectable_label(proof.scale == k, k.label()).clicked() {
+                                    proof.scale = k;
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(theme::tip(
+                            "A fraction of the source image. Full is full resolution.",
+                        ));
+                });
+                // **Dither lives with the proof, and only at 8 bits** — the maintainer's
+                // call. Beside the master button it read as if a TIFF could be
+                // dithered; a master never is, and a 16-bit proof would gain nothing
+                // from it. Hidden rather than greyed at 16 bits, because there is no
+                // 16-bit file this could ever describe. The screen's own dither is a
+                // Viewer setting and is unaffected.
+                if proof.target.depth == export::Depth::Eight {
+                    ui.checkbox(&mut proof.dither, theme::label("TPDF dither"))
+                        .on_hover_text(theme::tip(
+                            "About one level of noise before quantizing, so a smooth gradient \
+                         breaks into texture instead of steps.",
+                        ));
+                }
+                if theme::wide_button(
+                    ui,
+                    "Export Proof",
+                    theme::RUBY_FILL_DIM,
+                    theme::RUBY,
+                    w,
+                    can_proof,
+                )
+                .on_hover_text(theme::tip("⌘⇧E"))
+                .clicked()
+                {
+                    export_requested = Some(ExportKind::Proof);
+                }
+
+                // Under the buttons rather than beside them: a full-width button has no
+                // "beside", and the spinner only appears while both are disabled.
                 if exporting {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -8765,13 +8517,9 @@ impl App {
                         ui.label(theme::caption("exporting…"));
                     });
                 }
-                // **No summary line under the button.** It said what export would write —
-                // pixels, print size, ppi, space — and every one of those numbers is
-                // already on the page: pixels and print size in OUTPUT directly above,
-                // ppi in OUTPUT's own field, the space in OUTPUT's picker, and the whole
-                // set again in the footer. the maintainer called it redundant and it was; a caption
-                // that repeats the four controls it sits under is not a summary, it is the
-                // panel reading itself back.
+                // **No summary line under the buttons.** Pixels, print size, ppi and the
+                // master's space are all in OUTPUT directly above; a caption repeating
+                // them is the panel reading itself back.
             });
 
         // Same rule as the settings menu: written when something moves, and a failure
@@ -8782,8 +8530,15 @@ impl App {
                 self.status = format!("could not write settings: {e}");
             }
         }
-        if export_requested {
-            self.export_requested = self.tabs.active_id().map(|id| (id, ExportKind::Master));
+        if master_space != master_space_before || proof != proof_before {
+            self.settings.set_master_space(master_space);
+            self.settings.set_proof_prefs(proof);
+            if let Err(e) = self.settings.save() {
+                self.status = format!("could not write settings: {e}");
+            }
+        }
+        if let Some(kind) = export_requested {
+            self.export_requested = self.tabs.active_id().map(|id| (id, kind));
         }
         if let Some(clockwise) = rotate
             && let Some(t) = self.tabs.active_mut()
@@ -9627,7 +9382,10 @@ impl App {
 
     /// One-shot Curve point sampler. Its cursor is Triopro's white-point cursor:
     /// crosshair for the exact sampled pixel, eyedropper for the operation.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn curve_point_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -9722,7 +9480,10 @@ impl App {
     /// Screen → frame → source going in, source → frame → screen coming out. Pins are
     /// stored against the **negative** — see [`tabs::Pin`] — so every read and write
     /// crosses `Frame`, and a pin stays on its subject through a rotation or a crop.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn pin_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -10021,7 +9782,10 @@ impl App {
     /// in and the space `Viewport::patch` takes. Screen → frame is one line and its
     /// inverse is one line; there is no source-space step here, unlike the brush,
     /// because the loupe samples the *composed* picture rather than the negative.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn print_loupe(
         &mut self,
         ui: &mut egui::Ui,
@@ -10192,7 +9956,10 @@ impl App {
     /// own density like the crop handles — chrome, not pixels. It is the only thing
     /// that says what radius the brush currently is, and it is why `[` and `]` need
     /// no readout to be usable.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn paint_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -10507,7 +10274,10 @@ impl App {
     /// chrome, not pixels, the same way the curve editor's control points are. That
     /// is also what keeps them crisp: they are painted in points at the window's own
     /// density rather than resampled with the picture.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn crop_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -10714,7 +10484,10 @@ impl App {
     /// Manual perspective guides. Their four points are authored in the oriented
     /// photograph and drawn over that unwarped photograph while the tool is open;
     /// leaving the tool applies the correction in one step.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
     fn keystone_tool(
         &mut self,
         ui: &mut egui::Ui,
@@ -11174,7 +10947,11 @@ fn sample_rgb(
 /// the proof's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportKind {
+    /// The archival file: a 16-bit uncompressed TIFF at the print size, in the master
+    /// color space. See `export::Target::master`.
     Master,
+    /// Anything else: a PNG or JPEG at full size or a fraction of it, set in the
+    /// EXPORT module. The format is what says it is not the archival file.
     Proof,
 }
 
@@ -11201,7 +10978,7 @@ struct InfoClicks {
 /// immutably and losing the pin state.
 #[derive(Clone, Copy)]
 struct InfoEnv {
-    /// The depth the Inspector's values will be written at, from the export target.
+    /// The depth the Inspector's values will be written at: a master's, always 16.
     depth: export::Depth,
     /// How wide a window the readout averages. See [`settings::SampleArea`].
     sample: settings::SampleArea,
@@ -11307,7 +11084,7 @@ fn pipeline_section(tab: &Tab, ui: &mut egui::Ui, env: InfoEnv) {
         // larger than the `CAPTURE` / `SCREEN` / `PRINT` markers heading them — the
         // block read as three tiny labels interrupting a column of body text rather
         // than as three stanzas. the maintainer called it; one size for the whole panel is also
-        // the rule the rest of the app follows. See `docs/decisions.md`.
+        // the rule the rest of the app follows.
         let line = |ui: &mut egui::Ui, v: String| {
             ui.label(theme::readout(v).size(theme::size::CAPTION));
         };
@@ -11475,7 +11252,7 @@ fn export_section(tab: &Tab, ui: &mut egui::Ui, env: InfoEnv) -> InfoClicks {
                 ui.add_space(PAD);
                 clicks.export |= theme::wide_button(
                     ui,
-                    &format!("Export {} TIFF", env.depth.label()),
+                    "Export Master",
                     theme::RUBY_FILL,
                     theme::RUBY,
                     w,
@@ -11484,7 +11261,7 @@ fn export_section(tab: &Tab, ui: &mut egui::Ui, env: InfoEnv) -> InfoClicks {
                 .on_hover_text(theme::tip(if env.exporting {
                     "an export is already being written"
                 } else {
-                    "Full resolution grayscale, L*-encoded and tagged monostar.icc.  ⌘E"
+                    "16-bit uncompressed TIFF at the print size, in the master color space.  ⌘E"
                 }))
                 .clicked();
             });
@@ -11503,7 +11280,7 @@ fn export_section(tab: &Tab, ui: &mut egui::Ui, env: InfoEnv) -> InfoClicks {
                     ready,
                 )
                 .on_hover_text(theme::tip(format!(
-                    "{} · {} · {}. Set in Settings → Export.  ⌘⇧E",
+                    "{} · {} · {}. Set in the EXPORT module.  ⌘⇧E",
                     env.proof.container.label(),
                     env.proof_scale.label(),
                     env.proof.space.label(),
@@ -11516,16 +11293,22 @@ fn export_section(tab: &Tab, ui: &mut egui::Ui, env: InfoEnv) -> InfoClicks {
                 // The reset face at panel width. `theme::reset_button` cannot do this
                 // — it sizes to its text — so it is `wide_button` with a grey ground,
                 // which keeps the third button in the same primitive as the two above.
-                clicks.settings |=
-                    theme::wide_button(ui, "Settings", theme::CHROME, theme::DIM, w, true)
-                        // **`,` on its own, not `⌘,`.** The binding is a bare comma — see
-                        // `hotkeys::TABLE` — and it is the one key the table refuses to let
-                        // you disable, because it is the way back into the window that
-                        // disables things.
-                        .on_hover_text(theme::tip(
-                            "Export defaults, output folder and print resolution.  ,",
-                        ))
-                        .clicked();
+                clicks.settings |= theme::wide_button(
+                    ui,
+                    "Settings",
+                    theme::CHROME,
+                    theme::DIM,
+                    w,
+                    true,
+                )
+                // **`,` on its own, not `⌘,`.** The binding is a bare comma — see
+                // `hotkeys::TABLE` — and it is the one key the table refuses to let
+                // you disable, because it is the way back into the window that
+                // disables things.
+                .on_hover_text(theme::tip(
+                    "File naming, output folder, print resolution and master color space.  ,",
+                ))
+                .clicked();
             });
         });
     });
@@ -11712,7 +11495,7 @@ fn inspector_section(tab: &mut Tab, ui: &mut egui::Ui, env: InfoEnv, icons: &ico
                             // row and the tab strip both draw this exact control — a
                             // 14pt square that fills grey on hover and paints the
                             // `close` icon — and a third `×` in a third face would be
-                            // the drift `docs/decisions.md` exists to stop.
+                            // drift.
                             let (close_rect, close) = ui
                                 .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                             let hot = close.hovered();
@@ -12416,10 +12199,7 @@ impl App {
         // sidecar write needs no gate here: it is synchronous, settled before the
         // sheet can be interacted with. See `guard_quit` for the quit-time pair.
         let busy = self.export_rx.is_some() || self.confirm_quit.is_some();
-        let restart_ready = self
-            .updates
-            .as_ref()
-            .is_some_and(|u| u.restart_now_ready());
+        let restart_ready = self.updates.as_ref().is_some_and(|u| u.restart_now_ready());
         let skipped = updater::Updates::skipped_version(&self.settings).map(str::to_owned);
 
         let mut close = false;
@@ -12494,9 +12274,7 @@ impl App {
                     });
                 });
             }
-            if !skip_warning
-                && let Some(v) = &skipped
-            {
+            if !skip_warning && let Some(v) = &skipped {
                 ui.add_space(4.0);
                 ui.label(theme::caption(format!("skipping monopro {v}")));
             }
@@ -12802,13 +12580,13 @@ impl App {
                 // no row can be comparing against something slightly different.
                 let d = settings::Settings::default();
 
-                if sheet.shows(ui, settings::Section::Export, "FILE NAMING tiff png suffix filename stem name") {
+                if sheet.shows(ui, settings::Section::Export, "FILE NAMING master proof tiff png jpeg suffix filename stem name") {
                     settings::heading(ui, "FILE NAMING");
                     settings::rule(ui);
                     let (_, reset) = settings::item(
                         ui,
                         s.tiff_suffix != d.tiff_suffix,
-                        "TIFF suffix",
+                        "Master suffix",
                         None,
                         |ui| ui.add(egui::TextEdit::singleline(&mut s.tiff_suffix).desired_width(190.0)),
                     );
@@ -12819,7 +12597,7 @@ impl App {
                     let (_, reset) = settings::item(
                         ui,
                         s.png_suffix != d.png_suffix,
-                        "PNG suffix",
+                        "Proof suffix",
                         None,
                         |ui| ui.add(egui::TextEdit::singleline(&mut s.png_suffix).desired_width(190.0)),
                     );
@@ -12895,20 +12673,13 @@ impl App {
                 // numbers in a pixel, so a container that holds three is no longer a
                 // claim nobody has made.
                 //
-                // **Live now.** These were `pending` for as long as the export ignored
-                // them and the master's space was monostar or, under a toner, eciRGB v2.
-                // `Settings::space_for` is what the export module seeds from, and the
-                // picker beside the container is what overrides it per image.
-                //
-                // Three keys rather than one, because the containers are chosen for
-                // different jobs — a TIFF is the print master and a PNG is often what
-                // gets handed to somebody. JPEG's is a **proof** space today; the key is
-                // here so the three read as one decision.
-                for (label, value, default) in [
-                    ("TIFF color space", &mut s.tiff_color_space, &d.tiff_color_space),
-                    ("PNG color space", &mut s.png_color_space, &d.png_color_space),
-                    ("JPEG color space", &mut s.jpeg_color_space, &d.jpeg_color_space),
-                ] {
+                // **The one choice a master has.** OUTPUT's picker in Develop edits the
+                // same value (`Settings::master_space`). There used to be a key per
+                // container; a PNG or JPEG is a proof now, and a proof's space is set in
+                // the EXPORT module with the rest of the proof.
+                {
+                    let (label, value, default) =
+                        ("Master color space", &mut s.tiff_color_space, &d.tiff_color_space);
                     settings::rule(ui);
                     let current = export::Space::from_key(value)
                         .unwrap_or_default()
@@ -12951,100 +12722,7 @@ impl App {
 
                                 }
 
-                if sheet.shows(ui, settings::Section::Export, "PROOF jpeg jpg png quarter third half size format colour color space srgb monostar preview") {
-                    settings::heading(ui, "PROOF");
-                    settings::note(ui, "Defaults for Export Proof; master exports are unchanged.");
-                    ui.add_space(4.0);
-
-                    let mut target = s.proof_target();
-                    settings::rule(ui);
-                    let (_, reset) = settings::item(ui, s.proof_container != d.proof_container, "Format", None, |ui| {
-                        egui::ComboBox::from_id_salt("proof-format")
-                            .width(96.0)
-                            .truncate()
-                            .selected_text(settings::combo_text(target.container.label()))
-                            .show_ui(ui, |ui| settings::combo_menu(ui, |ui| {
-                                for c in export::Container::PROOF_ORDER {
-                                    if ui.selectable_label(target.container == c, c.label()).clicked() {
-                                        target.container = c;
-                                    }
-                                }
-                            }));
-                    });
-                    if reset {
-                        target.container = d.proof_target().container;
-                    }
-
-                    // **16-bit greys out for JPEG**, because baseline JPEG is 8 bits
-                    // per sample. `Container::depths` is the one place that rule
-                    // lives; this control asks rather than restating it.
-                    settings::rule(ui);
-                    let (_, reset) = settings::item(ui, s.proof_depth != d.proof_depth, "Depth", None, |ui| {
-                        egui::ComboBox::from_id_salt("proof-depth")
-                            .width(96.0)
-                            .truncate()
-                            .selected_text(settings::combo_text(target.depth.label()))
-                            .show_ui(ui, |ui| settings::combo_menu(ui, |ui| {
-                                for k in export::Depth::UI_ORDER {
-                                    let ok = target.container.supports(k);
-                                    let resp = ui.add_enabled(
-                                        ok,
-                                        egui::Button::selectable(target.depth == k, k.label()),
-                                    );
-                                    if resp.clicked() {
-                                        target.depth = k;
-                                    }
-                                }
-                            }));
-                    });
-                    if reset {
-                        target.depth = d.proof_target().depth;
-                    }
-
-                    settings::rule(ui);
-                    let (_, reset) = settings::item(ui, s.proof_space != d.proof_space, "Color space", Some("sRGB is safest for unmanaged screens."), |ui| {
-                        egui::ComboBox::from_id_salt("proof-space")
-                            .width(176.0)
-                            .truncate()
-                            .selected_text(settings::combo_text(target.space.label()))
-                            .show_ui(ui, |ui| settings::combo_menu(ui, |ui| {
-                                for k in export::Space::PROOF_ORDER {
-                                    if ui.selectable_label(target.space == k, k.label()).clicked() {
-                                        target.space = k;
-                                    }
-                                }
-                            }));
-                    });
-                    if reset {
-                        target.space = d.proof_target().space;
-                    }
-
-                    let mut scale = s.proof_scale();
-                    settings::rule(ui);
-                    let (_, reset) = settings::item(ui, s.proof_scale != d.proof_scale, "Size", Some("A fraction of the source image."), |ui| {
-                        egui::ComboBox::from_id_salt("proof-scale")
-                            .width(112.0)
-                            .truncate()
-                            .selected_text(settings::combo_text(scale.label()))
-                            .show_ui(ui, |ui| settings::combo_menu(ui, |ui| {
-                                for k in export::ProofScale::UI_ORDER {
-                                    if ui.selectable_label(scale == k, k.label()).clicked() {
-                                        scale = k;
-                                    }
-                                }
-                            }));
-                    });
-                    if reset {
-                        scale = d.proof_scale();
-                    }
-
-                    target.settle();
-                    s.proof_container = target.container.key().into();
-                    s.proof_depth = target.depth.key().into();
-                    s.proof_space = target.space.key().into();
-                    s.proof_scale = scale.key().into();
-                }
-                if sheet.shows(ui, settings::Section::Processing, "DEFAULT PIPELINE decode demosaic sampling luminance weighting mix contrast mask tone map dither") {
+                if sheet.shows(ui, settings::Section::Processing, "DEFAULT PIPELINE decode demosaic sampling luminance weighting mix contrast mask tone map") {
                     settings::heading(ui, "DEFAULT PIPELINE");
                 ui.label(
                     theme::caption("what a NEW image opens at — open tabs are untouched"),
@@ -13169,24 +12847,6 @@ impl App {
                 // The 16-bit statement belongs on the control that is actually inert,
                 // and that is the EXPORT module's checkbox, which is disabled at 16 bits
                 // and says so there.
-                settings::rule(ui);
-                settings::check(ui, &mut s.dither, d.dither, "TPDF dither on");
-                settings::note(ui, "Reduces banding on screen and in 8-bit exports.");
-
-                let mut depth = s.export_depth();
-                settings::rule(ui);
-                let reset_depth = settings::combo(ui, s.export_depth != d.export_depth, "Export depth", depth.label(), |ui| {
-                        for d in export::Depth::UI_ORDER {
-                            if ui.selectable_label(depth == d, d.label()).clicked() {
-                                depth = d;
-                            }
-                        }
-                    },
-                );
-                if reset_depth {
-                    depth = d.export_depth();
-                }
-                s.export_depth = depth.key().to_owned();
 
                                 }
                 if sheet.shows(ui, settings::Section::Viewer, "BACKGROUNDS viewer background canvas grey gray brightness panel panels match module modules card") {
@@ -13282,6 +12942,16 @@ impl App {
                     }
                 }
 
+                if sheet.shows(ui, settings::Section::Viewer, "DISPLAY dither tpdf banding screen monitor 8-bit gradient") {
+                    settings::heading(ui, "DISPLAY");
+                    settings::rule(ui);
+                    // A property of the monitor, not of any photograph: the viewer draws
+                    // into an 8-bit texture, where a smooth gradient bands although the
+                    // file does not. Files are separate — a master is never dithered and
+                    // an 8-bit proof has its own switch in the EXPORT module.
+                    settings::check(ui, &mut s.screen_dither, d.screen_dither, "Dither the screen");
+                    settings::note(ui, "Breaks up banding in smooth gradients on screen. Exports are unaffected.");
+                }
                 if sheet.shows(ui, settings::Section::Viewer, "SURROUND mount border colour color okhsl hue width mat") {
                     settings::heading(ui, "SURROUND");
                 settings::rule(ui);
@@ -13666,11 +13336,10 @@ impl App {
             }
             self.update_sheet_open = true;
         }
-        if stop_skipping
-            && let Some(updates) = &mut self.updates
-        {
+        if stop_skipping && let Some(updates) = &mut self.updates {
             updates.stop_skipping(&mut self.settings);
-            self.pending_note = Some("stopped skipping — the next check offers the feed again".into());
+            self.pending_note =
+                Some("stopped skipping — the next check offers the feed again".into());
         }
         // Acted on out here, because the panel that asked was holding the borrow the
         // purge needs — and because deleting ten thousand files in the middle of laying
