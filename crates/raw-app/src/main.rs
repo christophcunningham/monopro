@@ -63,6 +63,8 @@ mod updater;
 #[cfg(not(target_os = "macos"))]
 #[path = "updater_stub.rs"]
 mod updater;
+#[cfg(test)]
+mod visual;
 mod widgets;
 
 use std::path::{Path, PathBuf};
@@ -136,13 +138,19 @@ fn main() -> eframe::Result<()> {
 fn wgpu_config() -> egui_wgpu::WgpuConfiguration {
     let mut cfg = egui_wgpu::WgpuConfiguration::default();
     if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut cfg.wgpu_setup {
-        setup.device_descriptor = Arc::new(|adapter: &wgpu::Adapter| wgpu::DeviceDescriptor {
-            label: Some("monopro device"),
-            required_limits: raw_gpu::limits(adapter),
-            ..Default::default()
-        });
+        setup.device_descriptor = Arc::new(device_descriptor);
     }
     cfg
+}
+
+/// The device the window asks for. Shared with `visual`, whose frames would
+/// otherwise be drawn on a device that cannot hold the working image.
+fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
+        label: Some("monopro device"),
+        required_limits: raw_gpu::limits(adapter),
+        ..Default::default()
+    }
 }
 
 /// Result of a background encode.
@@ -2825,7 +2833,11 @@ impl eframe::App for App {
         let modal = self.tabs.active().is_some_and(|t| t.mode.is_paint());
         // **Installed on the first frame**, which is the earliest `NSApp` exists —
         // eframe creates it during startup and offers no callback that says so.
-        if !self.menus_installed {
+        //
+        // Neither this nor the updater below exists in a test build. `visual` draws
+        // frames of this app off the main thread, where AppKit refuses to build a
+        // menu, and a test must never start checking the live update feed.
+        if !cfg!(test) && !self.menus_installed {
             self.menus_installed = true;
             self.menus = menu::Menus::install("monopro");
         }
@@ -2833,7 +2845,7 @@ impl eframe::App for App {
         // the AppKit pieces it drives exist. It runs silent scheduled checks on
         // the stable feed and turns into a badge when it finds something; see
         // `updater`. A failed install is not fatal — the app updates by hand.
-        if self.updates.is_none() {
+        if !cfg!(test) && self.updates.is_none() {
             self.updates = Some(updater::Updates::install(&self.settings, &ctx));
         }
         // Sparkle's events drain once per frame, next to the export worker's.

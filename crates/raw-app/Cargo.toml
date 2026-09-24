@@ -45,6 +45,14 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 pdf-writer = "0.15.0"
 ttf-parser = "0.25.1"
 
+[dev-dependencies]
+# Draws real frames of the app with no window, so a change to the interface can be
+# looked at from a test run. `eframe` builds the actual `App`; `wgpu` renders it
+# through egui-wgpu, paint callbacks included, which is what puts the photograph
+# on the canvas and not only the panels around it. 0.35 to match egui. See
+# `visual.rs`.
+egui_kittest = { version = "0.35", features = ["eframe", "wgpu"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 # The native menu bar. Its Linux defaults are GTK and libxdo, but non-macOS builds

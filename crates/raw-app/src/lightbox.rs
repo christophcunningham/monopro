@@ -2540,6 +2540,14 @@ impl Lightbox {
     /// Everything from the previous folder is dropped and its generation retired —
     /// see [`Key`]. The sort and filters carry over, because they are how *you* look
     /// at a folder rather than a property of the one you left.
+    /// Whether the grid has finished arriving: at least one tile drawn and none
+    /// still queued. `visual` waits on this so a Lightbox frame is not captured
+    /// half-filled.
+    #[cfg(test)]
+    pub fn tiles_settled(&self) -> bool {
+        !self.tiles.is_empty() && !self.tiles.values().any(|t| matches!(t, Tile::Pending))
+    }
+
     pub fn open_folder(&mut self, dir: &Path) {
         let mut entries: Vec<Entry> = list_entries(
             dir,
