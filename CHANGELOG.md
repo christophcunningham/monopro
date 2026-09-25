@@ -16,9 +16,16 @@ changes belong in [docs/known-limitations.md](docs/known-limitations.md).
 
 ## Unreleased
 
+## 0.2.0 — 2026-09-25
+
+This release separates masters from proofs and lets Lightbox notice files that
+arrive in an open folder. Exporting works differently: a master is now always a
+16-bit TIFF, and the proof settings have moved from Settings into the EXPORT
+module in Develop.
+
 New
 - monopro runs from the command line without opening a window. monopro render
-  writes each raw as its sidecar describes it, exactly as the Export button would,
+  writes each raw as its sidecar describes it, exactly as the Export buttons would,
   as a master or a proof, one file or a whole folder. monopro info prints what a
   raw is and what its sidecar holds. Run monopro help for the options.
 - Settings can set the Panel and Module backgrounds beside the viewer background,
