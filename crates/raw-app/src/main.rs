@@ -425,7 +425,7 @@ impl App {
             export_thread: None,
             export_owner: None,
             export_requested: None,
-            status: "drop a raw file on the window, or pass one on the command line".to_owned(),
+            status: "drop a raw file on the window, or use lightbox (L)".to_owned(),
             last_dir: None,
             settings: settings::Settings::default(),
             settings_open: false,
@@ -776,7 +776,7 @@ impl App {
         // Another tab may already hold this exact decode — for example, duplicates
         // with Unity WB toggled opposite ways, flicked between.
         //
-        // `Tab::decoded` invalidates the working image, so the luminance pass has
+        // `Tab::decoded` marks the working image stale, so the luminance pass has
         // to follow it here just as it does on the queued path. Forgetting that is
         // what made toggling Unity WB blank the viewport whenever a duplicate was
         // open: the cache hit is only reachable when a second tab is holding the
@@ -1608,6 +1608,20 @@ impl App {
         {
             lightbox::store_edited_tile(&path, &stamp, w, h, &rgba);
         }
+    }
+
+    /// Show a Lightbox pane, switching to Lightbox first if Develop is up. Crossing
+    /// modes is part of the act: asking for FOLDERS from Develop can only mean you want
+    /// to be looking at folders. The Window menu, `⇧S` and `⇧M` all come here.
+    fn show_lightbox_pane(&mut self, pane: lightbox::Pane, rs: &egui_wgpu::RenderState) {
+        if !self.lightbox.active {
+            if let Some(id) = self.tabs.active_id() {
+                self.save_sidecar(id);
+            }
+            self.store_edited_tile(rs);
+            self.set_lightbox(true);
+        }
+        self.lightbox.reveal_pane(pane);
     }
 
     /// Cross into Lightbox, or back out of it.
@@ -2854,18 +2868,7 @@ impl eframe::App for App {
             match cmd {
                 menu::Command::Key(a) => actions.push(a),
                 menu::Command::Show(p) => self.layout.bring_forward(p),
-                // Crossing modes is part of the act: asking for FOLDERS from Develop
-                // can only mean you want to be looking at folders.
-                menu::Command::ShowLightbox(p) => {
-                    if !self.lightbox.active {
-                        if let Some(id) = self.tabs.active_id() {
-                            self.save_sidecar(id);
-                        }
-                        self.store_edited_tile(&rs);
-                        self.set_lightbox(true);
-                    }
-                    self.lightbox.reveal_pane(p);
-                }
+                menu::Command::ShowLightbox(p) => self.show_lightbox_pane(p, &rs),
                 // The manual check opens the sheet with it, so the result —
                 // including "up to date" and any failure — has somewhere to land.
                 menu::Command::CheckForUpdates => {
@@ -3339,6 +3342,21 @@ impl eframe::App for App {
                 hotkeys::Action::RefreshFolder if self.lightbox.active => {
                     self.lightbox.refresh(true);
                 }
+                // Not gated on Lightbox, unlike the rows above: these name a Lightbox pane,
+                // so from Develop they cross over to it, as the Window menu does.
+                hotkeys::Action::SearchPane => {
+                    self.show_lightbox_pane(lightbox::Pane::Search, &rs);
+                    self.lightbox.focus_search();
+                }
+                hotkeys::Action::MetadataPane => {
+                    self.show_lightbox_pane(lightbox::Pane::Exif, &rs);
+                }
+                hotkeys::Action::SelectAll if self.lightbox.active => {
+                    self.lightbox.select_all();
+                }
+                // Develop has nothing to select all of. Quietly nothing, rather than
+                // the "not built yet" note below, which would be untrue.
+                hotkeys::Action::SelectAll => {}
                 // Zoom needs the viewport's anchor, so it is handled where that
                 // exists; see `viewport_panel` — except in Lightbox, where there is
                 // no viewport and the same pair sizes the tiles instead. One
@@ -7224,6 +7242,7 @@ impl App {
             tab.show_loupe();
         }
         let reveal_loupe_module = tab.loupe.take_module_reveal();
+        let collapse_loupe_module = tab.loupe.take_module_collapse();
 
         // ── PRINT LOUPE ───────────────────────────────────────────────────────
         //
@@ -7236,9 +7255,13 @@ impl App {
         //
         // `Plain` rather than `Module`: there is no dot, because a loupe is not a
         // parameter. It is a tool that is open or shut, like the crop tool.
+        // **Folds when the loupe goes off**, the maintainer's call: an open PRINT LOUPE
+        // with no loupe up is a block of disabled controls. Opening is the reverse and
+        // already happened — `show_loupe` asks for the reveal.
         widgets::Plain::new("PRINT LOUPE")
             .open_on_start(false)
             .open_when(reveal_loupe_module)
+            .close_when(collapse_loupe_module)
             .show(ui, |ui| {
                 ui.label(theme::caption(
                     "sharpening and grain are applied on export only. The loupe is \
@@ -10786,7 +10809,7 @@ impl App {
 /// references that make the rest of the interface discoverable.
 ///
 /// **the maintainer's wording, and the shape of it is the point.** What was there was one line
-/// of status text — "drop a raw file on the window, or pass one on the command line" —
+/// of status text — "drop a raw file on the window, or use lightbox (L)" —
 /// repeated verbatim in the footer two inches below, which made the emptiest screen in
 /// the app the one that said the same thing twice. And it named the *command line*,
 /// which is not a route anybody takes twice; the menu is, and the menu was the one it
@@ -11034,23 +11057,17 @@ pub(crate) fn info_row(ui: &mut egui::Ui, key: &str, value: Option<String>) {
 ///
 /// # The order is INSPECTOR · PIPELINE · EXPORT
 ///
-/// # PIPELINE is the honesty panel, and it is now three stanzas
+/// # PIPELINE is the honesty panel: three stanzas on one rail
 ///
-/// It reads the chain that actually runs, so a demosaic-then-convert path creeping
-/// back in would show up here first — which is the whole reason it is worth a
-/// permanent home rather than a debug print. Under CAPTURE the chain reads
-/// `photosites → sampling → luminance`, in that order; the day it reads `→ RGB →`
-/// anywhere above the luminance step, the regression is on screen.
+/// It reads the chain that actually runs — see [`pipeline_stanzas`] for what it says
+/// and [`pipeline_rail`] for how it is drawn.
 ///
 /// It used to be a chain string plus six rows of dimensions, and the maintainer read it as
 /// unhelpful. The cause was structural rather than cosmetic: **it mixed three
 /// destinations in one list.** `source` and `working` are about the negative,
 /// `output` is about what is on screen, `print` and `file` are about what leaves. The
-/// stanzas say so, which is the "capture to screen to print" he asked for.
-///
-/// **The prototype's own line — `Leica M10-R RAW → Linear Rec2020` — is precisely the
-/// architecture the rewrite exists to escape**, and is not ported. See
-/// `docs/ux-inventory.md`.
+/// stanzas say so, which is the "capture to screen to print" he asked for, and the rail
+/// is what makes the three read as one line rather than three notes.
 ///
 /// # Why this is three functions and not one
 ///
@@ -11072,159 +11089,398 @@ fn info_body(tab: &mut Tab, ui: &mut egui::Ui, env: InfoEnv, icons: &icons::Icon
     export_section(tab, ui, env)
 }
 
-/// What is actually happening, in three stanzas: capture, screen, print.
+/// What is actually happening, as one rail from the sensor to the file.
 fn pipeline_section(tab: &Tab, ui: &mut egui::Ui, env: InfoEnv) {
     let (Some(img), Some(luma)) = (&tab.image, &tab.luma) else {
         return;
     };
-    let p = &tab.params;
-    let source = luma.source_dims;
-    let frame = tab.stored_frame();
-    let out = frame.map(|f| f.output_dims()).unwrap_or(luma.output_dims);
+    let out = tab
+        .stored_frame()
+        .map(|f| f.output_dims())
+        .unwrap_or(luma.output_dims);
+    let stanzas = pipeline_stanzas(
+        &tab.params,
+        &img.decoded.scene.camera,
+        luma.source_dims,
+        out,
+        env.depth,
+        env.unit,
+    );
+    widgets::Plain::new("PIPELINE").show(ui, |ui| pipeline_rail(ui, &stanzas));
+}
+
+/// One stage PIPELINE names: a station on the rail.
+#[derive(Debug, PartialEq)]
+struct Station {
+    /// What the stage is — `Sampling`, `Tone map`, `Grain`.
+    key: &'static str,
+    /// What it does to this picture.
+    value: String,
+    /// Whether it changes the picture. A stage switched off or at identity is still on
+    /// the line — the picture passes through it — but it is drawn hollow, the way a
+    /// bypassed module's dot is, and its value recedes.
+    acts: bool,
+}
+
+/// A stretch of the rail: where the picture is, how big it is there, and the stages it
+/// passes on the way through.
+#[derive(Debug, PartialEq)]
+struct Stanza {
+    name: &'static str,
+    /// What the picture is in this stretch, said once: the sensor's megapixels and
+    /// format, the pixels on screen, then the print's size and resolution.
+    extent: String,
+    stations: Vec<Station>,
+}
+
+/// What PIPELINE says, apart from how it is drawn: capture, screen and print. CAPTURE
+/// and SCREEN list their stages in the order they run; PRINT in the order of the Develop
+/// column, which is how the maintainer finds them.
+///
+/// # It reads the chain that actually runs
+///
+/// Under CAPTURE the stations are `Sampling` then `Luminance`, in that order; the day
+/// an RGB stage appears above the luminance step, the regression is on screen. That is
+/// the whole reason this panel is worth a permanent home rather than a debug print, and
+/// `pipeline_capture_is_photosites_then_sampling_then_luminance` holds it.
+///
+/// **The prototype's own line — `Leica M10-R RAW → Linear Rec2020` — is precisely the
+/// architecture the rewrite exists to escape**, and is not ported. See
+/// `docs/ux-inventory.md`.
+///
+/// # Every optional stage keeps its station
+///
+/// Toning, Grain and Sharpen used to appear only when they ran, and PRINT ended in a lone
+/// `—` when neither effect did. A line that loses stations as you work changes height
+/// under you and cannot say "this is off"; a hollow station can.
+///
+/// # A size is said once per stanza
+///
+/// The stanza's extent is the size, and no two extents say the same thing: CAPTURE
+/// gives the sensor's megapixels and format, SCREEN its pixels, PRINT inches and ppi. A
+/// working-frame station, a pixel count on Resample and megapixels in two headings once
+/// made four statements of nearly the same number, which the maintainer read as noise;
+/// Resample now gives its dimensions only when they differ from SCREEN's.
+fn pipeline_stanzas(
+    p: &Params,
+    camera: &str,
+    source: raw_core::Dims,
+    out: raw_core::Dims,
+    depth: export::Depth,
+    unit: Unit,
+) -> [Stanza; 3] {
+    let station = |key, value: String, acts| Station { key, value, acts };
+    let off = || "off".to_owned();
+
+    let capture = vec![
+        station("Camera", camera.to_owned(), true),
+        station("Sensor", "CFA, gain-equalized".to_owned(), true),
+        station("Sampling", sampling_label(p.luminance.sampling), true),
+        // The weighting alone. It said `· scene-linear` too, which no control can change:
+        // every sampling and weighting is a sum of linear photosites, and the non-linear
+        // steps are all under SCREEN. A value that never varies was noise.
+        station("Luminance", p.luminance.weighting.name().to_owned(), true),
+    ];
+
+    // The GPU chain in the order `raw_graph::build` wires it: exposure, contrast mask,
+    // dodge & burn, curve, then the display pass with the tone map and toning in it.
+    // Values are in the units the Develop sliders show, so a number here can be found
+    // on the control that set it.
+    let e = &p.exposure;
+    let exposure = if e.enabled {
+        let mut v = format!("{:.2} EV", e.ev);
+        if e.black != 0.0 {
+            v.push_str(&format!(", black {:.4}", e.black));
+        }
+        v
+    } else {
+        off()
+    };
+    let cm = &p.contrast_mask;
+    let mask = if cm.enabled {
+        format!("{:.2}, spacer {:.2} %", cm.contrast, cm.spacer)
+    } else {
+        off()
+    };
+    let db = &p.dodgeburn;
+    let layers = |sign: raw_core::Sign, one: &str, many: &str| {
+        let n = db.active().filter(|i| i.sign == sign).count();
+        (n > 0).then(|| format!("{n} {}", if n == 1 { one } else { many }))
+    };
+    let dodgeburn = if !db.enabled && !db.is_default() {
+        off()
+    } else {
+        let counts: Vec<String> = [
+            layers(raw_core::Sign::Dodge, "dodge", "dodges"),
+            layers(raw_core::Sign::Burn, "burn", "burns"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if counts.is_empty() {
+            "none".to_owned()
+        } else {
+            counts.join(" · ")
+        }
+    };
+    let linear = p.curve.is_identity();
+    // **Toning is a SCREEN station, not a PRINT one**, which is the only placement that
+    // keeps this panel honest. It runs *inside the display pass*, right after the tone
+    // map — see `raw_gpu::exec` — so unlike grain and sharpening it is on the viewport in
+    // front of you. Filing it under PRINT would say the preview is not showing you the
+    // toner, and the preview is the whole reason the module renders on the GPU at all.
+    //
+    // `is_active`, not `enabled`: the export gates on that too, and a process left at its
+    // defaults with every bath at zero changes no pixel.
+    let toning = if p.toning.is_active() {
+        station("Toning", p.toning.process.label().to_owned(), true)
+    } else {
+        station("Toning", off(), false)
+    };
+    let screen = vec![
+        station("Exposure", exposure, e.is_active()),
+        station("Contrast mask", mask, cm.is_active()),
+        station("Dodge & Burn", dodgeburn, db.is_active()),
+        station(
+            "Curve",
+            if linear { "linear" } else { "custom" }.to_owned(),
+            !linear,
+        ),
+        station(
+            "Tone map",
+            p.display.tone_map.label().to_owned(),
+            !matches!(p.display.tone_map, ToneMap::Clip),
+        ),
+        toning,
+    ];
+
+    // **In the Develop column's order — Grain, Sharpen, Crop, Resample, Encoding — not
+    // the export tail's**, which is the maintainer's call: a station here should be found
+    // where its module is. The tail itself crops, resamples, then grains and sharpens
+    // over everything; see `export.rs`. Grain and sharpening are what the print gets
+    // that the screen does not: both run on the CPU at export and neither reaches the
+    // viewport, which is why they are under PRINT.
+    //
+    // Crop is named by the ratio it was locked to, since that is how it was chosen, and
+    // by how much of the frame survived it.
+    let comp = &p.composition;
+    let cropped = comp.enabled && !comp.crop.is_full();
+    let crop = if !comp.enabled {
+        off()
+    } else if !cropped {
+        "none".to_owned()
+    } else {
+        let shape = match comp.ratio {
+            Ratio::Free => Ratio::aspect_label(out.w as u32, out.h as u32),
+            // The preset's own name without its gloss: `3:2`, not `3:2  —  4×6, 35mm`.
+            locked => locked
+                .label()
+                .split("  —  ")
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        let kept = comp.crop.w * comp.crop.h * 100.0;
+        format!("{shape} · {kept:.0} % of frame")
+    };
     let o = &p.output;
+    let d = o.target_dims(out);
+    let applied = |on: bool| if on { "applied".to_owned() } else { off() };
+    let resample = if o.resamples(out) {
+        format!("{} × {} px, {}", d.w, d.h, o.scale_note(out))
+    } else {
+        o.scale_note(out)
+    };
+    let print = vec![
+        station("Grain", applied(p.grain.is_active()), p.grain.is_active()),
+        station(
+            "Sharpen",
+            applied(p.sharpen.is_active()),
+            p.sharpen.is_active(),
+        ),
+        station("Crop", crop, cropped),
+        station("Resample", resample, o.resamples(out)),
+        station(
+            "Encoding",
+            format!("{} Gray · monostar", depth.label()),
+            true,
+        ),
+    ];
 
-    widgets::Plain::new("PIPELINE").show(ui, |ui| {
-        let stanza = |ui: &mut egui::Ui, name: &str| {
-            ui.label(
-                theme::readout(name)
-                    .size(theme::size::CAPTION)
-                    .color(theme::DIM),
-            );
-        };
-        // **Caption, matching the stanza names above them.** These used to be set at
-        // the readout's default body size, which made every line of this panel a step
-        // larger than the `CAPTURE` / `SCREEN` / `PRINT` markers heading them — the
-        // block read as three tiny labels interrupting a column of body text rather
-        // than as three stanzas. the maintainer called it; one size for the whole panel is also
-        // the rule the rest of the app follows.
-        let line = |ui: &mut egui::Ui, v: String| {
-            ui.label(theme::readout(v).size(theme::size::CAPTION));
-        };
+    // **In or cm, whichever the settings say.** Sizes are canonically inches everywhere
+    // below the UI — see `raw_core::Unit` on why — so this converts at the point of
+    // display and stores nothing. It was once hardcoded `in`, and the panel that exists
+    // to report what will happen was the last place still quoting the other unit.
+    let (pw, ph) = o.print_inches(out);
+    let (pw, ph) = (unit.from_inches(pw), unit.from_inches(ph));
+    [
+        Stanza {
+            name: "CAPTURE",
+            extent: format!(
+                "{:.1} MP · {}",
+                (source.w * source.h) as f32 / 1.0e6,
+                sensor_format(source)
+            ),
+            stations: capture,
+        },
+        Stanza {
+            name: "SCREEN",
+            extent: format!("{} × {} px", out.w, out.h),
+            stations: screen,
+        },
+        Stanza {
+            name: "PRINT",
+            extent: format!("{pw:.1} × {ph:.1} {} · {:.0} ppi", unit.label(), o.ppi),
+            stations: print,
+        },
+    ]
+}
 
-        // ── CAPTURE ──────────────────────────────────────────────────────────
-        // The chain, in the order it runs. `photosites → sampling → luminance`,
-        // never `→ RGB →`.
-        stanza(ui, "CAPTURE");
-        line(
-            ui,
-            format!("{}  ·  CFA, gain-equalized", img.decoded.scene.camera),
-        );
-        line(
-            ui,
-            format!(
-                "{} × {} photosites  →  {}",
-                source.w,
-                source.h,
-                sampling_label(p.luminance.sampling)
-            ),
-        );
-        line(
-            ui,
-            format!(
-                "{} luminance  →  one channel, scene-linear",
-                p.luminance.weighting.name()
-            ),
-        );
-        // The grid the tone chain runs on, named only when it differs from the
-        // picture — which is exactly when leaving it out would be a lie. Contrast
-        // Mask's spacer is a percentage of this frame's diagonal.
-        if let Some(f) = &frame
-            && (!f.is_uncropped() || f.frame != luma.output_dims)
-        {
-            line(ui, format!("{} × {} working frame", f.frame.w, f.frame.h));
-        }
+/// The format a sensor was built to, long side first: `3:2`, `4:3`, `65:24`.
+///
+/// **Rounded to the nominal format, unlike [`Ratio::aspect_label`]**, which names a
+/// freehand crop and will not call it 4:3 for being close. A sensor is the other case:
+/// makers trim a few photosites off the exact shape — the M10-R's 7864 × 5200 is 1.512 —
+/// and the honest name is the format it was built to, not `1.51:1`. Within 2 % of one of
+/// these; the decimal otherwise, so an unusual sensor is still described truthfully.
+fn sensor_format(d: raw_core::Dims) -> String {
+    const FORMATS: [(u32, u32); 6] = [(1, 1), (5, 4), (4, 3), (3, 2), (16, 9), (65, 24)];
+    let (long, short) = (d.w.max(d.h) as f32, d.w.min(d.h).max(1) as f32);
+    let r = long / short;
+    FORMATS
+        .iter()
+        .find(|(a, b)| (r / (*a as f32 / *b as f32) - 1.0).abs() <= 0.02)
+        .map_or_else(|| format!("{r:.2}:1"), |(a, b)| format!("{a}:{b}"))
+}
 
-        // ── SCREEN ───────────────────────────────────────────────────────────
-        ui.add_space(6.0);
-        stanza(ui, "SCREEN");
-        line(
-            ui,
-            format!(
-                "curve {}  →  {}",
-                if p.curve.is_identity() {
-                    "linear"
-                } else {
-                    "custom"
-                },
-                p.display.tone_map.label(),
-            ),
-        );
-        line(
-            ui,
-            format!(
-                "{} × {} px  ({:.1} MP)",
-                out.w,
-                out.h,
-                (out.w * out.h) as f32 / 1.0e6
-            ),
-        );
-        // **Toning is a SCREEN line, not a PRINT one**, which is the only placement
-        // that keeps this panel honest. It runs *inside the display pass*, right after
-        // the tone map — see `raw_gpu::exec` — so unlike grain and sharpening it is on
-        // the viewport in front of you. Filing it under PRINT would say the preview is
-        // not showing you the toner, and the preview is the whole reason the module
-        // renders on the GPU at all.
-        //
-        // `is_active`, not `enabled`: the export gates on that too, and a process left
-        // at its defaults with every bath at zero changes no pixel. A line claiming
-        // otherwise is exactly the kind of thing this panel exists to catch.
-        if p.toning.is_active() {
-            line(
-                ui,
-                format!("{} toning  →  after the tone map", p.toning.process.label()),
-            );
-        }
+/// Draw `stanzas` as one line: a rail down the lane a module header keeps for its dot, a
+/// square where each stanza begins, and a dot at every stage.
+///
+/// # Why a rail and not arrows
+///
+/// This was three stanzas of prose with `→` between the steps, and the maintainer read it as
+/// a list rather than a pipe: the arrows joined two steps inside a line and nothing
+/// joined the lines, so CAPTURE, SCREEN and PRINT sat as three separate notes. The rail
+/// is one continuous stroke from the camera to the encoder, so the order is carried by
+/// position and the connection by the line — which is what the arrows were trying to say
+/// a step at a time. Not a node graph: nothing branches, so nothing needs to be a box.
+///
+/// # The marks are the module dot's language
+///
+/// The rail sits exactly under the Develop column's state dots, and a stage that changes
+/// the picture is a small filled dot where one that passes it through is hollow, as a
+/// bypassed module is. Stanzas are squares, so a section and a stage cannot be confused.
+///
+/// **Caption throughout.** The stations were once set a step larger than their stanza
+/// names, which read as tiny labels interrupting body text; one size is also the rule the
+/// rest of the app follows. Keys are a column measured to the longest, so the values align
+/// down the whole line rather than stanza by stanza — and a stanza's extent starts on that
+/// same column rather than hanging off the right edge, where each heading's text began at
+/// a different place.
+fn pipeline_rail(ui: &mut egui::Ui, stanzas: &[Stanza]) {
+    /// The module header's dot box and the gap after it, so the rail runs where the dots
+    /// do and every word starts under PIPELINE's own title.
+    const LANE: f32 = 15.0;
+    const KEY_GAP: f32 = 10.0;
+    const RAIL: egui::Color32 = egui::Color32::from_gray(72);
+    const HOLLOW: egui::Color32 = egui::Color32::from_gray(96);
 
-        // ── PRINT ────────────────────────────────────────────────────────────
-        ui.add_space(6.0);
-        stanza(ui, "PRINT");
-        line(ui, format!("{} Gray  ·  monostar", env.depth.label()));
-        let d = o.target_dims(out);
-        // **In or cm, whichever the settings say.** Sizes are canonically inches
-        // everywhere below the UI — see `raw_core::Unit` on why — so this converts at
-        // the point of display and stores nothing. It used to be hardcoded `in`, which
-        // meant switching the preference moved every print size in the app except this
-        // one, and the panel that exists to report what will happen was the last place
-        // still quoting the other unit.
-        let u = env.unit;
-        let (pw, ph) = o.print_inches(out);
-        let (pw, ph) = (u.from_inches(pw), u.from_inches(ph));
-        line(
-            ui,
-            format!(
-                "{} × {} px  ·  {:.0} ppi  →  {pw:.1} × {ph:.1} {}",
-                d.w,
-                d.h,
-                o.ppi,
-                u.label()
-            ),
-        );
-        if o.resamples(out) {
-            line(ui, o.scale_note(out));
+    enum Mark {
+        Stanza,
+        Station(bool),
+    }
+
+    let size = theme::size::CAPTION;
+    let advance = ui
+        .ctx()
+        .fonts_mut(|f| f.glyph_width(&egui::FontId::monospace(size), '0'));
+    let longest = stanzas
+        .iter()
+        .flat_map(|s| &s.stations)
+        .map(|s| s.key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let key_w = longest as f32 * advance + KEY_GAP;
+
+    let left = ui.cursor().left();
+    // Reserved before any text, so the rail is under the words and the marks are over it.
+    let rail = ui.painter().add(egui::Shape::Noop);
+    let mut marks: Vec<(f32, Mark)> = Vec::new();
+
+    for (i, stanza) in stanzas.iter().enumerate() {
+        if i > 0 {
+            ui.add_space(5.0);
         }
-        // Grain and sharpening are what the print gets that the screen preview does
-        // not — both run on the CPU at export and neither reaches the viewport. They
-        // are listed in the order the export tail applies them, which is grain first
-        // and sharpening last, over everything including the grain. See `export.rs`.
-        //
-        // Toning belongs to this trio chemically and is deliberately *not* here: it is
-        // in SCREEN above, because it is the one of the three you can already see.
-        let mut effects: Vec<&str> = Vec::new();
-        if p.grain.is_active() {
-            effects.push("Grain");
+        let y = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_space(LANE);
+                let name = theme::tracked_at(ui, stanza.name, theme::DIM, size);
+                ui.add_space((key_w - name.rect.width()).max(KEY_GAP));
+                ui.add(egui::Label::new(theme::readout(&stanza.extent).size(size)).wrap());
+                name.rect.center().y
+            })
+            .inner;
+        marks.push((y, Mark::Stanza));
+
+        for s in &stanza.stations {
+            let y = ui
+                .horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_space(LANE);
+                    let key = ui.label(theme::readout(s.key).size(size).color(theme::DIM));
+                    ui.add_space((key_w - key.rect.width()).max(0.0));
+                    let value = theme::readout(&s.value).size(size);
+                    let value = if s.acts {
+                        value
+                    } else {
+                        value.color(theme::DIM)
+                    };
+                    ui.add(egui::Label::new(value).wrap());
+                    key.rect.center().y
+                })
+                .inner;
+            marks.push((y, Mark::Station(s.acts)));
         }
-        if p.sharpen.is_active() {
-            effects.push("Sharpen");
+    }
+
+    let (Some((top, _)), Some((bottom, _))) = (marks.first(), marks.last()) else {
+        return;
+    };
+    // The centre of the header's 13pt dot box. On a half point, so a one-point stroke
+    // lands on whole device pixels at 2x rather than smearing across three.
+    let x = left + 6.5;
+    ui.painter().set(
+        rail,
+        egui::Shape::line_segment(
+            [egui::pos2(x, *top), egui::pos2(x, *bottom)],
+            egui::Stroke::new(1.0, RAIL),
+        ),
+    );
+    let painter = ui.painter();
+    for (y, mark) in &marks {
+        let c = egui::pos2(x, *y);
+        match mark {
+            Mark::Stanza => {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(c, egui::vec2(6.0, 6.0)),
+                    1.0,
+                    theme::NAME,
+                );
+            }
+            Mark::Station(true) => {
+                painter.circle_filled(c, 2.5, theme::DIM);
+            }
+            // Filled with the module's own ground first, so the rail stops at the ring
+            // rather than running through it — hollow has to look hollow.
+            Mark::Station(false) => {
+                painter.circle_filled(c, 2.5, theme::CHROME);
+                painter.circle_stroke(c, 2.5, egui::Stroke::new(1.0, HOLLOW));
+            }
         }
-        line(
-            ui,
-            if effects.is_empty() {
-                "—".to_owned()
-            } else {
-                effects.join("  ·  ")
-            },
-        );
-    });
+    }
 }
 
 /// What leaves: two exports and the preferences that shape them.
@@ -11305,22 +11561,14 @@ fn export_section(tab: &Tab, ui: &mut egui::Ui, env: InfoEnv) -> InfoClicks {
                 // The reset face at panel width. `theme::reset_button` cannot do this
                 // — it sizes to its text — so it is `wide_button` with a grey ground,
                 // which keeps the third button in the same primitive as the two above.
-                clicks.settings |= theme::wide_button(
-                    ui,
-                    "Settings",
-                    theme::CHROME,
-                    theme::DIM,
-                    w,
-                    true,
-                )
-                // **`,` on its own, not `⌘,`.** The binding is a bare comma — see
-                // `hotkeys::TABLE` — and it is the one key the table refuses to let
-                // you disable, because it is the way back into the window that
-                // disables things.
-                .on_hover_text(theme::tip(
-                    "File naming, output folder, print resolution and master color space.  ,",
-                ))
-                .clicked();
+                clicks.settings |=
+                    theme::wide_button(ui, "Settings", theme::CHROME, theme::DIM, w, true)
+                        // **`,` on its own, not `⌘,`.** The binding is a bare comma — see
+                        // `hotkeys::TABLE` — and it is the one key the table refuses to let
+                        // you disable, because it is the way back into the window that
+                        // disables things.
+                        .on_hover_text(theme::tip("Settings window"))
+                        .clicked();
             });
         });
     });
@@ -11353,9 +11601,10 @@ fn export_section(tab: &Tab, ui: &mut egui::Ui, env: InfoEnv) -> InfoClicks {
 fn inspector_section(tab: &mut Tab, ui: &mut egui::Ui, env: InfoEnv, icons: &icons::Icons) {
     widgets::Plain::new("INSPECTOR").show(ui, |ui| {
         // With EXIF moved to Lightbox, Inspector becomes Info's primary working
-        // area. Keep 380 points available for its controls and pin list; content can
+        // area. Keep 300 points available for its controls and pin list; content can
         // still grow beyond this when several toned pins need three readout lines.
-        ui.set_min_height(380.0);
+        // It was 380 until PIPELINE became a full line of stages and needed the room.
+        ui.set_min_height(300.0);
         let placing = matches!(tab.mode, tabs::Mode::Pin);
         let mut clear = false;
 
@@ -11384,7 +11633,7 @@ fn inspector_section(tab: &mut Tab, ui: &mut egui::Ui, env: InfoEnv, icons: &ico
             // them, so there is nothing to keep in step.
             if theme::bracket(ui, "EDITED", !tab.pins.show_raw, theme::size::CAPTION)
                 .on_hover_text(theme::tip(
-                    "Developed image lightness, including spatial adjustments and toning; export-size grain and sharpening are excluded",
+                    "Edited image lightness; grain crystals are excluded",
                 ))
                 .clicked()
             {
@@ -11392,7 +11641,7 @@ fn inspector_section(tab: &mut Tab, ui: &mut egui::Ui, env: InfoEnv, icons: &ico
             }
             if theme::bracket(ui, "RAW", tab.pins.show_raw, theme::size::CAPTION)
                 .on_hover_text(theme::tip(
-                    "Undeveloped image lightness from the working luminance",
+                    "Un-edited image lightness from the raw luminance",
                 ))
                 .clicked()
             {
@@ -11404,13 +11653,13 @@ fn inspector_section(tab: &mut Tab, ui: &mut egui::Ui, env: InfoEnv, icons: &ico
             // away. The destructive one is the quiet text link, not the outlined
             // button — the same ranking the quit sheet uses.
             if theme::bracket(ui, "HIDE", tab.pins.hidden, theme::size::CAPTION)
-                .on_hover_text(theme::tip("Keep the pins, stop drawing them  ·  ⇧I"))
+                .on_hover_text(theme::tip("Hide all pins ·  ⇧i"))
                 .clicked()
             {
                 tab.pins.hidden = !tab.pins.hidden;
             }
             if !tab.pins.items.is_empty() {
-                clear = theme::reset_button(ui, "clear", "Remove every pin").clicked();
+                clear = theme::reset_button(ui, "clear", "Delete all pins").clicked();
             }
         });
 
@@ -11423,7 +11672,7 @@ fn inspector_section(tab: &mut Tab, ui: &mut egui::Ui, env: InfoEnv, icons: &ico
         // against another number.
         ui.label(
             theme::caption(format!(
-                "{}  ·  L  ·  {}  ·  {}",
+                "{}  ·  L*  ·  {}  ·  {}",
                 if tab.pins.show_raw { "RAW" } else { "EDITED" },
                 env.depth.label(),
                 env.sample.short(),
@@ -13472,6 +13721,159 @@ const ACKNOWLEDGMENTS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pipeline_for(p: &Params, unit: Unit) -> [Stanza; 3] {
+        let dims = raw_core::Dims { w: 7864, h: 5200 };
+        pipeline_stanzas(p, "Leica M10-R", dims, dims, export::Depth::Sixteen, unit)
+    }
+
+    #[test]
+    fn pipeline_capture_is_photosites_then_sampling_then_luminance() {
+        // The honesty check PIPELINE exists for: the chain that runs, in the order it
+        // runs, with no RGB stage anywhere above the luminance step.
+        let [capture, ..] = pipeline_for(&Params::default(), Unit::Inches);
+        let keys: Vec<_> = capture.stations.iter().map(|s| s.key).collect();
+        assert_eq!(keys, ["Camera", "Sensor", "Sampling", "Luminance"]);
+        assert_eq!(capture.extent, "40.9 MP · 3:2");
+        assert!(
+            capture.stations.iter().all(|s| !s.value.contains("RGB")),
+            "an RGB stage appeared in CAPTURE"
+        );
+    }
+
+    #[test]
+    fn pipeline_screen_is_the_gpu_chain_in_the_order_it_runs() {
+        let [_, screen, _] = pipeline_for(&Params::default(), Unit::Inches);
+        let keys: Vec<_> = screen.stations.iter().map(|s| s.key).collect();
+        assert_eq!(
+            keys,
+            [
+                "Exposure",
+                "Contrast mask",
+                "Dodge & Burn",
+                "Curve",
+                "Tone map",
+                "Toning"
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_says_each_size_once() {
+        // The stanza extents carry the size; no station repeats it unless it is news.
+        // Resample names its pixels only when they differ from SCREEN's.
+        let [capture, screen, print] = pipeline_for(&Params::default(), Unit::Inches);
+        let resample = print.stations.iter().find(|s| s.key == "Resample").unwrap();
+        assert_eq!(resample.value, "native");
+        assert!(!resample.acts);
+        // Megapixels belong to CAPTURE and pixels to SCREEN; neither repeats the other.
+        assert_eq!(screen.extent, "7864 × 5200 px");
+        assert!(!capture.extent.contains(" × "));
+        for stanza in [&capture, &screen, &print] {
+            for s in &stanza.stations {
+                assert!(
+                    !s.value.contains(" × "),
+                    "{} repeats a size: {}",
+                    s.key,
+                    s.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn screen_stations_quote_the_develop_sliders() {
+        let mut p = Params::default();
+        p.exposure.ev = 0.5;
+        p.exposure.black = -0.02;
+        p.contrast_mask.enabled = true;
+        p.contrast_mask.contrast = 0.3;
+        p.contrast_mask.spacer = 2.0;
+        let [_, screen, _] = pipeline_for(&p, Unit::Inches);
+        let get = |key| screen.stations.iter().find(|s| s.key == key).unwrap();
+        assert_eq!(get("Exposure").value, "0.50 EV, black -0.0200");
+        assert!(get("Exposure").acts);
+        assert_eq!(get("Contrast mask").value, "0.30, spacer 2.00 %");
+        assert!(get("Contrast mask").acts);
+        // No layers is "none", not "off": the module is on and simply has nothing in it.
+        assert_eq!(get("Dodge & Burn").value, "none");
+        assert!(!get("Dodge & Burn").acts);
+    }
+
+    #[test]
+    fn a_sensor_is_named_by_its_nominal_format() {
+        let d = |w, h| raw_core::Dims { w, h };
+        assert_eq!(sensor_format(d(7864, 5200)), "3:2"); // M10-R, 1.512
+        assert_eq!(sensor_format(d(6048, 4024)), "3:2");
+        assert_eq!(sensor_format(d(5184, 3888)), "4:3");
+        assert_eq!(sensor_format(d(3888, 5184)), "4:3", "long side first");
+        assert_eq!(
+            sensor_format(d(4000, 2000)),
+            "2.00:1",
+            "no nominal format near 2:1"
+        );
+    }
+
+    #[test]
+    fn crop_is_a_print_station_named_by_its_ratio_and_what_it_kept() {
+        let crop_of = |print: &Stanza| {
+            print
+                .stations
+                .iter()
+                .find(|s| s.key == "Crop")
+                .map(|s| (s.value.clone(), s.acts))
+                .unwrap()
+        };
+        let [_, _, print] = pipeline_for(&Params::default(), Unit::Inches);
+        // PRINT follows the Develop column rather than the export tail's run order.
+        let keys: Vec<_> = print.stations.iter().map(|s| s.key).collect();
+        assert_eq!(keys, ["Grain", "Sharpen", "Crop", "Resample", "Encoding"]);
+        assert_eq!(crop_of(&print), ("none".to_owned(), false));
+
+        let mut p = Params::default();
+        p.composition.crop = raw_core::composition::Rect::centred(0.9, 0.9);
+        p.composition.ratio = Ratio::Fixed(1.5);
+        let [_, _, print] = pipeline_for(&p, Unit::Inches);
+        let (value, acts) = crop_of(&print);
+        assert!(acts);
+        assert_eq!(value, "3:2 · 81 % of frame");
+    }
+
+    #[test]
+    fn an_active_print_effect_says_applied() {
+        let mut p = Params::default();
+        p.grain.enabled = true;
+        let [_, _, print] = pipeline_for(&p, Unit::Inches);
+        let grain = print.stations.iter().find(|s| s.key == "Grain").unwrap();
+        assert!(grain.acts);
+        assert_eq!(grain.value, "applied");
+    }
+
+    #[test]
+    fn a_stage_that_is_off_keeps_its_station_and_is_drawn_hollow() {
+        // Grain and Sharpen used to vanish when off, leaving PRINT ending in a lone `—`.
+        let mut p = Params::default();
+        p.grain.enabled = false;
+        p.sharpen.enabled = false;
+        let [_, _, print] = pipeline_for(&p, Unit::Inches);
+        for key in ["Grain", "Sharpen"] {
+            let s = print.stations.iter().find(|s| s.key == key).unwrap();
+            assert!(!s.acts, "{key} is off and should pass the picture through");
+            assert_eq!(s.value, "off");
+        }
+        // The encoder always runs and is always last: the line ends at the file.
+        let last = print.stations.last().unwrap();
+        assert_eq!(last.key, "Encoding");
+        assert!(last.acts);
+    }
+
+    #[test]
+    fn pipeline_print_extent_follows_the_unit_setting() {
+        let [.., inches] = pipeline_for(&Params::default(), Unit::Inches);
+        let [.., cm] = pipeline_for(&Params::default(), Unit::Centimetres);
+        assert!(inches.extent.contains(" in "), "{}", inches.extent);
+        assert!(cm.extent.contains(" cm "), "{}", cm.extent);
+    }
 
     #[test]
     fn a_snapshot_view_fits_the_complete_stored_crop() {

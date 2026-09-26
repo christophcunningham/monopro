@@ -110,6 +110,7 @@ fn modifiers(m: Mods) -> Option<Modifiers> {
 fn code(key: egui::Key) -> Option<Code> {
     use egui::Key as K;
     Some(match key {
+        K::A => Code::KeyA,
         K::B => Code::KeyB,
         K::C => Code::KeyC,
         K::D => Code::KeyD,
@@ -118,6 +119,7 @@ fn code(key: egui::Key) -> Option<Code> {
         K::J => Code::KeyJ,
         K::K => Code::KeyK,
         K::L => Code::KeyL,
+        K::M => Code::KeyM,
         K::O => Code::KeyO,
         K::P => Code::KeyP,
         K::Q => Code::KeyQ,

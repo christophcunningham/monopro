@@ -85,6 +85,12 @@ pub enum Action {
     ContactSheet,
     /// Re-read the open Lightbox folder for files that arrived or left.
     RefreshFolder,
+    /// Bring Lightbox's SEARCH pane forward with the cursor in its field, ready to type.
+    SearchPane,
+    /// Bring Lightbox's METADATA pane forward.
+    MetadataPane,
+    /// Select every picture the Lightbox grid is showing.
+    SelectAll,
     Rating(u8),
     ColourLabel(u8),
     // -- Composition
@@ -827,6 +833,39 @@ pub const TABLE: &[Binding] = &[
         Lightbox,
         true,
     ),
+    // **Shift-only, so a focused text field keeps them**: `is_typing` stands the table
+    // down while one has focus, and `⇧S` typed into the search field is a capital S.
+    // Both reveal their pane the way the Window menu does, crossing from Develop if
+    // need be.
+    b(
+        Action::SearchPane,
+        Key::S,
+        Shift,
+        "s",
+        "Search — cursor in the search field",
+        Lightbox,
+        true,
+    ),
+    b(
+        Action::MetadataPane,
+        Key::M,
+        Shift,
+        "m",
+        "Metadata panel",
+        Lightbox,
+        true,
+    ),
+    // Keyboard only, and deliberately kept out of the Edit menu: a menu accelerator
+    // would let AppKit take `⌘A` before a focused text field saw it.
+    b(
+        Action::SelectAll,
+        Key::A,
+        Cmd,
+        "a",
+        "Select all images",
+        Lightbox,
+        true,
+    ),
     b(
         Action::Rating(1),
         Key::Num1,
@@ -1115,8 +1154,9 @@ const fn m(
 /// bug, they just press the key again.
 ///
 /// **Typing suppresses the untyped-modifier bindings.** With a text field focused,
-/// `p` is a letter, not preview-original. Undo and Redo belong to the editor too;
-/// other command bindings remain available.
+/// `p` is a letter, not preview-original. Undo, Redo and Select All belong to the
+/// editor too — `⌘A` in the search field selects its text, not every tile — and other
+/// command bindings remain available.
 ///
 /// `text_edit_focused`, **not** `egui_wants_keyboard_input`, which despite its name is
 /// `focused().is_some()` — true of a slider or a button you merely clicked. With that
@@ -1147,7 +1187,7 @@ pub fn pressed(ctx: &egui::Context, modal: bool, enabled: bool) -> Vec<Action> {
             .filter(|bind| {
                 !(typing
                     && (bind.mods.is_typing()
-                        || matches!(bind.action, Action::Undo | Action::Redo)))
+                        || matches!(bind.action, Action::Undo | Action::Redo | Action::SelectAll)))
             })
             .filter(|bind| {
                 if bind.modal {

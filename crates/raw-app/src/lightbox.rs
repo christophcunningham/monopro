@@ -1275,8 +1275,7 @@ impl Lightbox {
                 .request_repaint_after(std::time::Duration::from_millis(40));
         }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
-            self.reveal_pane(Pane::Search);
-            self.search_focus = true;
+            self.focus_search();
         }
         // `tab` leaves the grid and nothing else. Drawn directly rather than by
         // emptying the tree, so the arrangement that comes back is the one that left.
@@ -1876,6 +1875,12 @@ impl Lightbox {
         }
     }
 
+    /// Bring SEARCH forward with the cursor in its field, ready to type: `⌘F` and `⇧S`.
+    pub fn focus_search(&mut self) {
+        self.reveal_pane(Pane::Search);
+        self.search_focus = true;
+    }
+
     /// Make a pane visible and current — the Window menu's job.
     pub fn reveal_pane(&mut self, want: Pane) {
         self.panels_hidden = false;
@@ -2282,6 +2287,34 @@ impl Lightbox {
             return v;
         }
         self.selected.into_iter().collect()
+    }
+
+    /// `⌘A`: every picture the grid is showing, in the batch.
+    ///
+    /// **Pictures, not tiles.** With folders or other files shown in the grid they are
+    /// tiles too, but nothing a batch is for — ratings, labels, rename, a contact
+    /// sheet — means anything for them. A filter or search narrows it, as it narrows
+    /// what is on screen. The anchor stays where it was if it is one of them, so a
+    /// following `⇧`-click still measures from the tile you were on.
+    pub fn select_all(&mut self) {
+        let pictures: Vec<u32> = self
+            .visible
+            .iter()
+            .copied()
+            .filter(|i| {
+                self.entries
+                    .get(*i as usize)
+                    .is_some_and(|e| e.kind == Kind::Picture)
+            })
+            .collect();
+        let Some(&first) = pictures.first() else {
+            return;
+        };
+        if !self.selected.is_some_and(|s| pictures.contains(&s)) {
+            self.selected = Some(first);
+        }
+        self.head = None;
+        self.batch = pictures.into_iter().collect();
     }
 
     fn selection_in_visible_order(&self) -> Vec<u32> {
@@ -5364,13 +5397,20 @@ impl Lightbox {
         }
 
         // **the maintainer's folder glyph**, tinted like the name it belongs to rather than
-        // drawn as a separate mark — the icon and the word are one label.
+        // drawn as a separate mark — the icon and the word are one label. Open while its
+        // children are showing, and only then: a folder with nothing under it has no
+        // triangle, so it cannot be open either.
         let colour = if current { theme::BRIGHT } else { theme::NAME };
         let glyph = egui::Rect::from_center_size(
             egui::pos2(label_rect.min.x + 9.0, rect.center().y),
             egui::Vec2::splat(13.0),
         );
-        crate::icons::paint_at(ui, icons, "folder", "▸", glyph, colour, 13.0);
+        let name = if open && has_kids {
+            "folder-open"
+        } else {
+            "folder"
+        };
+        crate::icons::paint_at(ui, icons, name, "▸", glyph, colour, 13.0);
         ui.painter().text(
             egui::pos2(label_rect.min.x + 20.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -6395,7 +6435,7 @@ impl Lightbox {
         if crate::icons::sized(
             ui,
             icons,
-            "file-pdf",
+            "contact-sheet",
             "PDF",
             has_pictures,
             theme::size::FOOTER_ICON,
@@ -8279,6 +8319,26 @@ mod tests {
             lb.entries[0].rating, 5,
             "the keyboard path stopped following the ring"
         );
+    }
+
+    #[test]
+    fn select_all_takes_every_picture_and_no_folder() {
+        let mut lb = grid_of(4);
+        lb.entries[0].kind = Kind::Folder;
+        lb.reindex();
+        lb.select_all();
+        assert_eq!(lb.batch, [1, 2, 3].into_iter().collect());
+        assert!(
+            lb.selected.is_some_and(|s| lb.batch.contains(&s)),
+            "the anchor has to be one of the selection"
+        );
+
+        // An anchor already on a picture stays put, so `⇧`-click still measures from it.
+        let mut lb = grid_of(4);
+        lb.selected = Some(2);
+        lb.select_all();
+        assert_eq!(lb.selected, Some(2));
+        assert_eq!(lb.selection().len(), 4);
     }
 
     #[test]

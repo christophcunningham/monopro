@@ -40,8 +40,22 @@ New
 - The edited mark on Lightbox tiles can be drawn in any of the Dixon China Marker
   colors, under Settings, Lightbox, Edited mark color. Dixon Yellow 73 is the new
   default, a touch warmer than the old yellow.
+- Shift+S brings up the Lightbox Search panel with the cursor in the search field,
+  ready to type, and Shift+M brings up the Metadata panel. From Develop, both switch
+  to Lightbox first.
+- Command+A selects every image in the Lightbox grid. In a text field it still selects
+  the text.
 
 Changed
+- The Info panel's Pipeline reads as one line from the camera to the file: every
+  stage sits on a single rail with what it does beside it, in the order it runs. A
+  stage that is off stays on the line, drawn hollow, rather than disappearing. It
+  now lists Exposure, Contrast Mask and Dodge & Burn under Screen, and Crop under
+  Print. Capture gives the sensor's megapixels and format, Screen its pixels, and no
+  size is repeated. The Inspector above it is shorter to give it room.
+- The Contact Sheet button in the Lightbox footer has its own icon, and a folder
+  expanded in the Lightbox folder tree shows as an open folder.
+- Print Loupe folds itself away when the loupe is turned off.
 - The Metadata pane lists IPTC fields in caption-desk order: Description, City,
   State, Country, Keywords, Digital Source Type, Creator, Copyright Owner, Copyright
   Notice, Credit Line, Contact Email, Date Created. Title, Headline, Source and
@@ -68,6 +82,12 @@ Fixed
 - Double-clicking just beside a panel's edge, on its scroll bar for instance, resets
   the panel to its default width rather than sending it to half the window. This
   applies in Develop and in Lightbox.
+- Toggling Unity WB no longer blanks the picture and collapses the histogram and Info
+  panel while the image is re-derived. The previous image stays up until the new one
+  is ready.
+- In Settings, Lightbox, Backgrounds, the Panel and Tiles sliders no longer show as
+  changed when they are at their defaults, and their reset now clears the mark. The
+  default moves from 11.8 to 12, a value the slider can hold.
 
 ## 0.2.0 — 2026-09-25
 

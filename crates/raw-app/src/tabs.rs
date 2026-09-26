@@ -1524,11 +1524,23 @@ impl Tab {
     /// Swap in a fresh decode of the same file, keeping the view. Used when a
     /// decode option changed — the frame did not, so the zoom and pan should not
     /// jump back to fit the way they do on a load.
+    ///
+    /// # The old working image stays on screen until the new one lands
+    ///
+    /// It is marked stale — `luma_params` cleared, so [`Self::has_current_luma`] is
+    /// false, the luminance pass is re-run, and export and snapshots wait for it — but
+    /// it is not dropped. It used to be, and for the length of the luminance pass the
+    /// tab then had no image at all: the viewport fell back to the status line, the
+    /// histogram to a dash that pulled the Develop column up, and Info to "no image
+    /// open". The demosaic runs in that pass, so on a 40 MP frame in RCD that was
+    /// ~90 ms of the whole layout collapsing and snapping back every time Unity WB was
+    /// toggled. A sampling or weighting change already kept the old image up this way;
+    /// a decode change now matches it, at the same cost of holding two working images
+    /// while the new one is built.
     pub fn decoded(&mut self, decoded: Arc<Decoded>) {
         let Some(img) = &mut self.image else { return };
         self.scene_gen += 1;
         img.decoded = decoded;
-        self.luma = None;
         self.luma_params = None;
         self.update_status();
     }
@@ -2526,6 +2538,13 @@ mod tests {
         assert!(
             tab.needs_luma(),
             "a swapped-in decode left the tab claiming to be current"
+        );
+        assert!(!tab.has_current_luma());
+        // Stale, not gone: dropping it blanked the viewport, the histogram and Info
+        // for the whole luminance pass, which is the Unity WB jump.
+        assert!(
+            tab.luma.is_some(),
+            "the old working image should stay on screen until the new one lands"
         );
     }
 
