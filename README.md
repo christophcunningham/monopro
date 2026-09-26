@@ -22,15 +22,15 @@ In development. A website with further documentation and a manual is in progress
 
 ## Getting started
 
-[Download for macOS](https://github.com/christophcunningham/monopro/releases/download/v0.2.0/monopro-0.2.0.dmg)
-— version 0.2.0, Apple Silicon and Intel. Open the `.dmg`, drag **monopro.app** to
+[Download for macOS](https://github.com/christophcunningham/monopro/releases/download/v0.2.1/monopro-0.2.1.dmg)
+— version 0.2.1, Apple Silicon and Intel. Open the `.dmg`, drag **monopro.app** to
 **Applications**, eject the disk image, and launch the installed app.
 
 This build is not notarized by Apple. The first time you open it, macOS may say it
 cannot verify the developer; if you trust this download, open **System Settings →
 Privacy & Security** and click **Open Anyway**. Later updates install from inside
 the app. See the
-[release notes](https://github.com/christophcunningham/monopro/releases/tag/v0.2.0)
+[release notes](https://github.com/christophcunningham/monopro/releases/tag/v0.2.1)
 for what changed.
 
 Windows and Linux packages are in preparation. [Build from source](#build) to run

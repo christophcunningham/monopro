@@ -16,6 +16,14 @@ changes belong in [docs/known-limitations.md](docs/known-limitations.md).
 
 ## Unreleased
 
+## 0.2.1 — 2026-09-26
+
+This release fills out the Lightbox Metadata pane with the IPTC fields a caption
+desk expects, carries the camera's EXIF into exports, redraws the Info panel's
+Pipeline as a single line, and keeps software updates inside the monopro window.
+Sidecars move to version 18; monopro 0.2.0 still opens them but will not save over
+them.
+
 New
 - Lightbox panels tuck off the edge of the window the way Develop's do: drag a
   side column past its minimum width, and click the strip it leaves to bring it back.
