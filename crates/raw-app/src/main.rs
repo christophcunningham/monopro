@@ -9917,14 +9917,19 @@ impl App {
         let k = raw.x.clamp(6.0, win_w) / raw.x;
         let reticle = egui::Rect::from_center_size(centre, raw * k * 2.0);
         let painter = ui.painter_at(rect);
-        // Amber, hairline, no fill — the prototype's, and it has to read over both a
-        // white sky and a black shadow without hiding either.
-        painter.rect_stroke(
-            reticle,
-            0.0,
-            egui::Stroke::new(1.0, theme::AMBER),
-            egui::StrokeKind::Inside,
+        // Hairline, no fill — the prototype's, and it has to read over both a white
+        // sky and a black shadow without hiding either. **Amber for the print, bright
+        // for Before**: both strokes say which of the two crops the window holds, so
+        // the original is never mistaken for the grain and sharpening being judged.
+        let ring = egui::Stroke::new(
+            1.0,
+            if tab.loupe.before {
+                theme::BRIGHT
+            } else {
+                theme::AMBER
+            },
         );
+        painter.rect_stroke(reticle, 0.0, ring, egui::StrokeKind::Inside);
 
         // ── The window ───────────────────────────────────────────────────────
         //
@@ -9946,8 +9951,8 @@ impl App {
                 //
                 // What the circle was buying — a window that reads as a lens rather
                 // than as another panel in a viewport full of rectangles — is carried
-                // by the amber stroke and by the offset placement above, which are the
-                // two things that say "this floats over the picture".
+                // by the stroke and by the offset placement above, which are the two
+                // things that say "this floats over the picture".
                 //
                 // Dimmed while a new tile is in flight, so a stale picture never
                 // silently passes for a fresh one during a drag.
@@ -9967,12 +9972,7 @@ impl App {
                 painter.rect_filled(win, 0.0, egui::Color32::from_gray(26));
             }
         }
-        painter.rect_stroke(
-            win,
-            0.0,
-            egui::Stroke::new(1.0, theme::AMBER),
-            egui::StrokeKind::Inside,
-        );
+        painter.rect_stroke(win, 0.0, ring, egui::StrokeKind::Inside);
     }
 
     /// The brush: where a press lands on the negative, and the pass it builds.

@@ -73,6 +73,8 @@ Changed
   which file is in front.
 - American spelling throughout: Center in contact sheet captions, Digitized in
   Digital Source Type, canceled in update messages.
+- The Print Loupe's outline is white while it shows Before (grain and sharpening
+  off) and amber while it shows the print, so the two are never confused.
 - Software updates stay inside the monopro window. Check for Updates, the update
   offer, download progress, "up to date" and update errors all appear in the
   Software Update sheet, which can also cancel a check or download in progress.
