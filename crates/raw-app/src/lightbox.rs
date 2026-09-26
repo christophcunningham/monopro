@@ -43,6 +43,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use raw_core::sidecar::IptcField;
+
 use crate::decode;
 use crate::theme;
 
@@ -283,13 +285,22 @@ fn default_tree() -> egui_tiles::Tree<Pane> {
     left.shares.set_share(favorites, 1.0);
     let left = tiles.insert_container(egui_tiles::Container::Linear(left));
 
+    // Info's width, so the reading column is the same in both modes.
     let mut row = egui_tiles::Linear::new(egui_tiles::LinearDir::Horizontal, vec![left, grid]);
-    row.shares.set_share(left, 240.0);
+    row.shares.set_share(left, crate::layout::INFO_W);
     row.shares.set_share(grid, 900.0);
 
     let root = tiles.insert_container(egui_tiles::Container::Linear(row));
     egui_tiles::Tree::new("monopro-lightbox", root, tiles)
 }
+
+/// Where the Lightbox's panel widths are remembered.
+///
+/// **`.v2` since the sidebar's default became Info's width**: the stored widths of
+/// every earlier layout were the old, narrower default, and they would have kept it
+/// there forever. Moving the key drops them once, on this upgrade, which is what
+/// "change the default" has to mean for someone who already has one.
+const PIXEL_SIZES_KEY: &str = "lightbox.pixel_sizes.v2";
 
 /// Whether a restored tree is one this build can run.
 ///
@@ -887,6 +898,9 @@ pub struct Lightbox {
     /// once a frame like the other display flags — it changes how a tile is *drawn* and
     /// so costs nothing to write every frame.
     pub edited_mark: bool,
+    /// The edited mark's color. Mirrors `Settings::lightbox_edited_ink`, pushed in the
+    /// same way as `edited_mark`.
+    pub edited_ink: egui::Color32,
     /// Subfolders as tiles. Mirrors `Settings::lightbox_folders`.
     ///
     /// **Private, with [`Lightbox::set_listing`] as the way in**, unlike the two
@@ -931,6 +945,9 @@ pub struct Lightbox {
     /// widths and leave the grid to absorb the difference.
     tree_restructured: bool,
     restore_panel_pixels: bool,
+    /// Side columns dragged off the window's edge — the same gesture, and the same
+    /// code, as Develop's. See [`crate::layout::Tuck`].
+    tuck: crate::layout::Tuck,
     /// `tab` has taken the panels away and left the grid.
     panels_hidden: bool,
     /// Folders you keep. Order is the order you added them.
@@ -977,6 +994,9 @@ pub struct Lightbox {
     iptc_template_selected: Option<usize>,
     iptc_template_name: Option<TemplateNameDialog>,
     iptc_template_editor: bool,
+    /// The Metadata pane's *More* fields are open. Session view state, like a
+    /// module's collapse.
+    iptc_more: bool,
     /// The rebuildable filename/path index and the SEARCH pane's session state.
     search: crate::search::SearchIndex,
     search_query: String,
@@ -1075,6 +1095,7 @@ impl Lightbox {
             frameless: false,
             xmp_thumbnails: false,
             edited_mark: true,
+            edited_ink: EDITED_INK,
             show_folders: false,
             show_other_files: false,
             grey: true,
@@ -1094,6 +1115,7 @@ impl Lightbox {
             panel_sizes: HashMap::new(),
             tree_restructured: false,
             restore_panel_pixels: true,
+            tuck: Default::default(),
             panels_hidden: false,
             favorites: Vec::new(),
             preview: None,
@@ -1112,6 +1134,7 @@ impl Lightbox {
             iptc_template_selected: None,
             iptc_template_name: None,
             iptc_template_editor: false,
+            iptc_more: false,
             search: crate::search::SearchIndex::new(),
             search_query: String::new(),
             search_showing: false,
@@ -1129,7 +1152,7 @@ impl Lightbox {
         {
             self.tree = tree;
         }
-        self.panel_sizes = eframe::get_value(storage, "lightbox.pixel_sizes").unwrap_or_default();
+        self.panel_sizes = eframe::get_value(storage, PIXEL_SIZES_KEY).unwrap_or_default();
         self.restore_panel_pixels = true;
         self.favorites =
             eframe::get_value::<Vec<PathBuf>>(storage, "lightbox.favorites").unwrap_or_default();
@@ -1196,6 +1219,7 @@ impl Lightbox {
         self.restore_panel_pixels = true;
         self.panel_sizes.clear();
         self.tree_restructured = false;
+        self.tuck = Default::default();
     }
 
     pub fn save(&self, storage: &mut dyn eframe::Storage) {
@@ -1206,7 +1230,13 @@ impl Lightbox {
                 sizes.insert(id, rect.size());
             }
         }
-        eframe::set_value(storage, "lightbox.pixel_sizes", &sizes);
+        // Tucks are not persisted, so a column quit while tucked comes back shown, at
+        // the width it would have come back at.
+        for (id, width) in self.tuck.iter() {
+            let h = sizes.get(&id).map_or(0.0, |s| s.y);
+            sizes.insert(id, egui::vec2(width, h));
+        }
+        eframe::set_value(storage, PIXEL_SIZES_KEY, &sizes);
         eframe::set_value(storage, "lightbox.favorites", &self.favorites);
     }
 
@@ -1229,50 +1259,6 @@ impl Lightbox {
                 .or_insert(egui::vec2(default, 0.0));
         }
         self.keep_panel_widths();
-    }
-
-    fn reset_panel_edge(&mut self, at: egui::Pos2, default: f32) -> bool {
-        let Some(grid) = self.tree.tiles.find_pane(&Pane::Grid) else {
-            return false;
-        };
-        let mut path = vec![grid];
-        while let Some(parent) = self.tree.tiles.parent_of(*path.last().unwrap()) {
-            path.push(parent);
-        }
-        self.capture_panel_sizes();
-        for id in self.tree.tiles.tile_ids().collect::<Vec<_>>() {
-            let Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(row))) =
-                self.tree.tiles.get(id)
-            else {
-                continue;
-            };
-            if row.dir != egui_tiles::LinearDir::Horizontal {
-                continue;
-            }
-            for pair in row.children.windows(2) {
-                let (Some(left), Some(right)) =
-                    (self.tree.tiles.rect(pair[0]), self.tree.tiles.rect(pair[1]))
-                else {
-                    continue;
-                };
-                let seam = egui::Rect::from_min_max(
-                    egui::pos2(left.right() - 4.0, left.top().max(right.top())),
-                    egui::pos2(right.left() + 4.0, left.bottom().min(right.bottom())),
-                );
-                if seam.contains(at) && path.contains(&pair[0]) != path.contains(&pair[1]) {
-                    let panel = if path.contains(&pair[0]) {
-                        pair[1]
-                    } else {
-                        pair[0]
-                    };
-                    self.panel_sizes
-                        .insert(panel, egui::vec2(default, left.height()));
-                    self.keep_panel_widths();
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     /// Draw the whole mode. Returns a file to open in Develop, if one was chosen.
@@ -1312,6 +1298,10 @@ impl Lightbox {
         // dropped pane is in doubt.
         self.heal_tree();
         self.tree.simplify(&crate::layout::SIMPLIFY);
+        // **Visibility before widths**, the order Develop's `before_ui` learned the hard
+        // way: `keep_panel_widths` solves over the children on screen, so it must see
+        // this frame's tucks rather than last frame's.
+        self.settle_visibility();
         if std::mem::take(&mut self.tree_restructured) {
             self.keep_panel_widths();
         } else {
@@ -1323,7 +1313,7 @@ impl Lightbox {
             .sum::<f32>()
             .ceil()
             + 2.0)
-            .max(240.0);
+            .max(crate::layout::INFO_W);
         self.restore_panel_widths(ui.available_width(), sidebar_width);
         let mut tree = std::mem::replace(&mut self.tree, egui_tiles::Tree::empty("lightbox-swap"));
         let tabbed: Vec<egui_tiles::TileId> = tree
@@ -1352,18 +1342,26 @@ impl Lightbox {
             open: None,
             nav: None,
             dropped: false,
+            resizing: false,
+            panel_width: sidebar_width,
         };
+        let area = ui.available_rect_before_wrap();
         tree.ui(&mut panes, ui);
-        let (open, nav, dropped) = (panes.open, panes.nav, panes.dropped);
+        let (open, nav, dropped, resizing) = (panes.open, panes.nav, panes.dropped, panes.resizing);
         self.tree = tree;
-        if let Some(at) = ui.input(|i| {
-            i.pointer
-                .button_double_clicked(egui::PointerButton::Primary)
-                .then(|| i.pointer.interact_pos())
-                .flatten()
-        }) && self.reset_panel_edge(at, sidebar_width)
-        {
-            ui.ctx().request_repaint();
+        if let Some(grid) = self.tree.tiles.find_pane(&Pane::Grid) {
+            // Outside `input`: ending the drag writes to the context `input` reads.
+            let tucked = ui.input(|i| {
+                self.tuck
+                    .drag(&self.tree, grid, i, resizing, [sidebar_width; 2])
+            });
+            if tucked {
+                ui.ctx().stop_dragging();
+                self.tree_restructured = true;
+            }
+            if let Some((id, width)) = self.tuck.strips(&self.tree, grid, ui, area) {
+                self.remember_width(id, width);
+            }
         }
         if dropped {
             self.tree_restructured = true;
@@ -1390,6 +1388,12 @@ impl Lightbox {
     /// comes back is exactly the arrangement that went away.
     pub fn toggle_panels(&mut self) {
         self.panels_hidden = !self.panels_hidden;
+        // "Every panel back" includes the ones tucked at the edge, as in Develop.
+        if !self.panels_hidden {
+            for (id, width) in self.tuck.take() {
+                self.remember_width(id, width);
+            }
+        }
     }
 
     pub fn previewing(&self) -> bool {
@@ -1737,6 +1741,28 @@ impl Lightbox {
         self.tree_restructured = true;
     }
 
+    /// Everything is shown except a tucked column.
+    ///
+    /// **Every tile, every frame**, because nothing else in this mode hides a tile and
+    /// the tree's visibility is serialized with it: a column quit while tucked would
+    /// otherwise come back invisible with no strip to reach it by, and one that was
+    /// tucked and then dragged somewhere else would stay hidden wherever it landed.
+    fn settle_visibility(&mut self) {
+        for id in self.tree.tiles.tile_ids().collect::<Vec<_>>() {
+            self.tree.set_visible(id, true);
+        }
+        if let Some(grid) = self.tree.tiles.find_pane(&Pane::Grid) {
+            self.tuck.settle(&mut self.tree, grid);
+        }
+    }
+
+    /// The width a column returning from a tuck comes back at.
+    fn remember_width(&mut self, id: egui_tiles::TileId, width: f32) {
+        let h = self.panel_sizes.get(&id).map_or(0.0, |s| s.y);
+        self.panel_sizes.insert(id, egui::vec2(width, h));
+        self.tree_restructured = true;
+    }
+
     /// Remember the sizes from the frame before a structural edit. `Tree::ui` clears
     /// its rects while drawing, so these must be captured ahead of the drop.
     fn capture_panel_sizes(&mut self) {
@@ -1792,7 +1818,7 @@ impl Lightbox {
                 .enumerate()
                 .filter(|(index, _)| *index != flex)
                 .find_map(|(_, child)| self.panel_sizes.get(child).map(|size| size.x))
-                .unwrap_or(240.0);
+                .unwrap_or(crate::layout::INFO_W);
             let mut widths: Vec<f32> = children
                 .iter()
                 .enumerate()
@@ -1822,12 +1848,29 @@ impl Lightbox {
             widths[flex] = for_grid;
 
             let solved: Vec<_> = children.iter().copied().zip(widths).collect();
+            // A hidden child — a tucked column — gets its remembered width too, on the
+            // same point scale. Left on the normalized one beside point-sized siblings,
+            // `normalise_shares` would preserve the mismatch and the column would come
+            // back a fraction of a point wide. Develop's `keep_panel_sizes` explains it.
+            let hidden: Vec<_> = row
+                .children
+                .iter()
+                .copied()
+                .filter(|child| !children.contains(child))
+                .map(|child| {
+                    let width = self
+                        .panel_sizes
+                        .get(&child)
+                        .map_or(crate::layout::INFO_W, |size| size.x);
+                    (child, width)
+                })
+                .collect();
             let Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(row))) =
                 self.tree.tiles.get_mut(id)
             else {
                 continue;
             };
-            for (child, width) in solved {
+            for (child, width) in solved.into_iter().chain(hidden) {
                 row.shares.set_share(child, width);
             }
         }
@@ -1844,6 +1887,11 @@ impl Lightbox {
             .find(|(_, t)| matches!(t, egui_tiles::Tile::Pane(p) if *p == want))
             .map(|(id, _)| *id);
         if let Some(id) = id {
+            // A pane asked for by name is brought out of a tucked column, or the Window
+            // menu would make current a panel nobody can see.
+            if let Some((column, width)) = self.tuck.release_containing(&self.tree, id) {
+                self.remember_width(column, width);
+            }
             self.tree.make_active(|tile, _| tile == id);
         }
     }
@@ -3781,6 +3829,9 @@ const IPTC_FIELDS: usize = raw_core::sidecar::IptcField::ALL.len();
 struct IptcDraft {
     paths: Vec<PathBuf>,
     values: [String; IPTC_FIELDS],
+    /// Each field as last loaded or saved — what an edit is an edit *from*. See
+    /// [`follow_creator`].
+    saved: [String; IPTC_FIELDS],
     mixed: [bool; IPTC_FIELDS],
     dirty: [bool; IPTC_FIELDS],
     ids: [Option<egui::Id>; IPTC_FIELDS],
@@ -3792,26 +3843,274 @@ impl IptcDraft {
             .iter()
             .map(|path| raw_core::sidecar::effective_metadata(path).unwrap_or_default())
             .collect();
-        let values = std::array::from_fn(|i| {
-            records
-                .first()
-                .and_then(|metadata| metadata.iptc(raw_core::sidecar::IptcField::ALL[i]))
-                .unwrap_or("")
-                .to_owned()
-        });
+        let text = |metadata: &raw_core::sidecar::Metadata, i: usize| {
+            metadata
+                .iptc(raw_core::sidecar::IptcField::ALL[i])
+                .map(|value| value.into_owned())
+                .unwrap_or_default()
+        };
+        let values: [String; IPTC_FIELDS] =
+            std::array::from_fn(|i| records.first().map(|m| text(m, i)).unwrap_or_default());
         let mixed = std::array::from_fn(|i| {
-            let field = raw_core::sidecar::IptcField::ALL[i];
             records
                 .iter()
                 .skip(1)
-                .any(|metadata| metadata.iptc(field).unwrap_or("") != values[i].as_str())
+                .any(|metadata| text(metadata, i) != values[i])
         });
         Self {
             paths,
+            saved: values.clone(),
             values,
             mixed,
             dirty: [false; IPTC_FIELDS],
             ids: [None; IPTC_FIELDS],
+        }
+    }
+}
+
+/// What the Metadata pane's stepping row asked for this frame.
+#[derive(Clone, Copy)]
+enum IptcNav {
+    Previous,
+    Next,
+    CopyToNext,
+}
+
+/// Apply IPTC `updates` to one image's sidecar, keeping its develop settings. The
+/// error names the file, ready to join into the footer's note.
+fn write_iptc(path: &Path, updates: &[(IptcField, String)]) -> Result<(), String> {
+    let (params, mut metadata) = match raw_core::sidecar::read(path) {
+        raw_core::sidecar::Loaded::Ok(sidecar) => (sidecar.params, sidecar.metadata),
+        raw_core::sidecar::Loaded::Absent => Default::default(),
+        raw_core::sidecar::Loaded::Corrupt(why) => {
+            return Err(format!("{}: {why}", name_of(path)));
+        }
+    };
+    for (field, value) in updates {
+        metadata.set_iptc(*field, value.clone());
+    }
+    raw_core::sidecar::write(path, &params, &metadata)
+        .map_err(|error| format!("{}: {error}", name_of(path)))
+}
+
+/// One IPTC field in the Metadata pane: its label, and its editor. Edits that are
+/// finished — a field left, a menu choice made — are pushed onto `commit`.
+fn iptc_field_ui(
+    ui: &mut egui::Ui,
+    draft: &mut IptcDraft,
+    i: usize,
+    field: IptcField,
+    commit: &mut Vec<usize>,
+) {
+    // Match the left inset on the right, plus a little room for the vertical
+    // scrollbar so the field stroke never disappears under the pane edge.
+    let inset = |ui: &egui::Ui| (ui.available_width() - 18.0).max(72.0);
+    // A menu choice is finished the moment it is made, so it commits at once.
+    let chose = |draft: &mut IptcDraft, value: String, commit: &mut Vec<usize>| {
+        if draft.mixed[i] || draft.values[i] != value {
+            draft.values[i] = value;
+            draft.dirty[i] = true;
+            draft.mixed[i] = false;
+            commit.push(i);
+        }
+    };
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(theme::caption(field.label()).color(theme::DIM));
+            if field == IptcField::Copyright {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(18.0);
+                    if let Some(notice) = copyright_presets(ui, draft) {
+                        chose(draft, notice, commit);
+                    }
+                });
+            } else if field.list() {
+                // Beside the label rather than as hint text, which reads as a value.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(18.0);
+                    ui.label(theme::caption("comma separated").color(theme::DIM));
+                });
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            let width = inset(ui);
+            if field.vocabulary().is_some() {
+                let mut value = draft.values[i].clone();
+                if vocabulary_menu(
+                    ui,
+                    egui::Id::new(("lightbox-iptc", field.key())),
+                    field,
+                    &mut value,
+                    draft.mixed[i],
+                    width,
+                ) {
+                    chose(draft, value, commit);
+                }
+                return;
+            }
+            let hint = if draft.mixed[i] {
+                "Multiple values"
+            } else if field == IptcField::DateCreated {
+                "YYYY-MM-DDThh:mm:ss"
+            } else if field == IptcField::Copyright {
+                "select preset"
+            } else {
+                ""
+            };
+            let rows = if field.list() || field == IptcField::Copyright {
+                2
+            } else {
+                3
+            };
+            let edit = if field.multiline() {
+                egui::TextEdit::multiline(&mut draft.values[i]).desired_rows(rows)
+            } else {
+                egui::TextEdit::singleline(&mut draft.values[i]).vertical_align(egui::Align::Center)
+            }
+            .desired_width(width)
+            .hint_text(hint)
+            .id_source(("lightbox-iptc", field.key()));
+            let height = if !field.multiline() {
+                24.0
+            } else if rows == 2 {
+                40.0
+            } else {
+                54.0
+            };
+            let response = ui.add_sized([width, height], edit);
+            draft.ids[i] = Some(response.id);
+            if response.changed() {
+                draft.dirty[i] = true;
+                draft.mixed[i] = false;
+            }
+            if response.lost_focus() && draft.dirty[i] {
+                commit.push(i);
+            }
+        });
+        ui.add_space(4.0);
+    });
+}
+
+/// The Copyright Notice's presets menu. The owner is the Copyright Owner field, or
+/// the Creator when that is empty; the year is Date Created's, or this year's.
+fn copyright_presets(ui: &mut egui::Ui, draft: &IptcDraft) -> Option<String> {
+    let known = |field: IptcField| {
+        let i = field as usize;
+        (!draft.mixed[i])
+            .then(|| draft.values[i].trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let owner = known(IptcField::CopyrightOwner)
+        .or_else(|| known(IptcField::Creator))
+        .unwrap_or_default();
+    let year =
+        crate::iptc_templates::notice_year(&known(IptcField::DateCreated).unwrap_or_default());
+    let mut picked = None;
+    ui.menu_button(theme::caption("Presets ▾").color(theme::DIM), |ui| {
+        for notice in crate::iptc_templates::Notice::ALL {
+            if ui
+                .button(notice.label())
+                .on_hover_text(notice.text(&year, &owner))
+                .clicked()
+            {
+                picked = Some(notice.text(&year, &owner));
+                ui.close();
+            }
+        }
+    })
+    .response
+    .on_hover_text(theme::tip("Fill in a standard notice — it stays editable"));
+    picked
+}
+
+/// A controlled-vocabulary field — Digital Source Type, Data Mining — as a menu of
+/// the vocabulary's own names, storing the URI the standard requires. A value outside
+/// the vocabulary is shown as written and kept until something is chosen. Returns
+/// whether a choice was made.
+fn vocabulary_menu(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    field: IptcField,
+    value: &mut String,
+    mixed: bool,
+    width: f32,
+) -> bool {
+    let Some((cv, terms)) = field.vocabulary() else {
+        return false;
+    };
+    let current = value.trim().to_owned();
+    let shown = if mixed {
+        "Multiple values".to_owned()
+    } else if current.is_empty() {
+        "—".to_owned()
+    } else {
+        field
+            .term_label(&current)
+            .map_or_else(|| current.clone(), str::to_owned)
+    };
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(shown)
+        .width(width)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(!mixed && current.is_empty(), "—")
+                .clicked()
+            {
+                picked = Some(String::new());
+            }
+            for (code, label, offered) in terms {
+                if !offered {
+                    continue;
+                }
+                let uri = format!("{cv}{code}");
+                if ui
+                    .selectable_label(!mixed && current == uri, *label)
+                    .clicked()
+                {
+                    picked = Some(uri);
+                }
+            }
+        });
+    match picked {
+        Some(uri) => {
+            *value = uri;
+            true
+        }
+        None => false,
+    }
+}
+
+/// **Copyright Owner and Credit Line follow the Creator**, the maintainer's ask: once
+/// a creator is entered, each of the two that is empty — or still says what the
+/// creator said before, so it was following — takes the new name. One that says
+/// something else was written on purpose and is left alone, and clearing the creator
+/// clears neither.
+///
+/// Called with the fields finished this frame, before they are saved; the two it
+/// fills are added to them.
+fn follow_creator(draft: &mut IptcDraft, commit: &mut Vec<usize>) {
+    let creator = IptcField::Creator as usize;
+    if !commit.contains(&creator) || draft.mixed[creator] {
+        return;
+    }
+    let new = draft.values[creator].trim().to_owned();
+    let old = draft.saved[creator].trim().to_owned();
+    if new.is_empty() {
+        return;
+    }
+    for field in [IptcField::CopyrightOwner, IptcField::Credit] {
+        let i = field as usize;
+        let current = draft.values[i].trim();
+        if draft.mixed[i] || current == new || !(current.is_empty() || current == old) {
+            continue;
+        }
+        draft.values[i] = new.clone();
+        draft.dirty[i] = true;
+        if !commit.contains(&i) {
+            commit.push(i);
         }
     }
 }
@@ -4058,12 +4357,75 @@ fn write_metadata(image: &Path, rating: i32, label: Option<&str>) -> std::io::Re
     raw_core::sidecar::write(image, &params, &metadata)
 }
 
-/// The mark on a frame that has been worked on. the maintainer's colour and weight.
+/// The mark on a frame that has been worked on, at its default color: Dixon Yellow 73,
+/// which replaced the app's own yellow as the maintainer's pick. The maintainer's weight.
 ///
 /// Outside the picture's edge rather than inside it, so the rule does not cover a
 /// pixel of the photograph it is marking.
-const EDITED_INK: egui::Color32 = egui::Color32::from_rgb(0xE9, 0xC5, 0x00);
+const EDITED_INK: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xD0, 0x2A);
 const EDITED_STROKE: f32 = 1.6;
+
+/// The settings key for [`EDITED_INK`].
+pub const EDITED_INK_DEFAULT: &str = "yellow-73";
+
+/// The colors the edited mark can be drawn in (Settings › Lightbox): the **Dixon China
+/// Marker** grease pencils — the darkroom's own way of marking a contact sheet, which is
+/// what the mark does to the grid.
+///
+/// `(settings key, name, color)`. The keys are what `settings.toml` stores, so a color
+/// can be retuned without stranding anybody's choice. Taken from the tip of each pencil
+/// in the maintainer's reference photograph, judged by eye (the file itself was not
+/// available to sample), and ordered by hue. Red 79 and Black 77 are left out on the
+/// maintainer's instruction: red is the app's selection ring, and black would vanish
+/// against the grid.
+pub const EDITED_INKS: [(&str, &str, egui::Color32); 8] = [
+    (EDITED_INK_DEFAULT, "Yellow 73", EDITED_INK),
+    (
+        "orange-72",
+        "Orange 72",
+        egui::Color32::from_rgb(0xEE, 0x6C, 0x1F),
+    ),
+    (
+        "crimson-71",
+        "Crimson Red 71",
+        egui::Color32::from_rgb(0xB4, 0x24, 0x48),
+    ),
+    (
+        "purple-76",
+        "Purple 76",
+        egui::Color32::from_rgb(0x7C, 0x3F, 0x9E),
+    ),
+    (
+        "blue-80",
+        "Blue 80",
+        egui::Color32::from_rgb(0x2F, 0x58, 0xAA),
+    ),
+    (
+        "green-74",
+        "Green 74",
+        egui::Color32::from_rgb(0x2C, 0x8C, 0x46),
+    ),
+    (
+        "brown-95",
+        "Brown 95",
+        egui::Color32::from_rgb(0x70, 0x42, 0x2B),
+    ),
+    (
+        "white-92",
+        "White 92",
+        egui::Color32::from_rgb(0xF2, 0xF0, 0xEA),
+    ),
+];
+
+/// The edited mark's color for a settings key. An unknown key — a hand edit, one from a
+/// later version, or the `"default"` an earlier build of this palette stored — is the
+/// default rather than an error.
+pub fn edited_ink(key: &str) -> egui::Color32 {
+    EDITED_INKS
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .map_or(EDITED_INK, |(_, _, c)| *c)
+}
 
 /// Shorten text to fit a width, keeping both ends.
 ///
@@ -4269,7 +4631,7 @@ fn grid_metrics(available_width: f32, rung: Rung, furniture_h: f32) -> (usize, f
 /// two words.
 pub fn mode_tabs(ui: &mut egui::Ui, lightbox_active: bool) -> Option<bool> {
     const TAB_W: f32 = 72.0;
-    const H: f32 = 20.0;
+    const H: f32 = theme::size::FOOTER_ICON + 2.0;
 
     let (rect, _) = ui.allocate_exact_size(egui::vec2(TAB_W * 2.0, H), egui::Sense::hover());
     let mut want = None;
@@ -4303,7 +4665,7 @@ pub fn mode_tabs(ui: &mut egui::Ui, lightbox_active: bool) -> Option<bool> {
             tab.center(),
             egui::Align2::CENTER_CENTER,
             label,
-            egui::FontId::proportional(8.0),
+            egui::FontId::proportional(theme::size::FOOTER_CAPTION),
             colour,
         );
         if r.clicked() {
@@ -4330,6 +4692,10 @@ struct Panes<'a> {
     open: Option<PathBuf>,
     nav: Option<PathBuf>,
     dropped: bool,
+    /// A seam was dragged this frame. See [`crate::layout::Tuck::drag`].
+    resizing: bool,
+    /// The sidebar's shipped width, which a double-clicked seam puts a panel back at.
+    panel_width: f32,
 }
 
 impl Panes<'_> {
@@ -4420,7 +4786,7 @@ impl Panes<'_> {
                     self.nav = Some(dir);
                 }
             }
-            Pane::Exif => self.lb.exif_ui(ui),
+            Pane::Exif => self.lb.exif_ui(ui, self.icons),
         }
         dragged
     }
@@ -4513,6 +4879,23 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
 
     fn on_edit(&mut self, action: egui_tiles::EditAction) {
         self.dropped |= action == egui_tiles::EditAction::TileDropped;
+        self.resizing |= action == egui_tiles::EditAction::TileResized;
+    }
+
+    /// See `layout::reset_seam`, which Develop answers with too.
+    fn on_seam_double_click(
+        &mut self,
+        tiles: &egui_tiles::Tiles<Pane>,
+        shares: &mut egui_tiles::Shares,
+        dir: egui_tiles::LinearDir,
+        children: &[egui_tiles::TileId],
+        pair: [egui_tiles::TileId; 2],
+    ) -> bool {
+        let Some(grid) = tiles.find_pane(&Pane::Grid) else {
+            return false;
+        };
+        let width = self.panel_width;
+        crate::layout::reset_seam(tiles, shares, dir, children, pair, grid, [width; 2]).is_some()
     }
 
     // The rest is Develop's tab styling, repeated rather than shared because the
@@ -5231,42 +5614,25 @@ impl Lightbox {
             return;
         };
         let paths = draft.paths.clone();
-        let updates: Vec<(usize, String)> = slots
+        let updates: Vec<(IptcField, String)> = slots
             .iter()
-            .copied()
-            .map(|i| (i, draft.values[i].clone()))
+            .map(|&i| (IptcField::ALL[i], draft.values[i].clone()))
             .collect();
         let mut errors = Vec::new();
         let mut saved = Vec::new();
-
         for path in &paths {
-            let (params, mut metadata) = match raw_core::sidecar::read(path) {
-                raw_core::sidecar::Loaded::Ok(sidecar) => (sidecar.params, sidecar.metadata),
-                raw_core::sidecar::Loaded::Absent => (Default::default(), Default::default()),
-                raw_core::sidecar::Loaded::Corrupt(why) => {
-                    errors.push(format!("{}: {why}", name_of(path)));
-                    continue;
-                }
-            };
-            for (i, value) in &updates {
-                metadata.set_iptc(raw_core::sidecar::IptcField::ALL[*i], value.clone());
-            }
-            match raw_core::sidecar::write(path, &params, &metadata) {
+            match write_iptc(path, &updates) {
                 Ok(()) => saved.push(path.clone()),
-                Err(err) => errors.push(format!("{}: {err}", name_of(path))),
+                Err(error) => errors.push(error),
             }
         }
-
-        let search_updates: Vec<_> = updates
-            .iter()
-            .map(|(i, value)| (raw_core::sidecar::IptcField::ALL[*i], value.clone()))
-            .collect();
-        self.search.update_iptc(&saved, &search_updates);
+        self.search.update_iptc(&saved, &updates);
 
         if let Some(draft) = self.iptc.as_mut() {
             for &i in slots {
                 draft.dirty[i] = false;
                 draft.mixed[i] = false;
+                draft.saved[i] = draft.values[i].clone();
             }
         }
         self.exif = None;
@@ -5302,44 +5668,23 @@ impl Lightbox {
         let paths = self.iptc_paths();
         let mut errors = Vec::new();
         let mut saved = Vec::new();
-        let mut search_updates = Vec::new();
-        for field in raw_core::sidecar::IptcField::ALL {
-            match template.action(field) {
-                Some(crate::iptc_templates::Action::Set { value }) => {
-                    search_updates.push((field, value.clone()));
-                }
-                Some(crate::iptc_templates::Action::Clear) => {
-                    search_updates.push((field, String::new()));
-                }
-                None => {}
-            }
-        }
+        // A hand-edited template file could name a capture date; it still must not
+        // be stamped across a folder. See `IptcField::per_image`.
+        let updates: Vec<(IptcField, String)> = IptcField::ALL
+            .into_iter()
+            .filter(|field| !field.per_image())
+            .filter_map(|field| match template.action(field)? {
+                crate::iptc_templates::Action::Set { value } => Some((field, value.clone())),
+                crate::iptc_templates::Action::Clear => Some((field, String::new())),
+            })
+            .collect();
         for path in &paths {
-            let (params, mut metadata) = match raw_core::sidecar::read(path) {
-                raw_core::sidecar::Loaded::Ok(sidecar) => (sidecar.params, sidecar.metadata),
-                raw_core::sidecar::Loaded::Absent => (Default::default(), Default::default()),
-                raw_core::sidecar::Loaded::Corrupt(why) => {
-                    errors.push(format!("{}: {why}", name_of(path)));
-                    continue;
-                }
-            };
-            for field in raw_core::sidecar::IptcField::ALL {
-                match template.action(field) {
-                    Some(crate::iptc_templates::Action::Set { value }) => {
-                        metadata.set_iptc(field, value.clone());
-                    }
-                    Some(crate::iptc_templates::Action::Clear) => {
-                        metadata.set_iptc(field, String::new());
-                    }
-                    None => {}
-                }
-            }
-            match raw_core::sidecar::write(path, &params, &metadata) {
+            match write_iptc(path, &updates) {
                 Ok(()) => saved.push(path.clone()),
-                Err(error) => errors.push(format!("{}: {error}", name_of(path))),
+                Err(error) => errors.push(error),
             }
         }
-        self.search.update_iptc(&saved, &search_updates);
+        self.search.update_iptc(&saved, &updates);
 
         self.iptc = Some(IptcDraft::load(paths));
         self.exif = None;
@@ -5353,7 +5698,9 @@ impl Lightbox {
         };
     }
 
-    fn iptc_template_controls(&mut self, ui: &mut egui::Ui) {
+    /// The template menu, Apply and `⋯`. Returns where the row ends, so the row under
+    /// it can end there too.
+    fn iptc_template_controls(&mut self, ui: &mut egui::Ui) -> f32 {
         let names: Vec<String> = self
             .iptc_templates
             .templates
@@ -5377,6 +5724,7 @@ impl Lightbox {
         let mut edit = false;
         let mut rename = false;
         let mut delete = false;
+        let mut right = ui.max_rect().right();
 
         ui.horizontal(|ui| {
             ui.add_space(8.0);
@@ -5408,26 +5756,30 @@ impl Lightbox {
                 )
                 .on_hover_text(theme::tip("Apply to the selected image or images"))
                 .clicked();
-            ui.menu_button("⋯", |ui| {
-                if ui.button("Save Current as Template…").clicked() {
-                    save_current = true;
-                    ui.close();
-                }
-                ui.add_enabled_ui(self.iptc_template_selected.is_some(), |ui| {
-                    if ui.button("Edit Template…").clicked() {
-                        edit = true;
+            right = ui
+                .menu_button("⋯", |ui| {
+                    if ui.button("Save Current as Template…").clicked() {
+                        save_current = true;
                         ui.close();
                     }
-                    if ui.button("Rename…").clicked() {
-                        rename = true;
-                        ui.close();
-                    }
-                    if ui.button("Delete").clicked() {
-                        delete = true;
-                        ui.close();
-                    }
-                });
-            });
+                    ui.add_enabled_ui(self.iptc_template_selected.is_some(), |ui| {
+                        if ui.button("Edit Template…").clicked() {
+                            edit = true;
+                            ui.close();
+                        }
+                        if ui.button("Rename…").clicked() {
+                            rename = true;
+                            ui.close();
+                        }
+                        if ui.button("Delete").clicked() {
+                            delete = true;
+                            ui.close();
+                        }
+                    });
+                })
+                .response
+                .rect
+                .right();
         });
 
         if let Some(index) = picked {
@@ -5465,6 +5817,7 @@ impl Lightbox {
             self.iptc_template_editor = false;
             self.save_iptc_templates();
         }
+        right
     }
 
     fn iptc_template_name_dialog(&mut self, ctx: &egui::Context) {
@@ -5596,6 +5949,9 @@ impl Lightbox {
                         for (i, field) in
                             raw_core::sidecar::IptcField::ALL.into_iter().enumerate()
                         {
+                            if field.per_image() {
+                                continue;
+                            }
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(118.0, 24.0),
@@ -5623,7 +5979,19 @@ impl Lightbox {
                                         values[i] = current_values[i].clone();
                                     }
                                 }
-                                if modes[i] == TemplateFieldMode::Set {
+                                if modes[i] == TemplateFieldMode::Set
+                                    && field.vocabulary().is_some()
+                                {
+                                    let width = ui.available_width();
+                                    changed |= vocabulary_menu(
+                                        ui,
+                                        egui::Id::new(("iptc-template-field-value", field.key())),
+                                        field,
+                                        &mut values[i],
+                                        false,
+                                        width,
+                                    );
+                                } else if modes[i] == TemplateFieldMode::Set {
                                     changed |= ui
                                         .add(
                                             egui::TextEdit::singleline(&mut values[i])
@@ -5658,7 +6026,7 @@ impl Lightbox {
 
     /// Camera and file facts remain read-only; IPTC beneath them is an authored
     /// sidecar overlay. A multi-selection edits only the field that was touched.
-    pub fn exif_ui(&mut self, ui: &mut egui::Ui) {
+    pub fn exif_ui(&mut self, ui: &mut egui::Ui, icons: &crate::icons::Icons) {
         let Some(path) = self
             .selected
             .and_then(|i| self.entries.get(i as usize))
@@ -5707,6 +6075,8 @@ impl Lightbox {
             .map(|draft| draft.paths.len())
             .unwrap_or(0);
         let mut left_fields = Vec::new();
+        let mut nav = None;
+        let mut toggle_more = false;
 
         ui.add_space(6.0);
         egui::ScrollArea::vertical()
@@ -5761,56 +6131,226 @@ impl Lightbox {
                     }
                 });
                 ui.add_space(3.0);
-                self.iptc_template_controls(ui);
+                let right = self.iptc_template_controls(ui);
+                ui.add_space(4.0);
+                nav = self.iptc_nav_row(ui, icons, right);
                 ui.add_space(6.0);
+                let more = self.iptc_more;
                 let Some(draft) = self.iptc.as_mut() else {
                     return;
                 };
-                for (i, field) in raw_core::sidecar::IptcField::ALL.into_iter().enumerate() {
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            ui.label(theme::caption(field.label()).color(theme::DIM));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            // Match the left inset on the right, plus a little room
-                            // for the vertical scrollbar so the field stroke never
-                            // disappears under the pane edge.
-                            let width = (ui.available_width() - 18.0).max(72.0);
-                            let edit = if field.multiline() {
-                                egui::TextEdit::multiline(&mut draft.values[i]).desired_rows(3)
-                            } else {
-                                egui::TextEdit::singleline(&mut draft.values[i])
-                                    .vertical_align(egui::Align::Center)
-                            }
-                            .desired_width(width)
-                            .hint_text(if draft.mixed[i] {
-                                "Multiple values"
-                            } else {
-                                ""
-                            })
-                            .id_source(("lightbox-iptc", field.key()));
-                            let response = ui.add_sized(
-                                [width, if field.multiline() { 54.0 } else { 24.0 }],
-                                edit,
-                            );
-                            draft.ids[i] = Some(response.id);
-                            if response.changed() {
-                                draft.dirty[i] = true;
-                                draft.mixed[i] = false;
-                            }
-                            if response.lost_focus() && draft.dirty[i] {
-                                left_fields.push(i);
-                            }
-                        });
-                        ui.add_space(4.0);
-                    });
+                for (i, field) in IptcField::ALL.into_iter().enumerate() {
+                    if !field.secondary() {
+                        iptc_field_ui(ui, draft, i, field, &mut left_fields);
+                    }
+                }
+                // The four older fields, kept rather than dropped: files already carry
+                // them and search still finds them, but they are not what a caption
+                // desk fills in, so they wait behind one click.
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    let label = if more { "▾ MORE" } else { "▸ MORE" };
+                    // A control rather than a note, so lighter and a size up from the
+                    // field captions around it — the maintainer found it too easy to miss.
+                    let text = egui::RichText::new(label)
+                        .size(theme::size::SLIDER)
+                        .color(theme::NAME);
+                    if ui
+                        .add(egui::Label::new(text).sense(egui::Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(theme::tip(
+                            "Alt Text, Title, Headline, Person Shown, Description Writer, \
+                             Source, Data Mining and Instructions",
+                        ))
+                        .clicked()
+                    {
+                        toggle_more = true;
+                    }
+                });
+                ui.add_space(4.0);
+                if more {
+                    for (i, field) in IptcField::ALL.into_iter().enumerate() {
+                        if field.secondary() {
+                            iptc_field_ui(ui, draft, i, field, &mut left_fields);
+                        }
+                    }
                 }
             });
+        self.iptc_more ^= toggle_more;
+        if let Some(draft) = self.iptc.as_mut() {
+            follow_creator(draft, &mut left_fields);
+        }
         self.commit_iptc_slots(&left_fields);
+        // After the pane is drawn and its edits saved, so the fields above were
+        // drawn from, and committed to, the frame they were typed into.
+        match nav {
+            Some(IptcNav::Previous) => {
+                if let Some(index) = self.neighbor_picture(false) {
+                    self.select_only(index);
+                }
+            }
+            Some(IptcNav::Next) => {
+                if let Some(index) = self.neighbor_picture(true) {
+                    self.select_only(index);
+                }
+            }
+            Some(IptcNav::CopyToNext) => self.copy_iptc_to_next(),
+            None => {}
+        }
         self.iptc_template_name_dialog(ui.ctx());
         self.iptc_template_editor(ui.ctx());
+    }
+
+    /// Open *More*, for `visual.rs`, which draws the pane with every field showing.
+    #[cfg(test)]
+    pub(crate) fn expand_iptc_more(&mut self) {
+        self.iptc_more = true;
+    }
+
+    /// Previous, Next and Copy to Next, under the template menu.
+    ///
+    /// **Next and previous skip folders**, unlike `←`/`→`: these live in the Metadata
+    /// pane and step between the things that have metadata. A folder tile between two
+    /// frames would otherwise be a stop with an empty form on it.
+    ///
+    /// Its right edge is the template row's, `right`: the two rows are one block of
+    /// controls, and a button reaching past the one above reads as out of place.
+    fn iptc_nav_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        icons: &crate::icons::Icons,
+        right: f32,
+    ) -> Option<IptcNav> {
+        let previous = self.neighbor_picture(false).is_some();
+        let next = self.neighbor_picture(true).is_some();
+        let single = self
+            .iptc
+            .as_ref()
+            .is_some_and(|draft| draft.paths.len() == 1);
+        let mut nav = None;
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing.x = 5.0;
+            if crate::icons::sized(ui, icons, "previous", "◀", previous, crate::icons::BIG)
+                .on_hover_text(theme::tip("Previous image"))
+                .clicked()
+            {
+                nav = Some(IptcNav::Previous);
+            }
+            if crate::icons::sized(ui, icons, "next", "▶", next, crate::icons::BIG)
+                .on_hover_text(theme::tip("Next image"))
+                .clicked()
+            {
+                nav = Some(IptcNav::Next);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space((ui.max_rect().right() - right).max(0.0));
+                let tip = if single {
+                    "Copy every IPTC field to the next image, then move to it. \
+                     Date Created stays with its own frame."
+                } else {
+                    "Select one image to copy from"
+                };
+                if crate::icons::pair(
+                    ui,
+                    icons,
+                    "Copy to Next",
+                    ["copy", "next"],
+                    "⧉",
+                    single && next,
+                    crate::icons::BIG,
+                )
+                .on_hover_text(theme::tip(tip))
+                .clicked()
+                {
+                    nav = Some(IptcNav::CopyToNext);
+                }
+            });
+        });
+        nav
+    }
+
+    /// The nearest picture before or after the selection in the grid's visible order,
+    /// passing over folders. `None` at either end.
+    fn neighbor_picture(&self, forward: bool) -> Option<u32> {
+        let current = self.selected?;
+        let at = self.visible.iter().position(|index| *index == current)?;
+        let picture = |index: &u32| {
+            self.entries
+                .get(*index as usize)
+                .is_some_and(|entry| entry.kind == Kind::Picture)
+        };
+        if forward {
+            self.visible[at + 1..].iter().copied().find(picture)
+        } else {
+            self.visible[..at].iter().rev().copied().find(picture)
+        }
+    }
+
+    /// Select one tile and nothing else, as a plain click on it does.
+    fn select_only(&mut self, index: u32) {
+        self.batch.clear();
+        self.head = None;
+        self.selected = Some(index);
+        self.follow = true;
+        if self.preview.is_some() {
+            self.preview = Some(index);
+        }
+    }
+
+    /// **Copy to Next**: every IPTC field of this frame onto the next, then move there.
+    ///
+    /// The sequential half of captioning, where a template is the batch half: a shoot
+    /// is mostly the same caption with one line changed per frame, so this carries the
+    /// lot forward and puts you on the frame to change it. Only what differs is
+    /// written, so a field that already matches — or an empty one over an empty one —
+    /// adds nothing to the next frame's sidecar. The capture date is left alone; see
+    /// `IptcField::per_image`.
+    fn copy_iptc_to_next(&mut self) {
+        let Some(next) = self.neighbor_picture(true) else {
+            return;
+        };
+        // What is still being typed is part of what is being copied.
+        let dirty: Vec<usize> = self
+            .iptc
+            .as_ref()
+            .map(|draft| (0..IPTC_FIELDS).filter(|&i| draft.dirty[i]).collect())
+            .unwrap_or_default();
+        self.commit_iptc_slots(&dirty);
+        let Some(draft) = self.iptc.as_ref().filter(|draft| draft.paths.len() == 1) else {
+            return;
+        };
+        let Some(target) = self
+            .entries
+            .get(next as usize)
+            .map(|entry| entry.path.clone())
+        else {
+            return;
+        };
+        let current = match raw_core::sidecar::effective_metadata(&target) {
+            Ok(metadata) => metadata,
+            Err(why) => {
+                self.action_note = Some(format!("Metadata was not copied — {why}"));
+                return;
+            }
+        };
+        let updates: Vec<(IptcField, String)> = IptcField::ALL
+            .into_iter()
+            .enumerate()
+            .filter(|(_, field)| !field.per_image())
+            .map(|(i, field)| (field, draft.values[i].trim().to_owned()))
+            .filter(|(field, value)| current.iptc(*field).as_deref().unwrap_or("") != value)
+            .collect();
+        if !updates.is_empty() {
+            if let Err(error) = write_iptc(&target, &updates) {
+                self.action_note = Some(format!("Metadata was not copied — {error}"));
+                return;
+            }
+            self.search
+                .update_iptc(std::slice::from_ref(&target), &updates);
+        }
+        self.select_only(next);
+        self.action_note = Some(format!("Copied metadata to {}", name_of(&target)));
     }
 
     /// Lightbox's browsing controls, grouped in the order their meaning unfolds:
@@ -5824,16 +6364,23 @@ impl Lightbox {
     fn footer_controls_ui(&mut self, ui: &mut egui::Ui, icons: &crate::icons::Icons) {
         // Subfolders changes what is *listed*, so it re-reads the folder rather than
         // re-filtering what is already in hand.
-        if crate::icons::toggle(ui, icons, "tree-view", "⌸", self.filters.subfolders, 18.0)
-            .on_hover_text(theme::tip("Include subfolders"))
-            .clicked()
+        if crate::icons::toggle(
+            ui,
+            icons,
+            "tree-view",
+            "⌸",
+            self.filters.subfolders,
+            theme::size::FOOTER_ICON,
+        )
+        .on_hover_text(theme::tip("Include subfolders"))
+        .clicked()
         {
             self.filters.subfolders = !self.filters.subfolders;
             self.reopen();
         }
 
         let any = !self.selection().is_empty();
-        if crate::icons::sized(ui, icons, "text-aa", "Aa", any, 18.0)
+        if crate::icons::sized(ui, icons, "text-aa", "Aa", any, theme::size::FOOTER_ICON)
             .on_hover_text(theme::tip("Rename selected files · ⇧⌘R"))
             .clicked()
         {
@@ -5845,9 +6392,16 @@ impl Lightbox {
                 .get(*index as usize)
                 .is_some_and(|entry| entry.kind == Kind::Picture)
         });
-        if crate::icons::sized(ui, icons, "file-pdf", "PDF", has_pictures, 18.0)
-            .on_hover_text(theme::tip("Contact sheet PDF · ⇧⌘P"))
-            .clicked()
+        if crate::icons::sized(
+            ui,
+            icons,
+            "file-pdf",
+            "PDF",
+            has_pictures,
+            theme::size::FOOTER_ICON,
+        )
+        .on_hover_text(theme::tip("Contact sheet PDF · ⇧⌘P"))
+        .clicked()
         {
             self.begin_contact_sheet();
         }
@@ -5878,7 +6432,7 @@ impl Lightbox {
         } else {
             "sort-ascending"
         };
-        if crate::icons::sized(ui, icons, glyph, "↕", true, 18.0)
+        if crate::icons::sized(ui, icons, glyph, "↕", true, theme::size::FOOTER_ICON)
             .on_hover_text(theme::tip(if self.descending {
                 "Descending"
             } else {
@@ -5910,8 +6464,9 @@ impl Lightbox {
         // and here it means "this many or more".
         let dim = self.filters.unrated;
         for n in 1..=5i32 {
+            // Scaled with `FOOTER_ICON`, so the filter row grows with the buttons.
             let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(12.0, ui.available_height()),
+                egui::vec2(14.0, ui.available_height()),
                 egui::Sense::hover(),
             );
             let hit = ui.interact(rect, ui.id().with(("fstar", n)), egui::Sense::click());
@@ -5929,7 +6484,7 @@ impl Lightbox {
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 if on { "★" } else { "☆" },
-                egui::FontId::proportional(10.0),
+                egui::FontId::proportional(12.0),
                 ink,
             );
             if hit.clicked() && !dim {
@@ -5944,18 +6499,18 @@ impl Lightbox {
         // naturally "show me these", not "show me this one".
         for (name, colour) in theme::LABELS {
             let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(14.0, ui.available_height()),
+                egui::vec2(16.0, ui.available_height()),
                 egui::Sense::hover(),
             );
             let hit = ui.interact(rect, ui.id().with(("flabel", name)), egui::Sense::click());
             let on = self.filters.labels.iter().any(|l| l == name);
             let c = rect.center();
             if on {
-                ui.painter().circle_filled(c, 5.0, colour);
+                ui.painter().circle_filled(c, 6.0, colour);
             } else {
                 ui.painter().circle_stroke(
                     c,
-                    4.5,
+                    5.5,
                     egui::Stroke::new(
                         1.0,
                         if hit.hovered() {
@@ -5981,7 +6536,7 @@ impl Lightbox {
         // clear by restarting.
         if self.filters.any() {
             let subfolders = self.filters.subfolders;
-            if crate::icons::sized(ui, icons, "funnel", "▽", true, 18.0)
+            if crate::icons::sized(ui, icons, "funnel", "▽", true, theme::size::FOOTER_ICON)
                 .on_hover_text(theme::tip("Clear the filters"))
                 .clicked()
             {
@@ -6120,15 +6675,29 @@ impl Lightbox {
                 } else {
                     "rectangle"
                 };
-                if crate::icons::toggle(ui, icons, frameless_glyph, "□", self.frameless, 18.0)
-                    .on_hover_text(theme::tip("Frameless tiles — hide the border"))
-                    .clicked()
+                if crate::icons::toggle(
+                    ui,
+                    icons,
+                    frameless_glyph,
+                    "□",
+                    self.frameless,
+                    theme::size::FOOTER_ICON,
+                )
+                .on_hover_text(theme::tip("Frameless tiles — hide the border"))
+                .clicked()
                 {
                     act.frameless = Some(!self.frameless);
                 }
-                if crate::icons::toggle(ui, icons, "article", "≡", self.show_filenames, 18.0)
-                    .on_hover_text(theme::tip("Filenames under the tiles"))
-                    .clicked()
+                if crate::icons::toggle(
+                    ui,
+                    icons,
+                    "article",
+                    "≡",
+                    self.show_filenames,
+                    theme::size::FOOTER_ICON,
+                )
+                .on_hover_text(theme::tip("Filenames under the tiles"))
+                .clicked()
                 {
                     act.filenames = Some(!self.show_filenames);
                 }
@@ -6168,13 +6737,20 @@ impl Lightbox {
                 // only read as one control in two directions if they are the way
                 // round the eye expects.
                 let any = !self.selection().is_empty();
-                if crate::icons::sized(ui, icons, "rotate-right", "↻", any, 18.0)
-                    .on_hover_text(theme::tip("Rotate the selection right, for display"))
-                    .clicked()
+                if crate::icons::sized(
+                    ui,
+                    icons,
+                    "rotate-right",
+                    "↻",
+                    any,
+                    theme::size::FOOTER_ICON,
+                )
+                .on_hover_text(theme::tip("Rotate the selection right, for display"))
+                .clicked()
                 {
                     act.note = self.rotate(true);
                 }
-                if crate::icons::sized(ui, icons, "rotate-left", "↺", any, 18.0)
+                if crate::icons::sized(ui, icons, "rotate-left", "↺", any, theme::size::FOOTER_ICON)
                     .on_hover_text(theme::tip("Rotate the selection left, for display"))
                     .clicked()
                 {
@@ -6660,7 +7236,7 @@ impl Lightbox {
                     ui.painter().rect_stroke(
                         shown,
                         0.0,
-                        egui::Stroke::new(EDITED_STROKE, EDITED_INK),
+                        egui::Stroke::new(EDITED_STROKE, self.edited_ink),
                         egui::StrokeKind::Outside,
                     );
                 }
@@ -8413,6 +8989,66 @@ mod tests {
     }
 
     #[test]
+    fn a_tucked_lightbox_column_hides_and_every_way_back_restores_it() {
+        // The Lightbox had no tuck at all — the maintainer's report — and now shares
+        // Develop's. What is tested here is the Lightbox's half: its visibility, which
+        // nothing else in this mode manages, and the three ways back.
+        let mut lb = Lightbox::new();
+        let grid = lb.tree.tiles.find_pane(&Pane::Grid).expect("a grid");
+        let [Some((left, _)), None] = lb.tuck.edge_columns(&lb.tree, grid) else {
+            panic!("the default arrangement has one column, on the left");
+        };
+
+        assert!(lb.tuck.push(left, 312.0));
+        lb.settle_visibility();
+        assert!(!lb.tree.is_visible(left), "tucked means off screen");
+        assert!(
+            lb.tree.is_visible(grid),
+            "and the grid is what takes its place"
+        );
+
+        // `tab` twice: every panel back, tucked ones included.
+        lb.toggle_panels();
+        lb.toggle_panels();
+        lb.settle_visibility();
+        assert!(lb.tree.is_visible(left), "`tab` restores every panel");
+        assert_eq!(lb.panel_sizes[&left].x, 312.0, "at the width it left at");
+
+        // The Window menu, asking for a pane inside the tucked column.
+        assert!(lb.tuck.push(left, 300.0));
+        lb.settle_visibility();
+        lb.reveal_pane(Pane::Favorites);
+        lb.settle_visibility();
+        assert!(
+            lb.tree.is_visible(left),
+            "revealing a pane brings its column out"
+        );
+
+        // A tree saved while tucked carries the column as invisible, and the tuck
+        // itself is not saved. Without the reset in `settle_visibility` it would come
+        // back hidden with no strip to reach it by.
+        lb.tree.set_visible(left, false);
+        lb.settle_visibility();
+        assert!(
+            lb.tree.is_visible(left),
+            "a restored layout hid a panel for good"
+        );
+    }
+
+    #[test]
+    fn the_lightbox_sidebar_starts_at_the_info_panel_width() {
+        // The maintainer: the folders column was too skinny beside Develop's Info.
+        let tree = default_tree();
+        let root = tree.root.expect("a root");
+        let Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(row))) =
+            tree.tiles.get(root)
+        else {
+            panic!("the root is a row");
+        };
+        assert_eq!(row.shares[row.children[0]], crate::layout::INFO_W);
+    }
+
+    #[test]
     fn a_rating_survives_a_restart() {
         // The contract of the settled decision: the sidecar is the truth, so
         // re-reading the folder from disk is the whole test — no cache is consulted
@@ -8568,6 +9204,158 @@ mod tests {
                 "cataloguing metadata lit the developed mark"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_edited_mark_palette_is_the_dixon_markers() {
+        assert_eq!(edited_ink(EDITED_INK_DEFAULT), EDITED_INK);
+        assert_eq!(
+            edited_ink("default"),
+            EDITED_INK,
+            "the retired key reads as the default"
+        );
+        assert_eq!(
+            edited_ink("not-a-color"),
+            EDITED_INK,
+            "an unknown key is the default, not an error"
+        );
+        let mut keys: Vec<_> = EDITED_INKS.iter().map(|(k, _, _)| *k).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), EDITED_INKS.len(), "a key listed twice");
+        // Red is the selection ring and black vanishes on the grid.
+        for (key, name, _) in EDITED_INKS {
+            assert!(
+                !key.starts_with("red") && !key.starts_with("black"),
+                "{name} is on the maintainer's excluded list"
+            );
+        }
+        assert_eq!(
+            crate::settings::Settings::default().lightbox_edited_ink,
+            EDITED_INK_DEFAULT
+        );
+        let yellows = EDITED_INKS
+            .iter()
+            .filter(|(k, _, _)| k.starts_with("yellow"))
+            .count();
+        assert_eq!(yellows, 1, "one yellow, and it is the default");
+    }
+
+    #[test]
+    fn copyright_owner_and_credit_line_follow_the_creator() {
+        let creator = IptcField::Creator as usize;
+        let owner = IptcField::CopyrightOwner as usize;
+        let credit = IptcField::Credit as usize;
+        let mut draft = IptcDraft::load(Vec::new());
+        let enter = |draft: &mut IptcDraft, name: &str| {
+            draft.values[creator] = name.into();
+            draft.dirty[creator] = true;
+            let mut commit = vec![creator];
+            follow_creator(draft, &mut commit);
+            // What `commit_iptc_slots` does to the draft once the files are written.
+            for i in commit {
+                draft.dirty[i] = false;
+                draft.saved[i] = draft.values[i].clone();
+            }
+        };
+
+        enter(&mut draft, "Christopher Cunningham");
+        assert_eq!(
+            draft.values[owner], "Christopher Cunningham",
+            "empty owner fills"
+        );
+        assert_eq!(
+            draft.values[credit], "Christopher Cunningham",
+            "empty credit fills"
+        );
+
+        enter(&mut draft, "C. Cunningham");
+        assert_eq!(
+            draft.values[owner], "C. Cunningham",
+            "a following owner follows"
+        );
+
+        draft.values[credit] = "Studio Credit".into();
+        draft.saved[credit] = "Studio Credit".into();
+        enter(&mut draft, "Chris Cunningham");
+        assert_eq!(draft.values[owner], "Chris Cunningham");
+        assert_eq!(
+            draft.values[credit], "Studio Credit",
+            "a written credit is left alone"
+        );
+
+        enter(&mut draft, "");
+        assert_eq!(
+            draft.values[owner], "Chris Cunningham",
+            "clearing the creator clears neither"
+        );
+    }
+
+    #[test]
+    fn copy_to_next_carries_every_field_but_the_date_and_moves_on() {
+        let dir = folder_of(
+            "iptc-copy-next",
+            &[("a.dng", 0, None), ("b.dng", 0, None), ("c.dng", 0, None)],
+        );
+        // A folder ahead of the first frame, which the stepping row passes over.
+        std::fs::create_dir_all(dir.join("0-contacts")).unwrap();
+        let source = raw_core::sidecar::Metadata {
+            description: Some("Opening night".into()),
+            city: Some("New York".into()),
+            subject: vec!["street".into(), "night".into()],
+            rights: Some("© 2026 Example. All rights reserved.".into()),
+            date_created: Some("2026-03-08T20:00:00".into()),
+            ..Default::default()
+        };
+        raw_core::sidecar::write(&dir.join("a.dng"), &Default::default(), &source).unwrap();
+        let target = raw_core::sidecar::Metadata {
+            description: Some("Old caption".into()),
+            city: Some("Paris".into()),
+            date_created: Some("2020-01-01".into()),
+            ..Default::default()
+        };
+        raw_core::sidecar::write(&dir.join("b.dng"), &Default::default(), &target).unwrap();
+
+        let mut lb = Lightbox::new();
+        lb.open_folder(&dir);
+        let index = |lb: &Lightbox, name: &str| {
+            lb.entries
+                .iter()
+                .position(|entry| entry.name == name)
+                .map(|i| i as u32)
+                .unwrap_or_else(|| panic!("{name} is not listed"))
+        };
+        let (a, b) = (index(&lb, "a.dng"), index(&lb, "b.dng"));
+        lb.select_only(a);
+        assert_eq!(lb.neighbor_picture(false), None, "a folder is not a frame");
+        assert_eq!(lb.neighbor_picture(true), Some(b));
+        lb.iptc = Some(IptcDraft::load(lb.iptc_paths()));
+        lb.copy_iptc_to_next();
+
+        assert_eq!(
+            lb.selected,
+            Some(b),
+            "Copy to Next moves to the frame it copied to"
+        );
+        let copied = raw_core::sidecar::read(&dir.join("b.dng"))
+            .ok()
+            .expect("sidecar parses")
+            .metadata;
+        assert_eq!(copied.description.as_deref(), Some("Opening night"));
+        assert_eq!(copied.city.as_deref(), Some("New York"));
+        assert_eq!(copied.subject, vec!["street", "night"]);
+        assert_eq!(copied.rights, source.rights);
+        assert_eq!(
+            copied.date_created.as_deref(),
+            Some("2020-01-01"),
+            "one frame's capture date was stamped on the next"
+        );
+        assert!(
+            !raw_core::sidecar::path_for(&dir.join("c.dng")).exists(),
+            "only the next frame is written"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

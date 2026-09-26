@@ -284,6 +284,8 @@ impl Linear {
             if let Some(pointer) = ui.pointer_interact_pos() {
                 resize_state = resize_interaction(
                     behavior,
+                    &tree.tiles,
+                    LinearDir::Horizontal,
                     &mut self.shares,
                     &visible_children,
                     &response,
@@ -358,6 +360,8 @@ impl Linear {
             if let Some(pointer) = ui.pointer_interact_pos() {
                 resize_state = resize_interaction(
                     behavior,
+                    &tree.tiles,
+                    LinearDir::Vertical,
                     &mut self.shares,
                     &visible_children,
                     &response,
@@ -400,6 +404,8 @@ impl Linear {
 #[expect(clippy::too_many_arguments)]
 fn resize_interaction<Pane>(
     behavior: &mut dyn Behavior<Pane>,
+    tiles: &Tiles<Pane>,
+    dir: LinearDir,
     shares: &mut Shares,
     children: &[TileId],
     splitter_response: &egui::Response,
@@ -411,10 +417,13 @@ fn resize_interaction<Pane>(
     if splitter_response.double_clicked() {
         behavior.on_edit(EditAction::TileResized);
 
-        // double-click to center the split between left and right:
-        let mean = 0.5 * (shares[left] + shares[right]);
-        shares[left] = mean;
-        shares[right] = mean;
+        // LOCAL PATCH (monopro): the behavior may answer the double-click itself.
+        if !behavior.on_seam_double_click(tiles, shares, dir, children, [left, right]) {
+            // double-click to center the split between left and right:
+            let mean = 0.5 * (shares[left] + shares[right]);
+            shares[left] = mean;
+            shares[right] = mean;
+        }
         ResizeState::Hovering
     } else if splitter_response.dragged() {
         behavior.on_edit(EditAction::TileResized);

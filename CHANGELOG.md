@@ -16,6 +16,59 @@ changes belong in [docs/known-limitations.md](docs/known-limitations.md).
 
 ## Unreleased
 
+New
+- Lightbox panels tuck off the edge of the window the way Develop's do: drag a
+  side column past its minimum width, and click the strip it leaves to bring it back.
+- The Metadata pane has buttons under the template menu to step to the previous or
+  next image, and Copy to Next, which copies every IPTC field to the next image and
+  moves to it. Date Created stays with its own frame.
+- New IPTC fields: Keywords, Digital Source Type (a menu of IPTC's own terms),
+  Copyright Owner and Contact Email, and under More: Alt Text (Accessibility), Person
+  Shown, Description Writer and Data Mining (a menu of the PLUS terms, including the
+  AI training prohibitions). Copyright Notice has a menu of standard notices (All
+  rights reserved, the Creative Commons licenses, CC0) that fill the field and stay
+  editable.
+- Entering a Creator fills in Copyright Owner and Credit Line when they are empty,
+  and keeps them in step when the Creator changes, unless you have written something
+  else there.
+- Date Created shows the camera's capture time when nothing else has set it, and is
+  written into exports.
+- Exports can carry the camera's EXIF: camera, lens, exposure, ISO, focal length and
+  capture time, in TIFF, PNG and JPEG alike. On by default, under Settings, Export,
+  Behavior, Include camera EXIF. Location, serial numbers and the owner's name are
+  never copied.
+- The edited mark on Lightbox tiles can be drawn in any of the Dixon China Marker
+  colors, under Settings, Lightbox, Edited mark color. Dixon Yellow 73 is the new
+  default, a touch warmer than the old yellow.
+
+Changed
+- The Metadata pane lists IPTC fields in caption-desk order: Description, City,
+  State, Country, Keywords, Digital Source Type, Creator, Copyright Owner, Copyright
+  Notice, Credit Line, Contact Email, Date Created. Title, Headline, Source and
+  Instructions are under More, with the new fields there.
+- Creator is also written as IPTC's Image Creator, so licensing tools find it.
+- The Lightbox sidebar starts at the same width as Develop's Info panel. Saved
+  Lightbox panel widths are reset once by this update.
+- Metadata templates never save or apply Date Created.
+- Sidecars are now version 18. monopro 0.2.0 declines to overwrite one rather than
+  save it without the new IPTC fields; sidecars from 0.2.0 open here as before.
+- The footer is a little taller, with larger buttons, stars and label dots.
+- Hotkeys are now called keyboard shortcuts: the overlay on the period key is
+  Keyboard Shortcuts, and the list in Settings, Controls is headed Keymap.
+- The open file's tab name is plain text rather than red; the lighter tab still marks
+  which file is in front.
+- American spelling throughout: Center in contact sheet captions, Digitized in
+  Digital Source Type, canceled in update messages.
+
+Fixed
+- Squeezing Develop off the left edge no longer squeezes the image after it and
+  hands the whole window to the right-hand panels.
+- A panel brought back from the edge returns at no less than its default width,
+  rather than at the narrower width the squeeze left it at.
+- Double-clicking just beside a panel's edge, on its scroll bar for instance, resets
+  the panel to its default width rather than sending it to half the window. This
+  applies in Develop and in Lightbox.
+
 ## 0.2.0 — 2026-09-25
 
 This release separates masters from proofs and lets Lightbox notice files that

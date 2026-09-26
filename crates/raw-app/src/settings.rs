@@ -261,6 +261,16 @@ pub struct Settings {
     /// standing decision about how you work, and answering it per picture would mean
     /// answering it again for every picture. Same reasoning as the print unit.
     pub export_metadata: bool,
+    /// Whether the source's camera EXIF — body, lens, exposure, capture time — travels
+    /// with an exported file.
+    ///
+    /// **On by default**, which is what `export_metadata`'s note already argues for:
+    /// the privacy case is what a camera writes *unasked*, and that is exactly what is
+    /// kept off the list — location, serial numbers, the owner's name. What is left is
+    /// the photograph's technical record, which every other raw developer carries by
+    /// default and which a print's buyer or a lab reasonably expects to find. See
+    /// `raw_core::camera_exif`.
+    pub export_camera_exif: bool,
     /// Draw the amber rule around a tile whose frame has been worked on. **Live.**
     ///
     /// **On by default**, because "which of these have I already been through" is the
@@ -271,6 +281,9 @@ pub struct Settings {
     /// It hides the mark, not the fact: the sidecar is still there, the EXIF pane still
     /// reports it, and the Edited filter still finds it.
     pub lightbox_edited_mark: bool,
+    /// The edited mark's color, as a key into `lightbox::EDITED_INKS`, the Dixon China
+    /// Marker colors. Yellow 73 by default. **Live.**
+    pub lightbox_edited_ink: String,
     /// Show a worked-on frame's edit in the grid instead of the camera's JPEG. **Live.**
     ///
     /// The doc here said "still unbuilt" long after it stopped being true, which is the
@@ -587,6 +600,7 @@ impl Default for Settings {
             screen_dither: true,
             reset_on_open: true,
             export_metadata: true,
+            export_camera_exif: true,
             lightbox_xmp_thumbnails: false,
             lightbox_gray: true,
             lightbox_matches_viewer: true,
@@ -600,6 +614,7 @@ impl Default for Settings {
             remember_lightbox_sort: true,
             lightbox_filenames: true,
             lightbox_edited_mark: true,
+            lightbox_edited_ink: crate::lightbox::EDITED_INK_DEFAULT.into(),
             lightbox_folders: false,
             lightbox_other_files: false,
             reset_panels_on_start: true,
@@ -1386,6 +1401,52 @@ pub fn item<R>(
     (value, reset)
 }
 
+/// A row of color swatches, one of which is `value`'s key. Each names itself on hover,
+/// and swatches shrink to fit a narrow control column rather than running off it.
+///
+/// **The chosen one is ringed in [`crate::theme::BRIGHT`], not ruby** — the one place an
+/// "on" state is not ruby, because a ruby ring vanishes into a crimson or orange swatch,
+/// which is exactly the swatch it would be marking.
+pub fn swatches(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    options: &[(&str, &str, egui::Color32)],
+) -> bool {
+    let gap = 3.0;
+    let n = options.len().max(1) as f32;
+    let side = ((ui.available_width() - gap * (n - 1.0)) / n).clamp(10.0, 16.0);
+    let mut changed = false;
+    ui.spacing_mut().item_spacing.x = gap;
+    // The control column lays out right to left; walk it backwards so the row reads
+    // in the palette's own order.
+    for (key, name, color) in options.iter().rev() {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+        let resp = resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(crate::theme::tip(*name));
+        let chosen = value == key;
+        ui.painter().rect_filled(rect, 0.0, *color);
+        let edge = if chosen {
+            egui::Stroke::new(2.0, crate::theme::BRIGHT)
+        } else if resp.hovered() {
+            egui::Stroke::new(1.0, crate::theme::NAME)
+        } else {
+            egui::Stroke::new(1.0, egui::Color32::from_gray(72))
+        };
+        let outside = if chosen {
+            egui::StrokeKind::Outside
+        } else {
+            egui::StrokeKind::Inside
+        };
+        ui.painter().rect_stroke(rect, 0.0, edge, outside);
+        if resp.clicked() && !chosen {
+            *value = (*key).to_owned();
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// The compact egui-style switch used for boolean preferences.
 fn toggle_switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
     let desired = egui::vec2(34.0, 18.0);
@@ -1658,6 +1719,7 @@ mod tests {
             surround_okhsl: [35.0, 0.15, 0.9],
             reset_on_open: false,
             export_metadata: false,
+            export_camera_exif: false,
             lightbox_xmp_thumbnails: true,
             lightbox_gray: false,
             lightbox_matches_viewer: false,
@@ -1670,6 +1732,7 @@ mod tests {
             frameless_tiles: true,
             lightbox_filenames: false,
             lightbox_edited_mark: false,
+            lightbox_edited_ink: "orange-72".into(),
             lightbox_folders: true,
             lightbox_other_files: true,
             reset_panels_on_start: false,

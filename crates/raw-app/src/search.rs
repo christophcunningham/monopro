@@ -24,10 +24,12 @@ const CONFIG: &str = "search-locations.toml";
 const INDEX: &str = "search-index.bin";
 // Version 2 adds effective IPTC text to every path record. An older index is simply
 // discarded and rebuilt from the locations file, which is why this is a disposable
-// cache rather than a migration surface.
-const MAGIC: &[u8; 8] = b"MPSRCH02";
+// cache rather than a migration surface. Version 4 is the IPTC field set and order
+// the Metadata pane was given, keywords included (3 was an unreleased step toward
+// it): a record names its field by position, so every stored position changed
+// meaning.
+const MAGIC: &[u8; 8] = b"MPSRCH04";
 const RESULT_LIMIT: usize = 20_000;
-const KEYWORDS_FIELD: u8 = raw_core::sidecar::IptcField::ALL.len() as u8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -575,20 +577,16 @@ fn metadata_text(path: &Path) -> Vec<(u8, String)> {
         raw_core::sidecar::Loaded::Absent | raw_core::sidecar::Loaded::Corrupt(_) => embedded,
     };
 
-    let mut text: Vec<(u8, String)> = raw_core::sidecar::IptcField::ALL
+    raw_core::sidecar::IptcField::ALL
         .into_iter()
         .enumerate()
         .filter_map(|(index, field)| {
             metadata
                 .iptc(field)
                 .filter(|value| !value.trim().is_empty())
-                .map(|value| (index as u8, value.to_owned()))
+                .map(|value| (index as u8, value.into_owned()))
         })
-        .collect();
-    if !metadata.subject.is_empty() {
-        text.push((KEYWORDS_FIELD, metadata.subject.join(", ")));
-    }
-    text
+        .collect()
 }
 
 fn quick_xmp_packet(path: &Path) -> Option<String> {
@@ -1117,7 +1115,10 @@ mod tests {
                     raw_core::sidecar::IptcField::Headline as u8,
                     "Opening night".into(),
                 ),
-                (KEYWORDS_FIELD, "theatre, backstage".into()),
+                (
+                    raw_core::sidecar::IptcField::Keywords as u8,
+                    "theatre, backstage".into(),
+                ),
             ],
         )];
 

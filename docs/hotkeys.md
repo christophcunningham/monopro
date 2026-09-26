@@ -33,7 +33,7 @@ Letter shortcuts are suppressed while typing into text fields.
 | `l` | Lightbox |
 | `e` | Bring the Develop panel forward |
 | `,` | Settings |
-| `.` | Hotkey HUD |
+| `.` | Keyboard shortcuts overlay |
 
 ## Comparison
 

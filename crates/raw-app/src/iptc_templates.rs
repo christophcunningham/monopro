@@ -34,7 +34,8 @@ impl Template {
         let fields = IptcField::ALL
             .into_iter()
             .enumerate()
-            .filter(|(i, _)| !mixed[*i] && !values[*i].trim().is_empty())
+            // A capture date is this frame's alone; see `IptcField::per_image`.
+            .filter(|(i, field)| !field.per_image() && !mixed[*i] && !values[*i].trim().is_empty())
             .map(|(i, field)| {
                 (
                     field.key().to_owned(),
@@ -131,6 +132,84 @@ fn path() -> Option<PathBuf> {
     crate::settings::dir().map(|dir| dir.join(FILE))
 }
 
+/// A Copyright Notice to start from, in the phrasing each is conventionally written
+/// in — the Metadata pane's menu beside the field.
+///
+/// **They fill the field; they are not a separate setting.** The notice is free text
+/// in IPTC and stays that way here: pick one, then edit it like anything else.
+///
+/// The Creative Commons ones carry the license's deed URL, which is how CC asks to be
+/// cited when the notice cannot be a link — and embedded metadata cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notice {
+    AllRightsReserved,
+    /// A CC 4.0 license: its short code (`BY-NC`) and its name.
+    CreativeCommons(&'static str, &'static str),
+    /// CC0, which is a waiver and not a license, so it is worded as one.
+    PublicDomain,
+}
+
+impl Notice {
+    pub const ALL: [Self; 8] = [
+        Self::AllRightsReserved,
+        Self::CreativeCommons("BY", "Attribution"),
+        Self::CreativeCommons("BY-SA", "Attribution-ShareAlike"),
+        Self::CreativeCommons("BY-ND", "Attribution-NoDerivatives"),
+        Self::CreativeCommons("BY-NC", "Attribution-NonCommercial"),
+        Self::CreativeCommons("BY-NC-SA", "Attribution-NonCommercial-ShareAlike"),
+        Self::CreativeCommons("BY-NC-ND", "Attribution-NonCommercial-NoDerivatives"),
+        Self::PublicDomain,
+    ];
+
+    /// The menu's name for it.
+    pub fn label(self) -> String {
+        match self {
+            Self::AllRightsReserved => "All rights reserved".to_owned(),
+            Self::CreativeCommons(code, name) => format!("CC {code} 4.0 — {name}"),
+            Self::PublicDomain => "CC0 1.0 — Public domain dedication".to_owned(),
+        }
+    }
+
+    /// The notice for `owner`, first published in `year`. An empty owner leaves the
+    /// sentence grammatical rather than leaving a gap to fill.
+    pub fn text(self, year: &str, owner: &str) -> String {
+        let owner = owner.trim();
+        let by = if owner.is_empty() {
+            String::new()
+        } else {
+            format!(" {owner}")
+        };
+        match self {
+            Self::AllRightsReserved => format!("© {year}{by}. All rights reserved."),
+            Self::CreativeCommons(code, _) => format!(
+                "© {year}{by}. Licensed under CC {code} 4.0: https://creativecommons.org/licenses/{}/4.0/",
+                code.to_ascii_lowercase()
+            ),
+            Self::PublicDomain if owner.is_empty() => "No rights reserved. Dedicated to the \
+                 public domain under CC0 1.0: https://creativecommons.org/publicdomain/zero/1.0/"
+                .to_owned(),
+            Self::PublicDomain => format!(
+                "No rights reserved. {owner} has dedicated this work to the public domain \
+                 under CC0 1.0: https://creativecommons.org/publicdomain/zero/1.0/"
+            ),
+        }
+    }
+}
+
+/// The year a notice claims: Date Created's, when it starts with one, since a
+/// copyright runs from when the work was made — otherwise this year.
+pub fn notice_year(date_created: &str) -> String {
+    let year = date_created.trim().get(0..4).unwrap_or("");
+    if year.len() == 4 && year.bytes().all(|b| b.is_ascii_digit()) {
+        return year.to_owned();
+    }
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+        .div_euclid(86_400);
+    crate::rename::civil_from_days(days).0.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +268,43 @@ mod tests {
         ));
         assert_eq!(template.action(IptcField::Title), None);
         assert_eq!(template.action(IptcField::City), None);
+    }
+
+    #[test]
+    fn a_capture_date_is_never_saved_into_a_template() {
+        // Applied to a folder, it would stamp one frame's capture time on all of them.
+        let mut values: [String; IptcField::ALL.len()] = Default::default();
+        values[IptcField::DateCreated as usize] = "2026-03-08T14:22:05".into();
+        values[IptcField::City as usize] = "New York".into();
+        let template =
+            Template::from_values("Shoot".into(), &values, &[false; IptcField::ALL.len()]);
+        assert_eq!(template.action(IptcField::DateCreated), None);
+        assert!(template.action(IptcField::City).is_some());
+    }
+
+    #[test]
+    fn copyright_notices_are_phrased_as_they_are_conventionally_written() {
+        assert_eq!(
+            Notice::AllRightsReserved.text("2026", "Jane Doe"),
+            "© 2026 Jane Doe. All rights reserved."
+        );
+        assert_eq!(
+            Notice::AllRightsReserved.text("2026", "  "),
+            "© 2026. All rights reserved.",
+            "no owner is no gap"
+        );
+        assert_eq!(
+            Notice::CreativeCommons("BY-NC-SA", "Attribution-NonCommercial-ShareAlike")
+                .text("2025", "Jane Doe"),
+            "© 2025 Jane Doe. Licensed under CC BY-NC-SA 4.0: https://creativecommons.org/licenses/by-nc-sa/4.0/"
+        );
+        assert!(Notice::PublicDomain.text("2026", "Jane Doe").starts_with(
+            "No rights reserved. Jane Doe has dedicated this work to the public domain"
+        ));
+        assert_eq!(notice_year("2019-05-01T10:00:00"), "2019");
+        let this_year = notice_year("");
+        assert_eq!(this_year.len(), 4, "falls back to the current year");
+        assert!(this_year.as_str() >= "2026");
     }
 
     #[test]

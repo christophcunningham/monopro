@@ -821,9 +821,11 @@ impl App {
                 tab.metadata = s.metadata;
                 // An older sidecar is migrated on the next settled edit. Prototype
                 // files contribute exposure only; later pipeline versions contribute
-                // every field they know and new modules take their safe defaults.
-                tab.saved = (s.schema == sidecar::SCHEMA_VERSION).then(|| tab.params.clone());
-                if s.schema < sidecar::SCHEMA_VERSION {
+                // every field they know and new modules take their safe defaults. One
+                // whose parameters already mean what ours do is not waiting on a
+                // migration at all — see `PARAMS_SCHEMA`.
+                tab.saved = (s.schema >= sidecar::PARAMS_SCHEMA).then(|| tab.params.clone());
+                if s.schema < sidecar::PARAMS_SCHEMA {
                     tab.status = if s.schema < sidecar::PIPELINE_SCHEMA {
                         format!(
                             "{} · opened a v{} sidecar: exposure only",
@@ -1322,7 +1324,13 @@ impl App {
         let export_metadata =
             sidecar::effective_metadata(&img.path).unwrap_or_else(|_| tab.metadata.clone());
         let meta = settings.export_metadata.then_some(&export_metadata);
-        let spec = export::Spec::for_params(target, proof, &p, meta, settings.proof_dither);
+        // The raw was read to open it, so this read is from the page cache.
+        let camera = settings
+            .export_camera_exif
+            .then(|| raw_core::camera_exif::CameraExif::read(&img.path))
+            .flatten();
+        let spec = export::Spec::for_params(target, proof, &p, meta, settings.proof_dither)
+            .with_camera(camera);
         // `Spec::dims`, not `output.target_dims`: a proof ignores the master's
         // resample, and asking the spec is the one way the status line and the
         // encoder cannot disagree about the size of the file.
@@ -2005,14 +2013,14 @@ enum TabClick {
 /// now. This is the same construction as the tile-tree tabs in `layout::tab_ui`, which
 /// is deliberate: the app should have one idea of what a tab is.
 ///
-/// # Active is a lighter fill *and* ruby text
+/// # Active is a lighter fill, and nothing else
 ///
-/// 7c chose "red text, not text on red", because a filled ruby swatch behind a filename
-/// is a lot of ink for "this one" and fights the ruby that means interaction everywhere
-/// else. That still holds and the ruby name stays. What is added is a **light/dark step
-/// in the fill**, which the maintainer asked for from Photoshop's strip: it groups the close with
-/// the name into one object, and it says which tab is in front from the corner of the
-/// eye, without spending any colour on it.
+/// 7c set the front tab's name in ruby ("red text, not text on red"), and a **light/dark
+/// step in the fill** was added later from Photoshop's strip, which groups the close
+/// with the name into one object and says which tab is in front from the corner of the
+/// eye. With the fill doing that, the maintainer asked for the name to go back to plain
+/// text: ruby on a filename read as an alert rather than as "this one", and the fill
+/// already says it without spending any color.
 ///
 /// # The close is on the left
 ///
@@ -2066,7 +2074,8 @@ fn file_tab(
         };
         ui.painter().rect_filled(rect, 2.0, fill);
         let text = match (active, tab.hovered()) {
-            (true, _) => theme::RUBY,
+            // Plain text: what a bare label is set in.
+            (true, _) => ui.visuals().widgets.noninteractive.text_color(),
             (false, false) => egui::Color32::from_gray(170),
             (false, true) => egui::Color32::from_gray(215),
         };
@@ -3938,6 +3947,7 @@ impl eframe::App for App {
             // they also mutate the Lightbox.
             self.lightbox.show_filenames = self.settings.lightbox_filenames;
             self.lightbox.edited_mark = self.settings.lightbox_edited_mark;
+            self.lightbox.edited_ink = lightbox::edited_ink(&self.settings.lightbox_edited_ink);
             self.lightbox.frameless = self.settings.frameless_tiles;
             self.lightbox.set_grey(self.settings.lightbox_gray);
             self.lightbox
@@ -10785,7 +10795,7 @@ impl App {
 /// The name first, because an application with nothing open should say what it is. It
 /// is set in the heading size and left dim: this is a title card, not a splash screen,
 /// and the instruction under it is the part that is being read. Settings and the
-/// Hotkey HUD sit one line below as a quiet quick reference rather than competing
+/// Keyboard Shortcuts overlay sit one line below as a quiet quick reference rather than competing
 /// with the primary action.
 fn welcome(ui: &mut egui::Ui) {
     let chord = |action| {
@@ -10812,7 +10822,9 @@ fn welcome(ui: &mut egui::Ui) {
             ui.add_space(18.0);
             ui.label(theme::caption(format!("Press {settings} for Settings")));
             ui.add_space(5.0);
-            ui.label(theme::caption(format!("Press {hud} for the Hotkey HUD")));
+            ui.label(theme::caption(format!(
+                "Press {hud} for keyboard shortcuts"
+            )));
         });
     });
 }
@@ -11896,7 +11908,7 @@ fn byte_label(bytes: u64) -> String {
     }
 }
 
-/// The Hotkey HUD occupies most of the viewport while leaving enough of the image
+/// The Keyboard Shortcuts overlay occupies most of the viewport while leaving enough of the image
 /// visible around it to read unmistakably as an overlay.
 fn hotkey_hud_rect(screen: egui::Rect) -> egui::Rect {
     let inset = egui::vec2(
@@ -11995,7 +12007,7 @@ fn hotkey_hud(ctx: &egui::Context) {
             ui.set_max_size(content_size);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("HOTKEYS")
+                    egui::RichText::new("KEYBOARD SHORTCUTS")
                         .size(18.0)
                         .color(theme::BRIGHT),
                 );
@@ -13002,7 +13014,7 @@ impl App {
                     );
                 }
 
-                if sheet.shows(ui, settings::Section::Export, "EXPORT BEHAVIOR metadata iptc quick export dialog") {
+                if sheet.shows(ui, settings::Section::Export, "EXPORT BEHAVIOR metadata iptc camera exif lens exposure quick export dialog") {
                     settings::heading(ui, "BEHAVIOR");
                     settings::rule(ui);
                     settings::check(
@@ -13012,6 +13024,17 @@ impl App {
                         "Include authored metadata",
                     );
                     settings::note(ui, "Includes IPTC, keywords, rating and color label.");
+                    settings::rule(ui);
+                    settings::check(
+                        ui,
+                        &mut s.export_camera_exif,
+                        d.export_camera_exif,
+                        "Include camera EXIF",
+                    );
+                    settings::note(
+                        ui,
+                        "Camera, lens, exposure and capture time. Never location, serial numbers or the owner's name.",
+                    );
                     settings::rule(ui);
                     settings::check(
                         ui,
@@ -13089,7 +13112,7 @@ impl App {
                         }
                     }
                 }
-                if sheet.shows(ui, settings::Section::Lightbox, "TILES thumbnails edits gray grey default sort frameless filenames folders non-image files") {
+                if sheet.shows(ui, settings::Section::Lightbox, "TILES thumbnails edits edited mark color colour dixon china marker gray grey default sort frameless filenames folders non-image files") {
                     settings::heading(ui, "TILES");
                     settings::rule(ui);
                     settings::check(
@@ -13133,6 +13156,34 @@ impl App {
                         d.lightbox_edited_mark,
                         "Mark edited images",
                     );
+                    settings::rule(ui);
+                    // A key this palette no longer has — an earlier build stored
+                    // "default" — is shown, and saved, as the default it already draws as.
+                    if !lightbox::EDITED_INKS
+                        .iter()
+                        .any(|(key, _, _)| *key == s.lightbox_edited_ink)
+                    {
+                        s.lightbox_edited_ink = d.lightbox_edited_ink.clone();
+                    }
+                    let (_, reset) = settings::item(
+                        ui,
+                        s.lightbox_edited_ink != d.lightbox_edited_ink,
+                        "Edited mark color",
+                        None,
+                        |ui| {
+                            ui.add_enabled_ui(s.lightbox_edited_mark, |ui| {
+                                settings::swatches(
+                                    ui,
+                                    &mut s.lightbox_edited_ink,
+                                    &lightbox::EDITED_INKS,
+                                )
+                            })
+                            .inner
+                        },
+                    );
+                    if reset {
+                        s.lightbox_edited_ink = d.lightbox_edited_ink.clone();
+                    }
                     settings::rule(ui);
                     settings::check(
                         ui,
@@ -13183,7 +13234,7 @@ impl App {
                     }),
                     );
                 }
-                if sheet.shows(ui, settings::Section::Controls, "INPUT scroll wheel invert zoom hotkeys keys tooltips hover") {
+                if sheet.shows(ui, settings::Section::Controls, "INPUT scroll wheel invert zoom keyboard shortcuts hotkeys keys tooltips hover") {
                     settings::heading(ui, "INPUT");
                     settings::rule(ui);
                     settings::check(ui, &mut s.invert_scroll, d.invert_scroll, "Invert scroll direction");
@@ -13192,11 +13243,18 @@ impl App {
                     settings::rule(ui);
                     settings::check(ui, &mut s.tooltips, d.tooltips, "Show hover tooltips");
                     settings::rule(ui);
-                    settings::check(ui, &mut s.hotkeys_enabled, d.hotkeys_enabled, "Hotkeys enabled");
+                    settings::check(
+                        ui,
+                        &mut s.hotkeys_enabled,
+                        d.hotkeys_enabled,
+                        "Keyboard shortcuts enabled",
+                    );
                 }
 
-                if sheet.shows(ui, settings::Section::Controls, "HOTKEYS keys shortcuts bindings chords reference lightbox quick look loupe inspector pin delete ratings labels") {
-                    settings::heading(ui, "HOTKEYS");
+                if sheet.shows(ui, settings::Section::Controls, "KEYMAP keyboard shortcuts hotkeys keys bindings chords reference lightbox quick look loupe inspector pin delete ratings labels") {
+                    // KEYMAP rather than SHORTCUTS: this is where custom bindings
+                    // will be set, and the name is the one that area will keep.
+                    settings::heading(ui, "KEYMAP");
                 for group in hotkeys::Group::ORDER {
                     ui.add_space(6.0);
                     settings::note(ui, group.label());

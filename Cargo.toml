@@ -90,7 +90,8 @@ pollster = "0.4"
 [patch.crates-io]
 sparkle-updater = { path = "vendor/sparkle-updater" }
 # `egui_tiles` 0.16.0, vendored so a tab bar's scroll arrows step one tab at a
-# time instead of a third of the bar. See vendor/egui_tiles/LOCAL-PATCH.md.
+# time instead of a third of the bar, and so a double-clicked seam can be answered
+# by monopro. See vendor/egui_tiles/LOCAL-PATCH.md.
 egui_tiles = { path = "vendor/egui_tiles" }
 
 [profile.dev]
