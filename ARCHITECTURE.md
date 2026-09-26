@@ -120,7 +120,7 @@ but runs only `--lib`.
 | `paint.rs` | 1180 | The Dodge & Burn brush |
 | `rename.rs`, `search.rs` | 2440 | Lightbox batch rename, and filename/IPTC search |
 | `histogram.rs` | 1170 | The tonal distribution panel |
-| `updater.rs` / `updater_stub.rs` | 1190 | Sparkle on macOS, an inert stand-in elsewhere |
+| `updater.rs` / `updater_stub.rs` | 1940 | Sparkle on macOS, answered by the update sheet; an inert stand-in elsewhere |
 | `loupe.rs` | 960 | The print loupe: the export tail on one tile |
 | `decode.rs` | 860 | The off-thread decode queue and cache |
 | `cli.rs` | 700 | `monopro render` and `monopro info` |

@@ -525,7 +525,7 @@ fn no_update_info(error: &NSObject) -> Option<NoUpdateInfo> {
     })
 }
 
-fn error_payload(error: &NSObject) -> ErrorPayload {
+pub(crate) fn error_payload(error: &NSObject) -> ErrorPayload {
     ErrorPayload {
         message: nserror_description(error),
         code: unsafe { msg_send![error, code] },
@@ -537,7 +537,7 @@ fn error_payload(error: &NSObject) -> ErrorPayload {
     }
 }
 
-fn update_info_from_item(item: &SPUAppcastItem) -> UpdateInfo {
+pub(crate) fn update_info_from_item(item: &SPUAppcastItem) -> UpdateInfo {
     let url_to_string = |url: &NSURL| -> String {
         let abs: Option<Retained<NSString>> = unsafe { msg_send![url, absoluteString] };
         abs.map(|s| s.to_string()).unwrap_or_default()

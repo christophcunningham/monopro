@@ -62,8 +62,8 @@ libc = "0.2"
 # deliberately keep their shortcuts in egui until a native shell can attach a menu.
 muda = { version = "0.19", default-features = false }
 # Sparkle auto-updates, stable channel. Chosen over slint-ui/sparklers because it
-# registers as the user-driver delegate too: `GentleReminders` is what keeps a
-# scheduled update silent (the badge is ours, not Sparkle's alert) and
+# can own the user-facing half: the vendored copy adds an in-app user driver, so
+# Sparkle draws no window and every prompt lands in the update sheet, and
 # `RelaunchHandler` is what defers a relaunch until an export has drained.
 # hankbao/sparkle-updater was rejected — abandoned since 2023 on Sparkle 1.x.
 # The framework itself is vendored and pinned in packaging/macos/Sparkle; see
@@ -73,8 +73,3 @@ sparkle-updater = "0.1.0"
 # keeping our skip choice and Sparkle's skip machinery in agreement.
 objc2-foundation = { version = "0.3", features = ["NSUserDefaults"] }
 
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-# For the updater's private-API canary only: `objc2-foundation` re-exports
-# `NSObject` and `MainThreadMarker`, not `runtime::AnyClass`, which is what
-# asking the ObjC runtime whether a class still answers a selector needs.
-objc2 = "0.6"

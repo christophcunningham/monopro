@@ -15,6 +15,9 @@ pub enum Error {
 
     #[error("Updater not ready")]
     UpdaterNotReady,
+
+    #[error("Sparkle is using its standard user driver; there is no in-app prompt to answer")]
+    NoInAppDriver,
 }
 
 impl Serialize for Error {

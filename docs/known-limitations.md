@@ -66,6 +66,11 @@ These are scope decisions, not gaps.
   exists.
 - **Automatic updates are macOS only.** Windows and Linux compile against an inert
   stand-in and never check for updates.
+- **Installing an update can still show system windows.** Every update prompt is in
+  monopro's own sheet, but the install itself runs in Sparkle's installer after
+  monopro quits. If monopro's folder is not writable by the current user, macOS asks
+  for an administrator password, and a slow install may show Sparkle's own progress
+  window until the new version opens.
 - **No native menu bar on Windows or Linux.** Every shortcut is handled inside the
   window instead. An attached native menu is optional release work.
 - **x86-64 only on Windows and Linux.** ARM builds of either are outside the first

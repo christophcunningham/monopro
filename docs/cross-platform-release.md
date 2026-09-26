@@ -141,6 +141,17 @@ shows the version and notes it saw last.
   appcast assembly with a local test key, signature verification) was run on
   the packaging host.
 
+**2026-09-26 — Sparkle's own windows removed.** A manual check put Sparkle's
+native "You're up to date!" alert (and, for an update, its alert and progress
+panel) on top of the update sheet. The vendored binding now starts Sparkle with an
+in-app implementation of `SPUUserDriver`, so Sparkle draws nothing and every
+prompt — checking, up to date, an offer, download progress, ready to install,
+errors — is shown and answered in the sheet. The sheet shows its three choices
+only when an update is on offer, and can cancel a check or download. The Skip
+choice is now the reply to Sparkle's offer, which replaces the private
+`activeUpdateAlert`/`skipThisVersion:` route described above. Exercised by unit
+tests against the real Sparkle selectors; not yet run against a live feed.
+
 ## Supported first-release matrix
 
 | Platform | Artifact | CPU | Minimum OS / desktop |
