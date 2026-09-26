@@ -75,6 +75,7 @@ Three rules hold the path together:
 | `icc.rs` | 450 | Generating `monostar.icc` |
 | `preview.rs` | 830 | The embedded colour preview, for reference views only (not the pipeline) |
 | `atomic_file.rs` | 120 | Replacing a file without ever exposing half of one |
+| `camera_exif.rs` | 450 | The camera EXIF an export carries, and the list of what never travels |
 
 Examples in `examples/` are measurement tools (`inspect`, `sharpen-sweep`,
 `demosaic-compare`, …). `tests/grain_cost.rs` is an ignored benchmark.
@@ -165,6 +166,16 @@ the canvas tools and `settings_window` are each large enough to be modules.
 | check a UI change by eye | add or reuse a scene in `visual.rs` and run `cargo test -p raw-app visual -- --ignored` |
 | record a user-visible change | a line under **Unreleased** in `CHANGELOG.md` |
 | record something monopro can't do | `docs/known-limitations.md` |
+
+For a first reading, follow one edit from file to print:
+
+1. `raw-app/src/main.rs`, `fn main`: a command or the window.
+2. `struct App` and its `loading` section: how a file opens, and `apply`, which every
+   edit goes through.
+3. `raw-core/src/params.rs`: what an edit is.
+4. `raw-graph/src/lib.rs`, `build`: how an edit becomes stages.
+5. `raw-gpu/src/lib.rs`, `Viewport`: how those stages run and reach the screen.
+6. `raw-app/src/export.rs`, `write`: the CPU tail and the encoders.
 
 ## Tests
 

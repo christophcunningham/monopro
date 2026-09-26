@@ -635,6 +635,10 @@ pub struct Spec {
     /// easier to forget is the one that leaks. `Spec::new` is the single resolution
     /// and is what every caller should use.
     pub metadata: Option<Metadata>,
+    /// The camera's EXIF to embed, or `None` for none. Decided by the caller in the
+    /// same way as `metadata`, under `Settings::export_camera_exif`; see
+    /// [`Spec::with_camera`] and `raw_core::camera_exif` for what is on the list.
+    pub camera: Option<raw_core::camera_exif::CameraExif>,
 }
 
 /// The CPU export tail's modules, as one argument.
@@ -716,6 +720,16 @@ impl Spec {
             dither: true,
             proof: None,
             metadata,
+            camera: None,
+        }
+    }
+
+    /// The same spec, carrying the source's camera EXIF. An empty record is dropped, so
+    /// a file whose source recorded nothing gets no EXIF block rather than an empty one.
+    pub fn with_camera(self, camera: Option<raw_core::camera_exif::CameraExif>) -> Self {
+        Self {
+            camera: camera.filter(|c| !c.is_empty()),
+            ..self
         }
     }
 
@@ -1301,6 +1315,12 @@ fn write_jpeg(
     // **Always.** A proof is the file that leaves, and the profile is what the next
     // application looks for. See `Space::channels`.
     enc.add_icc_profile(space.icc()).map_err(io)?;
+    // Camera EXIF in its own APP1, ahead of XMP's, which is where readers look first.
+    if let Some(camera) = &spec.camera {
+        let mut segment = b"Exif\0\0".to_vec();
+        segment.extend_from_slice(&camera.tiff_block());
+        enc.add_app_segment(1, segment).map_err(io)?;
+    }
     if let Some(packet) = xmp {
         // Standard XMP APP1: NUL-terminated identifier followed by UTF-8 XML.
         // Do not truncate metadata or split it into unrelated APP1 packets.
@@ -1400,7 +1420,33 @@ where
 
     let io = |e: tiff::TiffError| std::io::Error::other(e.to_string());
     let space = spec.target.space;
+
+    // **Camera EXIF as a real Exif IFD**, written before the image's own directory so
+    // IFD0 can point at it. Make and Model are baseline TIFF tags and go in IFD0 itself;
+    // everything else on the list lives in the Exif IFD, as the standard puts it.
+    let exif_ifd = match &spec.camera {
+        Some(camera) if camera.entries().iter().any(|e| e.exif_ifd) => {
+            let mut dir = enc.extra_directory().map_err(io)?;
+            for entry in camera.entries().iter().filter(|e| e.exif_ifd) {
+                write_exif_entry(&mut dir, entry).map_err(io)?;
+            }
+            Some(dir.finish_with_offsets().map_err(io)?.offset)
+        }
+        _ => None,
+    };
+
     let mut image = enc.new_image::<C>(w, h).map_err(io)?;
+    if let Some(camera) = &spec.camera {
+        for entry in camera.entries().iter().filter(|e| !e.exif_ifd) {
+            write_exif_entry(image.encoder(), entry).map_err(io)?;
+        }
+    }
+    if let Some(offset) = exif_ifd {
+        image
+            .encoder()
+            .write_tag(Tag::ExifDirectory, offset)
+            .map_err(io)?;
+    }
 
     // Tags must be written before the pixel data.
     image
@@ -1445,6 +1491,51 @@ where
 
     image.write_data(samples).map_err(io)?;
     Ok(())
+}
+
+/// One camera EXIF entry into a TIFF directory, in the field type it was read as.
+fn write_exif_entry<W, K>(
+    dir: &mut tiff::encoder::DirectoryEncoder<'_, W, K>,
+    entry: &raw_core::camera_exif::Entry,
+) -> tiff::TiffResult<()>
+where
+    W: std::io::Write + std::io::Seek,
+    K: tiff::encoder::TiffKind,
+{
+    use raw_core::camera_exif::Value;
+    use tiff::encoder::{Rational, SRational};
+    let tag = tiff::tags::Tag::Unknown(entry.tag);
+    match &entry.value {
+        Value::Ascii(text) => dir.write_tag(tag, Utf8Ascii(text)),
+        Value::Short(v) => dir.write_tag(tag, *v),
+        Value::Rational(n, d) => dir.write_tag(tag, Rational { n: *n, d: *d }),
+        Value::SRational(n, d) => dir.write_tag(tag, SRational { n: *n, d: *d }),
+        Value::Rationals(list) => {
+            let list: Vec<Rational> = list
+                .iter()
+                .map(|(n, d)| Rational { n: *n, d: *d })
+                .collect();
+            dir.write_tag(tag, &list[..])
+        }
+        Value::Undefined(bytes) => dir.write_tag(tag, Undefined(bytes)),
+    }
+}
+
+/// A TIFF UNDEFINED field: bytes whose meaning the tag defines, such as ExifVersion's
+/// `0232`. The crate writes `[u8]` as BYTE, which is a different type to a strict reader.
+struct Undefined<'a>(&'a [u8]);
+
+impl tiff::encoder::TiffValue for Undefined<'_> {
+    const BYTE_LEN: u8 = 1;
+    const FIELD_TYPE: tiff::tags::Type = tiff::tags::Type::UNDEFINED;
+
+    fn count(&self) -> usize {
+        self.0.len()
+    }
+
+    fn data(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self.0)
+    }
 }
 
 /// A TIFF ASCII field whose bytes are written as given.
@@ -1523,6 +1614,12 @@ fn write_png(
         yppu: ppm,
         unit: png::Unit::Meter,
     });
+
+    // Camera EXIF in PNG's own chunk for it, `eXIf`: the TIFF-structured block
+    // without JPEG's `Exif\0\0` prefix.
+    if let Some(camera) = &spec.camera {
+        info.exif_metadata = Some(Cow::Owned(camera.tiff_block()));
+    }
 
     // XMP travels in an *uncompressed* iTXt chunk under the keyword the XMP spec
     // fixes for PNG. Compressing it is legal and is what breaks readers: several
@@ -3415,6 +3512,86 @@ mod tests {
             }
             assert_eq!(decoded[0], decoded[1]);
             assert_eq!(decoded[0], decoded[2]);
+        }
+    }
+
+    #[test]
+    fn camera_exif_travels_in_every_container_and_only_when_asked() {
+        use raw_core::camera_exif::{CameraExif, Entry, Value};
+        let camera = CameraExif::from_entries([
+            Entry {
+                tag: 0x010F,
+                exif_ifd: false,
+                value: Value::Ascii("Leica".into()),
+            },
+            Entry {
+                tag: 0x0110,
+                exif_ifd: false,
+                value: Value::Ascii("M10-R".into()),
+            },
+            Entry {
+                tag: 0x829A,
+                exif_ifd: true,
+                value: Value::Rational(1, 500),
+            },
+            Entry {
+                tag: 0x829D,
+                exif_ifd: true,
+                value: Value::Rational(17, 10),
+            },
+            Entry {
+                tag: 0x8827,
+                exif_ifd: true,
+                value: Value::Short(200),
+            },
+            Entry {
+                tag: 0x9003,
+                exif_ifd: true,
+                value: Value::Ascii("2026:03:08 10:26:38".into()),
+            },
+            Entry {
+                tag: 0x9204,
+                exif_ifd: true,
+                value: Value::SRational(-1, 3),
+            },
+            Entry {
+                tag: 0xA432,
+                exif_ifd: true,
+                value: Value::Rationals(vec![(50, 1), (50, 1), (14, 10), (14, 10)]),
+            },
+        ]);
+        let scene = ramp(16, 8);
+        for (container, depth, space) in [
+            (Container::Tiff, Depth::Sixteen, Space::Monostar),
+            (Container::Tiff, Depth::Eight, Space::Srgb),
+            (Container::Png, Depth::Sixteen, Space::Monostar),
+            (Container::Jpeg, Depth::Eight, Space::Srgb),
+        ] {
+            for with in [true, false] {
+                let path = tmp(&format!("camera-{container:?}-{depth:?}-{with}"));
+                let spec = Spec::new(
+                    ts(container, depth, space),
+                    ToneMap::Clip,
+                    OutputParams::default(),
+                    Tail::default(),
+                    None,
+                )
+                .with_camera(with.then(|| camera.clone()));
+                write(&path, 16, 8, &scene, &spec).unwrap();
+                // Read back with the reader an export's own EXIF would be read with:
+                // what went in is exactly what comes out.
+                let back = CameraExif::read(&path);
+                if with {
+                    assert_eq!(
+                        back.as_ref(),
+                        Some(&camera),
+                        "{container:?} {depth:?} lost or changed the camera record"
+                    );
+                } else {
+                    assert_eq!(back, None, "{container:?} wrote EXIF nobody asked for");
+                }
+                std::fs::remove_file(path).unwrap();
+            }
         }
     }
 

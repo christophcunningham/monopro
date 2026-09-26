@@ -40,7 +40,7 @@
 //!
 //! # Schema versions
 //!
-//! [`SCHEMA_VERSION`] is 17. Versions 1 and 2 are **prototype** sidecars, and this
+//! [`SCHEMA_VERSION`] is 18. Versions 1 and 2 are **prototype** sidecars, and this
 //! app is a different pipeline: it reads the CFA mosaic where the prototype read
 //! LibRaw's demosaiced tristimulus, so almost nothing in a v2 file means the same
 //! thing here. Pretending otherwise would open an image with settings that look
@@ -68,6 +68,13 @@
 //! Composition is the case that moved it: a v3 reader handed a v4 file would ignore
 //! `Crop` and show the whole frame, silently — precisely the "looks carried over and
 //! renders differently" failure versions exist to make visible.
+//!
+//! **Fields an older build would drop on save do bump it**, which is the repository's
+//! rule (`AGENTS.md`) and the reason 18 exists. A reader that skips an element it does
+//! not know also *writes the file back without it*: a 0.2.0 build that opened a
+//! captioned sidecar to change the exposure would silently erase the keywords, the
+//! alt text and the rest of the IPTC it could not see. The version is what makes that
+//! build refuse the file instead — see `future_sidecars_are_not_loaded_or_overwritten`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -107,12 +114,29 @@ use crate::sharpen;
 /// | 15 | Softness becomes Recovery | — (no numeric change) |
 /// | 16 | retires highlight reconstruction and TCA | — (attributes ignored) |
 /// | 17 | manual keystone | ignores the projective map |
+/// | 18 | the Metadata pane's IPTC fields | refuses the file rather than saving it without them |
 ///
 /// **9 is the one to reason from.** It is the harshest since 5, and the first whose
 /// *order* is load-bearing: the Chemistry stack is an `rdf:Seq` because gold after
 /// sulphide is red and gold before it is blue-black, so a reader treating it as a bag
 /// produces a plausible picture that is not the one that was made.
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
+
+/// The oldest version whose develop parameters mean exactly what this build's do.
+///
+/// A file at or above it has nothing to migrate, so it opens as saved rather than as
+/// an edit waiting to be written. 18 changed only the metadata — which Develop re-reads
+/// from the file whenever it writes — so without this every picture developed before
+/// it would have opened "unsaved", warned at quit, and been kept out of Lightbox's
+/// edited-tile cache, for a version change it plays no part in.
+///
+/// **Moves with `SCHEMA_VERSION` whenever a version changes what the parameters
+/// mean**, which is every version before 18.
+pub const PARAMS_SCHEMA: u32 = 17;
+const _: () = assert!(
+    PARAMS_SCHEMA <= SCHEMA_VERSION,
+    "PARAMS_SCHEMA names a version this build does not write"
+);
 
 /// The first version that describes **this** pipeline rather than the prototype's.
 ///
@@ -126,6 +150,12 @@ const MONOPRO_NS: &str = "http://monopro.app/ns/1.0/";
 const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
 const XMP_NS: &str = "http://ns.adobe.com/xap/1.0/";
 const PHOTOSHOP_NS: &str = "http://ns.adobe.com/photoshop/1.0/";
+/// IPTC Core: the creator's contact details.
+const IPTC_CORE_NS: &str = "http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/";
+/// IPTC Extension: the digital source type.
+const IPTC_EXT_NS: &str = "http://iptc.org/std/Iptc4xmpExt/2008-02-29/";
+/// PLUS, which IPTC uses for the image creator and the copyright owner.
+const PLUS_NS: &str = "http://ns.useplus.org/ldf/xmp/1.0/";
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
 /// What came back from trying to load something persisted.
@@ -158,73 +188,374 @@ impl<T> Loaded<T> {
     }
 }
 
-/// The editable IPTC text fields, in their stable UI and storage order.
+/// The editable IPTC fields, in the order the Metadata pane shows them.
+///
+/// **The order is the maintainer's**, and the one a caption desk works in: what the
+/// picture is and where, what it is about, how it was made, then whose it is and how
+/// to reach them. Everything after `DateCreated` is shown under *More* — see
+/// [`IptcField::secondary`] — in an order of its own: what the picture is (for
+/// someone who cannot see it, then by name), who is in it, who wrote the words,
+/// where it came from, and what may be done with it.
+///
+/// Storage never depends on this order. Templates and the clear markers are keyed by
+/// [`IptcField::key`], so reordering here moves a row on screen and nothing on disk.
+/// The one exception is Lightbox search's index, which records a field by position
+/// and is rebuilt when its version moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
 pub enum IptcField {
-    Creator,
-    Copyright,
-    Title,
-    Headline,
     Description,
-    Credit,
-    Source,
     City,
     State,
     Country,
+    /// `dc:subject`, edited as one comma-separated line.
+    Keywords,
+    /// A URI from IPTC's controlled vocabulary. See [`DIGITAL_SOURCE_TYPES`].
+    DigitalSourceType,
+    /// `dc:creator`, and PLUS's Image Creator written alongside it — the same person
+    /// in IPTC Core's vocabulary and in the licensing one.
+    Creator,
+    CopyrightOwner,
+    /// The copyright notice, `dc:rights`.
+    Copyright,
+    Credit,
+    ContactEmail,
+    /// ISO 8601. Falls back to the capture time in EXIF when nothing has set it — see
+    /// [`embedded_metadata`].
+    DateCreated,
+    /// IPTC Core's Alt Text (Accessibility): the picture in words, for a screen reader.
+    AltText,
+    Title,
+    Headline,
+    /// IPTC Extension's Person Shown in the Image, a list like the keywords.
+    PersonShown,
+    /// `photoshop:CaptionWriter` — who wrote or edited the description and alt text.
+    DescriptionWriter,
+    Source,
+    /// PLUS Data Mining, a URI. See [`DATA_MINING`].
+    DataMining,
     Instructions,
 }
 
 impl IptcField {
-    pub const ALL: [Self; 11] = [
-        Self::Creator,
-        Self::Copyright,
-        Self::Title,
-        Self::Headline,
+    pub const ALL: [Self; 20] = [
         Self::Description,
-        Self::Credit,
-        Self::Source,
         Self::City,
         Self::State,
         Self::Country,
+        Self::Keywords,
+        Self::DigitalSourceType,
+        Self::Creator,
+        Self::CopyrightOwner,
+        Self::Copyright,
+        Self::Credit,
+        Self::ContactEmail,
+        Self::DateCreated,
+        Self::AltText,
+        Self::Title,
+        Self::Headline,
+        Self::PersonShown,
+        Self::DescriptionWriter,
+        Self::Source,
+        Self::DataMining,
         Self::Instructions,
     ];
 
+    /// The stable name templates and clear markers use. Never change one: it is what
+    /// an existing template file and an existing sidecar say.
     pub const fn key(self) -> &'static str {
         match self {
-            Self::Creator => "creator",
-            Self::Copyright => "copyright",
-            Self::Title => "title",
-            Self::Headline => "headline",
             Self::Description => "description",
-            Self::Credit => "credit",
-            Self::Source => "source",
             Self::City => "city",
             Self::State => "state",
             Self::Country => "country",
+            Self::Keywords => "keywords",
+            Self::DigitalSourceType => "digital_source_type",
+            Self::Creator => "creator",
+            Self::CopyrightOwner => "copyright_owner",
+            Self::Copyright => "copyright",
+            Self::Credit => "credit",
+            Self::ContactEmail => "contact_email",
+            Self::DateCreated => "date_created",
+            Self::AltText => "alt_text",
+            Self::Title => "title",
+            Self::Headline => "headline",
+            Self::PersonShown => "person_shown",
+            Self::DescriptionWriter => "description_writer",
+            Self::Source => "source",
+            Self::DataMining => "data_mining",
             Self::Instructions => "instructions",
         }
     }
 
+    /// IPTC's own names, where the standard has one.
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Creator => "Creator",
-            Self::Copyright => "Copyright",
-            Self::Title => "Title",
-            Self::Headline => "Headline",
             Self::Description => "Description / Caption",
-            Self::Credit => "Credit",
-            Self::Source => "Source",
             Self::City => "City",
             Self::State => "State / Province",
             Self::Country => "Country",
+            Self::Keywords => "Keywords",
+            Self::DigitalSourceType => "Digital Source Type",
+            Self::Creator => "Creator / Image Creator",
+            Self::CopyrightOwner => "Copyright Owner",
+            Self::Copyright => "Copyright Notice",
+            Self::Credit => "Credit Line",
+            Self::ContactEmail => "Contact Email",
+            Self::DateCreated => "Date Created",
+            Self::AltText => "Alt Text (Accessibility)",
+            Self::Title => "Title",
+            Self::Headline => "Headline",
+            Self::PersonShown => "Person Shown",
+            Self::DescriptionWriter => "Description Writer",
+            Self::Source => "Source",
+            Self::DataMining => "Data Mining",
             Self::Instructions => "Instructions",
         }
     }
 
     pub const fn multiline(self) -> bool {
-        matches!(self, Self::Description | Self::Instructions)
+        matches!(
+            self,
+            Self::Description
+                | Self::Instructions
+                | Self::Keywords
+                | Self::Copyright
+                | Self::AltText
+                | Self::PersonShown
+        )
     }
+
+    /// Stored as a list, edited as one comma-separated line. See [`parse_keywords`].
+    pub const fn list(self) -> bool {
+        matches!(self, Self::Keywords | Self::PersonShown)
+    }
+
+    /// Shown under *More* rather than in the pane's main list.
+    pub const fn secondary(self) -> bool {
+        self as usize > Self::DateCreated as usize
+    }
+
+    /// **A fact about this one frame**, so it is never carried to another: not by
+    /// Copy to Next, and not into a template. Every other field describes a shoot,
+    /// and is exactly what those two exist to repeat — but stamping one frame's
+    /// capture time on the next is a record that is simply wrong.
+    pub const fn per_image(self) -> bool {
+        matches!(self, Self::DateCreated)
+    }
+
+    /// The controlled vocabulary the field's value is a URI from: the prefix every
+    /// value starts with, and the codes after it as `(code, name, offered)`.
+    pub const fn vocabulary(self) -> Option<(&'static str, Vocabulary)> {
+        match self {
+            Self::DigitalSourceType => Some((DIGITAL_SOURCE_TYPE_CV, DIGITAL_SOURCE_TYPES)),
+            Self::DataMining => Some((DATA_MINING_CV, DATA_MINING)),
+            _ => None,
+        }
+    }
+
+    /// A vocabulary value in its published words. `None` for a field with no
+    /// vocabulary, or a value outside it.
+    pub fn term_label(self, uri: &str) -> Option<&'static str> {
+        let (cv, terms) = self.vocabulary()?;
+        let code = uri.trim().strip_prefix(cv)?;
+        terms
+            .iter()
+            .find(|(c, _, _)| *c == code)
+            .map(|(_, label, _)| *label)
+    }
+}
+
+/// A controlled vocabulary's codes, their published names, and whether the Metadata
+/// pane offers each. See [`IptcField::vocabulary`].
+pub type Vocabulary = &'static [(&'static str, &'static str, bool)];
+
+/// Where IPTC's Digital Source Type vocabulary lives. A value is this plus a code.
+pub const DIGITAL_SOURCE_TYPE_CV: &str = "http://cv.iptc.org/newscodes/digitalsourcetype/";
+
+/// IPTC's Digital Source Type codes, with IPTC's own English names — retrieved from
+/// <https://cv.iptc.org/newscodes/digitalsourcetype/> on 2026-09-25 — in American
+/// spelling, which is the app's: IPTC publishes the three film and print terms as
+/// "Digitised". The stored value is the URI either way.
+///
+/// `offered` is whether the pane's menu lists it. The retired three are not offered,
+/// but are still named here so a file that carries one reads as words rather than as
+/// a URI. `dataDrivenMedia`, `algorithmicMedia` and `virtualRecording` are current but
+/// not photographic, so they are named and not offered either.
+pub const DIGITAL_SOURCE_TYPES: Vocabulary = &[
+    (
+        "digitalCapture",
+        "Digital capture sampled from real life",
+        true,
+    ),
+    (
+        "computationalCapture",
+        "Multi-frame computational capture sampled from real life",
+        true,
+    ),
+    (
+        "negativeFilm",
+        "Digitized from a transparent negative",
+        true,
+    ),
+    (
+        "positiveFilm",
+        "Digitized from a transparent positive",
+        true,
+    ),
+    ("print", "Digitized from a non-transparent medium", true),
+    ("humanEdits", "Human-edited media", true),
+    (
+        "algorithmicallyEnhanced",
+        "Algorithmically-altered media",
+        true,
+    ),
+    ("compositeCapture", "Composite of captured elements", true),
+    ("composite", "Composite of elements", true),
+    (
+        "compositeWithTrainedAlgorithmicMedia",
+        "Edited using Generative AI",
+        true,
+    ),
+    (
+        "compositeSynthetic",
+        "Composite including generative AI elements",
+        true,
+    ),
+    (
+        "trainedAlgorithmicMedia",
+        "Created using Generative AI",
+        true,
+    ),
+    ("digitalCreation", "Digital creation", true),
+    ("screenCapture", "Screen capture", true),
+    ("dataDrivenMedia", "Data-driven media", false),
+    ("algorithmicMedia", "Pure algorithmic media", false),
+    ("virtualRecording", "Virtual event recording", false),
+    (
+        "minorHumanEdits",
+        "Original media with minor human edits",
+        false,
+    ),
+    ("softwareImage", "Created by software", false),
+    ("digitalArt", "Digital art", false),
+];
+
+/// IPTC's name for a Digital Source Type URI, or `None` for one it does not define.
+pub fn digital_source_type_label(uri: &str) -> Option<&'static str> {
+    IptcField::DigitalSourceType.term_label(uri)
+}
+
+/// Where PLUS's Data Mining vocabulary lives. A value is this plus a code.
+pub const DATA_MINING_CV: &str = "http://ns.useplus.org/ldf/vocab/";
+
+/// PLUS's Data Mining codes, with the English names IPTC's user guide gives them —
+/// retrieved from <https://iptc.org/std/photometadata/documentation/userguide/> on
+/// 2026-09-25.
+///
+/// `offered` is whether the pane's menu lists it. The last three each point at a
+/// further field — Other Constraints, or an encoded rights expression — that monopro
+/// does not edit, so choosing one here would make a promise the file cannot keep. They
+/// are named so a file that carries one reads as words.
+pub const DATA_MINING: Vocabulary = &[
+    (
+        "DMI-UNSPECIFIED",
+        "Unspecified – no prohibition defined",
+        true,
+    ),
+    ("DMI-ALLOWED", "Allowed", true),
+    (
+        "DMI-PROHIBITED-AIMLTRAINING",
+        "Prohibited for AI/ML training",
+        true,
+    ),
+    (
+        "DMI-PROHIBITED-GENAIMLTRAINING",
+        "Prohibited for Generative AI/ML training",
+        true,
+    ),
+    (
+        "DMI-PROHIBITED-EXCEPTSEARCHENGINEINDEXING",
+        "Prohibited except for search engine indexing",
+        true,
+    ),
+    ("DMI-PROHIBITED", "Prohibited", true),
+    (
+        "DMI-PROHIBITED-SEECONSTRAINT",
+        "Prohibited, see Other Constraints",
+        false,
+    ),
+    (
+        "DMI-PROHIBITED-SEEEMBEDDEDRIGHTSEXPR",
+        "Prohibited, see Embedded Encoded Rights Expression",
+        false,
+    ),
+    (
+        "DMI-PROHIBITED-SEELINKEDRIGHTSEXPR",
+        "Prohibited, see Linked Encoded Rights Expression",
+        false,
+    ),
+];
+
+/// The published name for a Data Mining URI, or `None` for one PLUS does not define.
+pub fn data_mining_label(uri: &str) -> Option<&'static str> {
+    IptcField::DataMining.term_label(uri)
+}
+
+/// A keyword line split the way every catalog reads one: at commas, and at
+/// semicolons and line breaks too, since a pasted list uses whichever it came with.
+/// Blank entries and repeats are dropped; the first spelling of a repeat is kept.
+pub fn parse_keywords(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split([',', ';', '\n']).map(str::trim) {
+        if !word.is_empty() && !out.iter().any(|w| w == word) {
+            out.push(word.to_owned());
+        }
+    }
+    out
+}
+
+/// An EXIF-style date — `YYYY:MM:DD HH:MM:SS`, which is what a person copying from
+/// a camera's readout types too — as the ISO 8601 that XMP requires. Anything else
+/// is kept as written: a partial date (`2026`, `2026-03`) is valid IPTC, and a value
+/// this cannot read is still the person's to keep.
+pub fn normalize_date(text: &str) -> String {
+    let t = text.trim();
+    let b = t.as_bytes();
+    let digits =
+        |r: std::ops::Range<usize>| b.get(r).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
+    if b.len() >= 10
+        && digits(0..4)
+        && b[4] == b':'
+        && digits(5..7)
+        && b[7] == b':'
+        && digits(8..10)
+    {
+        let date = format!("{}-{}-{}", &t[0..4], &t[5..7], &t[8..10]);
+        let rest = t[10..].trim_start();
+        return if rest.is_empty() {
+            date
+        } else {
+            format!("{date}T{rest}")
+        };
+    }
+    t.to_owned()
+}
+
+/// The EXIF capture time and its offset, if the camera wrote one, as ISO 8601.
+pub fn exif_date_to_iso(date_time: &str, offset: Option<&str>) -> Option<String> {
+    let iso = normalize_date(date_time);
+    if iso == date_time.trim() || iso.starts_with("0000") {
+        return None; // not an EXIF date, or a camera whose clock was never set
+    }
+    let offset = offset.map(str::trim).filter(|o| {
+        let b = o.as_bytes();
+        b.len() == 6 && matches!(b[0], b'+' | b'-') && b[3] == b':'
+    });
+    Some(match offset {
+        Some(offset) if iso.contains('T') => format!("{iso}{offset}"),
+        _ => iso,
+    })
 }
 
 /// Standard metadata, kept so it travels to other applications — and read back
@@ -242,6 +573,23 @@ pub struct Metadata {
     pub state: Option<String>,
     pub country: Option<String>,
     pub instructions: Option<String>,
+    /// PLUS Copyright Owner — who holds the copyright, as against the notice.
+    pub copyright_owner: Option<String>,
+    /// A URI from IPTC's vocabulary; see [`DIGITAL_SOURCE_TYPES`].
+    pub digital_source_type: Option<String>,
+    /// IPTC Core Creator's Contact Info, work email.
+    pub contact_email: Option<String>,
+    /// `photoshop:DateCreated`, ISO 8601.
+    pub date_created: Option<String>,
+    /// IPTC Core Alt Text (Accessibility).
+    pub alt_text: Option<String>,
+    /// `photoshop:CaptionWriter`.
+    pub description_writer: Option<String>,
+    /// IPTC Extension Person Shown in the Image.
+    pub person_shown: Vec<String>,
+    /// PLUS Data Mining, a URI; see [`DATA_MINING`].
+    pub data_mining: Option<String>,
+    /// `dc:subject`, the keywords.
     pub subject: Vec<String>,
     /// `xmp:Rating`. Lightbox's, but stored here from the start so a rating set in
     /// another application survives a develop write.
@@ -260,30 +608,48 @@ impl Metadata {
         *self == Self::default()
     }
 
-    pub fn iptc(&self, field: IptcField) -> Option<&str> {
-        match field {
-            IptcField::Creator => self.creator.as_deref(),
-            IptcField::Copyright => self.rights.as_deref(),
-            IptcField::Title => self.title.as_deref(),
-            IptcField::Headline => self.headline.as_deref(),
-            IptcField::Description => self.description.as_deref(),
-            IptcField::Credit => self.credit.as_deref(),
-            IptcField::Source => self.source.as_deref(),
-            IptcField::City => self.city.as_deref(),
-            IptcField::State => self.state.as_deref(),
-            IptcField::Country => self.country.as_deref(),
-            IptcField::Instructions => self.instructions.as_deref(),
+    /// A field's value as the pane shows it. A list is joined into the one line it is
+    /// edited as.
+    pub fn iptc(&self, field: IptcField) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        match (self.slot(field), self.list(field)) {
+            (Some(slot), _) => slot.as_deref().map(Cow::Borrowed),
+            (None, Some(list)) => (!list.is_empty()).then(|| Cow::Owned(list.join(", "))),
+            (None, None) => None,
         }
     }
 
-    /// Change one authored field. An empty string is a deliberate clear, recorded
-    /// separately from absence so an embedded value cannot leak back through.
-    pub fn set_iptc(&mut self, field: IptcField, value: String) {
-        let value = value.trim().to_owned();
-        let cleared = value.is_empty();
-        let slot = match field {
+    /// The text slot behind a field. `None` for a list field; see [`Self::list`].
+    fn slot(&self, field: IptcField) -> Option<&Option<String>> {
+        Some(match field {
+            IptcField::Keywords | IptcField::PersonShown => return None,
+            IptcField::Creator => &self.creator,
+            IptcField::Copyright => &self.rights,
+            IptcField::CopyrightOwner => &self.copyright_owner,
+            IptcField::Title => &self.title,
+            IptcField::Headline => &self.headline,
+            IptcField::Description => &self.description,
+            IptcField::Credit => &self.credit,
+            IptcField::Source => &self.source,
+            IptcField::City => &self.city,
+            IptcField::State => &self.state,
+            IptcField::Country => &self.country,
+            IptcField::Instructions => &self.instructions,
+            IptcField::DigitalSourceType => &self.digital_source_type,
+            IptcField::ContactEmail => &self.contact_email,
+            IptcField::DateCreated => &self.date_created,
+            IptcField::AltText => &self.alt_text,
+            IptcField::DescriptionWriter => &self.description_writer,
+            IptcField::DataMining => &self.data_mining,
+        })
+    }
+
+    fn slot_mut(&mut self, field: IptcField) -> Option<&mut Option<String>> {
+        Some(match field {
+            IptcField::Keywords | IptcField::PersonShown => return None,
             IptcField::Creator => &mut self.creator,
             IptcField::Copyright => &mut self.rights,
+            IptcField::CopyrightOwner => &mut self.copyright_owner,
             IptcField::Title => &mut self.title,
             IptcField::Headline => &mut self.headline,
             IptcField::Description => &mut self.description,
@@ -293,8 +659,49 @@ impl Metadata {
             IptcField::State => &mut self.state,
             IptcField::Country => &mut self.country,
             IptcField::Instructions => &mut self.instructions,
+            IptcField::DigitalSourceType => &mut self.digital_source_type,
+            IptcField::ContactEmail => &mut self.contact_email,
+            IptcField::DateCreated => &mut self.date_created,
+            IptcField::AltText => &mut self.alt_text,
+            IptcField::DescriptionWriter => &mut self.description_writer,
+            IptcField::DataMining => &mut self.data_mining,
+        })
+    }
+
+    /// The list behind a list field, `None` for a text one.
+    fn list(&self, field: IptcField) -> Option<&Vec<String>> {
+        match field {
+            IptcField::Keywords => Some(&self.subject),
+            IptcField::PersonShown => Some(&self.person_shown),
+            _ => None,
+        }
+    }
+
+    fn list_mut(&mut self, field: IptcField) -> Option<&mut Vec<String>> {
+        match field {
+            IptcField::Keywords => Some(&mut self.subject),
+            IptcField::PersonShown => Some(&mut self.person_shown),
+            _ => None,
+        }
+    }
+
+    /// Change one authored field. An empty string is a deliberate clear, recorded
+    /// separately from absence so an embedded value cannot leak back through.
+    pub fn set_iptc(&mut self, field: IptcField, value: String) {
+        let cleared = if let Some(list) = self.list_mut(field) {
+            *list = parse_keywords(&value);
+            list.is_empty()
+        } else {
+            let value = match field {
+                IptcField::DateCreated => normalize_date(&value),
+                _ => value.trim().to_owned(),
+            };
+            let cleared = value.is_empty();
+            if let Some(slot) = self.slot_mut(field) {
+                *slot = (!cleared).then_some(value);
+            }
+            cleared
         };
-        *slot = (!cleared).then_some(value);
         self.cleared.retain(|key| key != field.key());
         if cleared {
             self.cleared.push(field.key().to_owned());
@@ -306,15 +713,25 @@ impl Metadata {
     pub fn merged(embedded: &Self, authored: &Self) -> Self {
         let mut out = embedded.clone();
         for field in IptcField::ALL {
-            if authored.cleared.iter().any(|key| key == field.key()) {
-                clear_iptc(&mut out, field);
-            } else if let Some(value) = authored.iptc(field) {
-                set_iptc_value(&mut out, field, Some(value.to_owned()));
+            let cleared = authored.cleared.iter().any(|key| key == field.key());
+            if let (Some(slot), Some(value)) = (out.slot_mut(field), authored.slot(field)) {
+                if cleared {
+                    *slot = None;
+                } else if value.is_some() {
+                    slot.clone_from(value);
+                }
+            }
+            // A list is copied as a list rather than through the joined line, so an
+            // entry another application wrote with a comma in it survives.
+            if let (Some(list), Some(value)) = (out.list_mut(field), authored.list(field)) {
+                if cleared {
+                    list.clear();
+                } else if !value.is_empty() {
+                    list.clone_from(value);
+                }
             }
         }
-        if !authored.subject.is_empty() {
-            out.subject = authored.subject.clone();
-        }
+        // The keywords' marker before they were a field of their own.
         if authored.cleared.iter().any(|key| key == "subject") {
             out.subject.clear();
         }
@@ -331,26 +748,6 @@ impl Metadata {
         out.cleared.clear();
         out
     }
-}
-
-fn set_iptc_value(metadata: &mut Metadata, field: IptcField, value: Option<String>) {
-    match field {
-        IptcField::Creator => metadata.creator = value,
-        IptcField::Copyright => metadata.rights = value,
-        IptcField::Title => metadata.title = value,
-        IptcField::Headline => metadata.headline = value,
-        IptcField::Description => metadata.description = value,
-        IptcField::Credit => metadata.credit = value,
-        IptcField::Source => metadata.source = value,
-        IptcField::City => metadata.city = value,
-        IptcField::State => metadata.state = value,
-        IptcField::Country => metadata.country = value,
-        IptcField::Instructions => metadata.instructions = value,
-    }
-}
-
-fn clear_iptc(metadata: &mut Metadata, field: IptcField) {
-    set_iptc_value(metadata, field, None);
 }
 
 /// One sidecar's contents.
@@ -1039,6 +1436,9 @@ pub fn to_xml(params: &Params, metadata: &Metadata, source_name: &str) -> String
     o.push_str(&format!("    xmlns:dc=\"{DC_NS}\"\n"));
     o.push_str(&format!("    xmlns:xmp=\"{XMP_NS}\"\n"));
     o.push_str(&format!("    xmlns:photoshop=\"{PHOTOSHOP_NS}\"\n"));
+    o.push_str(&format!("    xmlns:Iptc4xmpCore=\"{IPTC_CORE_NS}\"\n"));
+    o.push_str(&format!("    xmlns:Iptc4xmpExt=\"{IPTC_EXT_NS}\"\n"));
+    o.push_str(&format!("    xmlns:plus=\"{PLUS_NS}\"\n"));
 
     let mut attr = |name: &str, value: String| {
         o.push_str(&format!("   monopro:{name}=\"{value}\"\n"));
@@ -1277,40 +1677,72 @@ pub fn to_xml(params: &Params, metadata: &Metadata, source_name: &str) -> String
     write_dodgeburn(&mut o, &p.dodgeburn);
     write_toning(&mut o, &p.toning);
 
-    // Metadata, in the shapes XMP defines for them.
+    write_metadata(&mut o, metadata);
+
+    o.push_str("  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n");
+    o
+}
+
+/// The IPTC fields as elements, in the shapes XMP and IPTC define for them. Shared
+/// by the sidecar and the export packet, so the two can never describe one field
+/// two ways.
+///
+/// The structured ones are written the way Lightroom and Photo Mechanic write them —
+/// `rdf:parseType="Resource"` rather than a nested `rdf:Description` — since those
+/// are the readers this is addressed to; [`read_metadata`] accepts either.
+fn write_metadata(o: &mut String, metadata: &Metadata) {
     if let Some(v) = &metadata.creator {
         o.push_str(&format!(
             "   <dc:creator><rdf:Seq><rdf:li>{}</rdf:li></rdf:Seq></dc:creator>\n",
             escape(v)
         ));
+        // IPTC's Image Creator is the same person in PLUS's licensing vocabulary.
+        o.push_str(&format!(
+            "   <plus:ImageCreator><rdf:Seq><rdf:li rdf:parseType=\"Resource\"><plus:ImageCreatorName>{}</plus:ImageCreatorName></rdf:li></rdf:Seq></plus:ImageCreator>\n",
+            escape(v)
+        ));
+    }
+    if let Some(v) = &metadata.copyright_owner {
+        o.push_str(&format!(
+            "   <plus:CopyrightOwner><rdf:Seq><rdf:li rdf:parseType=\"Resource\"><plus:CopyrightOwnerName>{}</plus:CopyrightOwnerName></rdf:li></rdf:Seq></plus:CopyrightOwner>\n",
+            escape(v)
+        ));
     }
     for (tag, val) in [
-        ("title", &metadata.title),
-        ("rights", &metadata.rights),
-        ("description", &metadata.description),
+        ("dc:title", &metadata.title),
+        ("dc:rights", &metadata.rights),
+        ("dc:description", &metadata.description),
+        ("Iptc4xmpCore:AltTextAccessibility", &metadata.alt_text),
     ] {
         if let Some(v) = val {
             o.push_str(&format!(
-                "   <dc:{tag}><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:{tag}>\n",
+                "   <{tag}><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></{tag}>\n",
                 escape(v)
             ));
         }
     }
-    if !metadata.subject.is_empty() {
-        o.push_str("   <dc:subject>\n    <rdf:Bag>\n");
-        for s in &metadata.subject {
-            o.push_str(&format!("     <rdf:li>{}</rdf:li>\n", escape(s)));
+    for (tag, list) in [
+        ("dc:subject", &metadata.subject),
+        ("Iptc4xmpExt:PersonInImage", &metadata.person_shown),
+    ] {
+        if !list.is_empty() {
+            o.push_str(&format!("   <{tag}>\n    <rdf:Bag>\n"));
+            for s in list {
+                o.push_str(&format!("     <rdf:li>{}</rdf:li>\n", escape(s)));
+            }
+            o.push_str(&format!("    </rdf:Bag>\n   </{tag}>\n"));
         }
-        o.push_str("    </rdf:Bag>\n   </dc:subject>\n");
     }
     for (tag, val) in [
         ("Headline", &metadata.headline),
+        ("CaptionWriter", &metadata.description_writer),
         ("Credit", &metadata.credit),
         ("Source", &metadata.source),
         ("City", &metadata.city),
         ("State", &metadata.state),
         ("Country", &metadata.country),
         ("Instructions", &metadata.instructions),
+        ("DateCreated", &metadata.date_created),
     ] {
         if let Some(v) = val {
             o.push_str(&format!(
@@ -1319,9 +1751,24 @@ pub fn to_xml(params: &Params, metadata: &Metadata, source_name: &str) -> String
             ));
         }
     }
-
-    o.push_str("  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n");
-    o
+    if let Some(v) = &metadata.contact_email {
+        o.push_str(&format!(
+            "   <Iptc4xmpCore:CreatorContactInfo rdf:parseType=\"Resource\"><Iptc4xmpCore:CiEmailWork>{}</Iptc4xmpCore:CiEmailWork></Iptc4xmpCore:CreatorContactInfo>\n",
+            escape(v)
+        ));
+    }
+    if let Some(v) = &metadata.digital_source_type {
+        o.push_str(&format!(
+            "   <Iptc4xmpExt:DigitalSourceType>{}</Iptc4xmpExt:DigitalSourceType>\n",
+            escape(v)
+        ));
+    }
+    if let Some(v) = &metadata.data_mining {
+        o.push_str(&format!(
+            "   <plus:DataMining>{}</plus:DataMining>\n",
+            escape(v)
+        ));
+    }
 }
 
 /// A standalone XMP packet carrying **only** the authored metadata, for embedding in
@@ -1349,7 +1796,7 @@ pub fn metadata_packet(metadata: &Metadata) -> Option<String> {
     o.push_str("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n");
     o.push_str(&format!(" <rdf:RDF xmlns:rdf=\"{RDF_NS}\">\n"));
     o.push_str(&format!(
-        "  <rdf:Description rdf:about=\"\"\n   xmlns:dc=\"{DC_NS}\"\n   xmlns:xmp=\"{XMP_NS}\"\n   xmlns:photoshop=\"{PHOTOSHOP_NS}\"\n"
+        "  <rdf:Description rdf:about=\"\"\n   xmlns:dc=\"{DC_NS}\"\n   xmlns:xmp=\"{XMP_NS}\"\n   xmlns:photoshop=\"{PHOTOSHOP_NS}\"\n   xmlns:Iptc4xmpCore=\"{IPTC_CORE_NS}\"\n   xmlns:Iptc4xmpExt=\"{IPTC_EXT_NS}\"\n   xmlns:plus=\"{PLUS_NS}\"\n"
     ));
     if let Some(r) = metadata.rating {
         o.push_str(&format!("   xmp:Rating=\"{r}\"\n"));
@@ -1358,47 +1805,7 @@ pub fn metadata_packet(metadata: &Metadata) -> Option<String> {
         o.push_str(&format!("   xmp:Label=\"{}\"\n", escape(l)));
     }
     o.push_str("   >\n");
-    if let Some(v) = &metadata.creator {
-        o.push_str(&format!(
-            "   <dc:creator><rdf:Seq><rdf:li>{}</rdf:li></rdf:Seq></dc:creator>\n",
-            escape(v)
-        ));
-    }
-    for (tag, val) in [
-        ("title", &metadata.title),
-        ("rights", &metadata.rights),
-        ("description", &metadata.description),
-    ] {
-        if let Some(v) = val {
-            o.push_str(&format!(
-                "   <dc:{tag}><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:{tag}>\n",
-                escape(v)
-            ));
-        }
-    }
-    if !metadata.subject.is_empty() {
-        o.push_str("   <dc:subject>\n    <rdf:Bag>\n");
-        for s in &metadata.subject {
-            o.push_str(&format!("     <rdf:li>{}</rdf:li>\n", escape(s)));
-        }
-        o.push_str("    </rdf:Bag>\n   </dc:subject>\n");
-    }
-    for (tag, val) in [
-        ("Headline", &metadata.headline),
-        ("Credit", &metadata.credit),
-        ("Source", &metadata.source),
-        ("City", &metadata.city),
-        ("State", &metadata.state),
-        ("Country", &metadata.country),
-        ("Instructions", &metadata.instructions),
-    ] {
-        if let Some(v) = val {
-            o.push_str(&format!(
-                "   <photoshop:{tag}>{}</photoshop:{tag}>\n",
-                escape(v)
-            ));
-        }
-    }
+    write_metadata(&mut o, metadata);
     o.push_str("  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end=\"w\"?>");
     Some(o)
 }
@@ -1441,11 +1848,22 @@ pub fn read(image: &Path) -> Loaded<Sidecar> {
 
 /// Standard XMP metadata embedded in the source, if its format exposes a packet.
 /// It is always read-only; authored changes belong to `<stem>.mono.xmp`.
+///
+/// **Date Created falls back to the EXIF capture time.** The maintainer's ask — the
+/// field should show at least what the camera recorded — and the Metadata Working
+/// Group's rule besides: `photoshop:DateCreated` and EXIF `DateTimeOriginal` are one
+/// fact in two places. So a frame nobody has dated reads, and exports, as taken when
+/// the camera says it was; typing a date overrides it, and clearing it clears it.
 pub fn embedded_metadata(image: &Path) -> Metadata {
-    crate::sensor::xmp_packet(image)
+    let (packet, taken) = crate::sensor::xmp_and_capture_date(image);
+    let mut metadata = packet
         .and_then(|packet| from_xml(&packet).ok())
         .map(|sidecar| sidecar.metadata)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if metadata.date_created.is_none() {
+        metadata.date_created = taken;
+    }
+    metadata
 }
 
 /// The source's embedded metadata with monopro's sidecar applied as a field-level
@@ -2000,9 +2418,9 @@ fn read_curves(desc: &roxmltree::Node) -> Option<Vec<CurveInstance>> {
 fn read_metadata(desc: &roxmltree::Node) -> Metadata {
     // `rdf:Seq`, `rdf:Alt` and `rdf:Bag` differ in meaning but not in how the text
     // is reached, so one helper reads all three.
-    let list = |tag: &str| -> Vec<String> {
+    let list_in = |ns: &str, tag: &str| -> Vec<String> {
         desc.children()
-            .find(|n| n.has_tag_name((DC_NS, tag)))
+            .find(|n| n.has_tag_name((ns, tag)))
             .into_iter()
             .flat_map(|n| n.children().collect::<Vec<_>>())
             .flat_map(|c| c.children().collect::<Vec<_>>())
@@ -2010,6 +2428,7 @@ fn read_metadata(desc: &roxmltree::Node) -> Metadata {
             .filter_map(|n| n.text().map(str::to_owned))
             .collect()
     };
+    let list = |tag: &str| list_in(DC_NS, tag);
     let simple = |ns: &str, tag: &str| -> Option<String> {
         desc.attribute((ns, tag))
             .map(str::to_owned)
@@ -2021,8 +2440,29 @@ fn read_metadata(desc: &roxmltree::Node) -> Metadata {
             })
             .filter(|value| !value.is_empty())
     };
+    // A field inside a structure, written as an element or as an attribute, at any
+    // depth — `rdf:parseType="Resource"`, a nested `rdf:Description`, or the compact
+    // attribute form are all the same value to a reader.
+    let within = |outer_ns: &str, outer: &str, ns: &str, tag: &str| -> Option<String> {
+        let node = desc
+            .children()
+            .find(|n| n.has_tag_name((outer_ns, outer)))?;
+        node.descendants()
+            .find_map(|n| {
+                n.attribute((ns, tag)).map(str::to_owned).or_else(|| {
+                    n.has_tag_name((ns, tag))
+                        .then(|| n.text().map(str::to_owned))
+                        .flatten()
+                })
+            })
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
     Metadata {
-        creator: list("creator").into_iter().next(),
+        creator: list("creator")
+            .into_iter()
+            .next()
+            .or_else(|| within(PLUS_NS, "ImageCreator", PLUS_NS, "ImageCreatorName")),
         rights: list("rights").into_iter().next(),
         title: list("title").into_iter().next(),
         headline: simple(PHOTOSHOP_NS, "Headline"),
@@ -2033,6 +2473,28 @@ fn read_metadata(desc: &roxmltree::Node) -> Metadata {
         state: simple(PHOTOSHOP_NS, "State"),
         country: simple(PHOTOSHOP_NS, "Country"),
         instructions: simple(PHOTOSHOP_NS, "Instructions"),
+        copyright_owner: within(PLUS_NS, "CopyrightOwner", PLUS_NS, "CopyrightOwnerName"),
+        digital_source_type: simple(IPTC_EXT_NS, "DigitalSourceType"),
+        contact_email: within(
+            IPTC_CORE_NS,
+            "CreatorContactInfo",
+            IPTC_CORE_NS,
+            "CiEmailWork",
+        ),
+        date_created: simple(PHOTOSHOP_NS, "DateCreated"),
+        alt_text: list_in(IPTC_CORE_NS, "AltTextAccessibility")
+            .into_iter()
+            .next()
+            .or_else(|| simple(IPTC_CORE_NS, "AltTextAccessibility")),
+        description_writer: simple(PHOTOSHOP_NS, "CaptionWriter"),
+        person_shown: list_in(IPTC_EXT_NS, "PersonInImage"),
+        // A URL property, so another writer may have put it in `rdf:resource`.
+        data_mining: simple(PLUS_NS, "DataMining").or_else(|| {
+            desc.children()
+                .find(|n| n.has_tag_name((PLUS_NS, "DataMining")))
+                .and_then(|n| n.attribute((RDF_NS, "resource")))
+                .map(str::to_owned)
+        }),
         subject: list("subject"),
         rating: desc
             .attribute((XMP_NS, "Rating"))
@@ -3231,6 +3693,14 @@ mod tests {
             state: Some("Example City".into()),
             country: Some("United States".into()),
             instructions: Some("Contact before publication".into()),
+            copyright_owner: Some("Example Studio LLC".into()),
+            digital_source_type: Some(format!("{DIGITAL_SOURCE_TYPE_CV}digitalCapture")),
+            contact_email: Some("studio@example.com".into()),
+            date_created: Some("2026-03-08T14:22:05-05:00".into()),
+            alt_text: Some("A brick wall with a lattice of breeze blocks".into()),
+            description_writer: Some("C. Writer".into()),
+            person_shown: vec!["Jane Doe".into(), "John Roe".into()],
+            data_mining: Some(format!("{DATA_MINING_CV}DMI-PROHIBITED-AIMLTRAINING")),
             subject: vec!["architecture".into(), "daylight".into()],
             rating: Some(4),
             // A word this app's own palette does not contain, deliberately: the label
@@ -3273,6 +3743,253 @@ mod tests {
         let reread = from_xml(&xml).ok().expect("sidecar parses").metadata;
         assert!(reread.cleared.iter().any(|key| key == "description"));
         assert_eq!(Metadata::merged(&embedded, &reread), merged);
+    }
+
+    #[test]
+    fn the_new_iptc_fields_are_written_where_other_applications_look() {
+        // Not merely round-tripped through this app's own reader: each lands in the
+        // property IPTC names for it, which is the only reason to write it at all.
+        let mut meta = Metadata::default();
+        meta.set_iptc(IptcField::Creator, "A. Photographer".into());
+        meta.set_iptc(IptcField::CopyrightOwner, "Example Studio".into());
+        meta.set_iptc(IptcField::ContactEmail, "a@example.com".into());
+        meta.set_iptc(
+            IptcField::DigitalSourceType,
+            format!("{DIGITAL_SOURCE_TYPE_CV}negativeFilm"),
+        );
+        meta.set_iptc(IptcField::DateCreated, "2026:03:08 14:22:05".into());
+        meta.set_iptc(IptcField::AltText, "Birch bark, peeling".into());
+        meta.set_iptc(IptcField::DescriptionWriter, "C. Writer".into());
+        meta.set_iptc(IptcField::PersonShown, "Jane Doe, John Roe".into());
+        meta.set_iptc(
+            IptcField::DataMining,
+            format!("{DATA_MINING_CV}DMI-PROHIBITED"),
+        );
+        let packet = metadata_packet(&meta).expect("something to say");
+        for needle in [
+            "<dc:creator><rdf:Seq><rdf:li>A. Photographer</rdf:li>",
+            "<plus:ImageCreatorName>A. Photographer</plus:ImageCreatorName>",
+            "<plus:CopyrightOwnerName>Example Studio</plus:CopyrightOwnerName>",
+            "<Iptc4xmpCore:CiEmailWork>a@example.com</Iptc4xmpCore:CiEmailWork>",
+            "<Iptc4xmpExt:DigitalSourceType>http://cv.iptc.org/newscodes/digitalsourcetype/negativeFilm</Iptc4xmpExt:DigitalSourceType>",
+            "<photoshop:DateCreated>2026-03-08T14:22:05</photoshop:DateCreated>",
+            "<Iptc4xmpCore:AltTextAccessibility><rdf:Alt><rdf:li xml:lang=\"x-default\">Birch bark, peeling</rdf:li>",
+            "<photoshop:CaptionWriter>C. Writer</photoshop:CaptionWriter>",
+            "<Iptc4xmpExt:PersonInImage>\n    <rdf:Bag>\n     <rdf:li>Jane Doe</rdf:li>\n     <rdf:li>John Roe</rdf:li>",
+            "<plus:DataMining>http://ns.useplus.org/ldf/vocab/DMI-PROHIBITED</plus:DataMining>",
+        ] {
+            assert!(packet.contains(needle), "missing {needle} in\n{packet}");
+        }
+        assert!(
+            roxmltree::Document::parse(&packet).is_ok(),
+            "the packet is not well-formed:\n{packet}"
+        );
+        let reread = from_xml(&packet).ok().expect("parses").metadata;
+        assert_eq!(reread.creator.as_deref(), Some("A. Photographer"));
+        assert_eq!(reread.copyright_owner.as_deref(), Some("Example Studio"));
+        assert_eq!(reread.contact_email.as_deref(), Some("a@example.com"));
+        assert_eq!(reread.date_created.as_deref(), Some("2026-03-08T14:22:05"));
+        assert_eq!(reread.alt_text.as_deref(), Some("Birch bark, peeling"));
+        assert_eq!(reread.person_shown, vec!["Jane Doe", "John Roe"]);
+        assert_eq!(
+            data_mining_label(reread.data_mining.as_deref().unwrap_or("")),
+            Some("Prohibited")
+        );
+    }
+
+    #[test]
+    fn structured_fields_are_read_in_every_shape_xmp_allows() {
+        // Another application's packet: the contact info as a nested
+        // `rdf:Description` with attributes, the owner as an element inside one, and
+        // only PLUS's Image Creator — no `dc:creator` at all.
+        let xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="{RDF_NS}">
+            <rdf:Description rdf:about="" xmlns:Iptc4xmpCore="{IPTC_CORE_NS}" xmlns:plus="{PLUS_NS}" xmlns:photoshop="{PHOTOSHOP_NS}" photoshop:DateCreated="2025-12-01">
+              <Iptc4xmpCore:CreatorContactInfo>
+                <rdf:Description Iptc4xmpCore:CiEmailWork="desk@example.org"/>
+              </Iptc4xmpCore:CreatorContactInfo>
+              <plus:CopyrightOwner><rdf:Seq><rdf:li><rdf:Description>
+                <plus:CopyrightOwnerName>Owner Name</plus:CopyrightOwnerName>
+              </rdf:Description></rdf:li></rdf:Seq></plus:CopyrightOwner>
+              <plus:ImageCreator><rdf:Seq><rdf:li rdf:parseType="Resource">
+                <plus:ImageCreatorName>Only In Plus</plus:ImageCreatorName>
+              </rdf:li></rdf:Seq></plus:ImageCreator>
+            </rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let meta = from_xml(&xml).ok().expect("parses").metadata;
+        assert_eq!(meta.contact_email.as_deref(), Some("desk@example.org"));
+        assert_eq!(meta.copyright_owner.as_deref(), Some("Owner Name"));
+        assert_eq!(meta.creator.as_deref(), Some("Only In Plus"));
+        assert_eq!(meta.date_created.as_deref(), Some("2025-12-01"));
+    }
+
+    #[test]
+    fn keywords_are_one_line_to_edit_and_a_list_on_disk() {
+        assert_eq!(
+            parse_keywords(" street, night ;winter\nstreet,, "),
+            vec!["street", "night", "winter"],
+            "split on every separator, trimmed, with blanks and repeats dropped"
+        );
+        let mut meta = Metadata::default();
+        meta.set_iptc(IptcField::Keywords, "street, night".into());
+        assert_eq!(meta.subject, vec!["street", "night"]);
+        assert_eq!(
+            meta.iptc(IptcField::Keywords).as_deref(),
+            Some("street, night")
+        );
+
+        // Clearing is a tombstone like every other field, so embedded keywords stay
+        // gone — and the marker from before keywords were a field still works.
+        let embedded = Metadata {
+            subject: vec!["from the camera".into()],
+            ..Default::default()
+        };
+        meta.set_iptc(IptcField::Keywords, " , ".into());
+        assert!(Metadata::merged(&embedded, &meta).subject.is_empty());
+        let legacy = Metadata {
+            cleared: vec!["subject".into()],
+            ..Default::default()
+        };
+        assert!(Metadata::merged(&embedded, &legacy).subject.is_empty());
+
+        // A keyword another application wrote with a comma inside survives a merge.
+        let authored = Metadata {
+            subject: vec!["Smith, Jane".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            Metadata::merged(&embedded, &authored).subject,
+            vec!["Smith, Jane"]
+        );
+    }
+
+    #[test]
+    fn dates_are_iso_whether_typed_or_read_from_exif() {
+        assert_eq!(normalize_date("2026:03:08 14:22:05"), "2026-03-08T14:22:05");
+        assert_eq!(normalize_date("2026:03:08"), "2026-03-08");
+        assert_eq!(
+            normalize_date("2026-03"),
+            "2026-03",
+            "a partial date is valid IPTC"
+        );
+        assert_eq!(
+            normalize_date(" March 2026 "),
+            "March 2026",
+            "kept as written"
+        );
+        assert_eq!(
+            exif_date_to_iso("2026:03:08 14:22:05", Some("-05:00")).as_deref(),
+            Some("2026-03-08T14:22:05-05:00")
+        );
+        assert_eq!(
+            exif_date_to_iso("2026:03:08 14:22:05", None).as_deref(),
+            Some("2026-03-08T14:22:05")
+        );
+        assert_eq!(
+            exif_date_to_iso("0000:00:00 00:00:00", None),
+            None,
+            "an unset camera clock is not a date"
+        );
+        assert_eq!(exif_date_to_iso("garbage", None), None);
+    }
+
+    #[test]
+    fn every_digital_source_type_reads_as_iptcs_own_words() {
+        assert_eq!(
+            digital_source_type_label(&format!("{DIGITAL_SOURCE_TYPE_CV}digitalCapture")),
+            Some("Digital capture sampled from real life")
+        );
+        assert_eq!(digital_source_type_label("urn:something:else"), None);
+        let mut codes: Vec<_> = DIGITAL_SOURCE_TYPES.iter().map(|(c, _, _)| *c).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(
+            codes.len(),
+            DIGITAL_SOURCE_TYPES.len(),
+            "a code listed twice"
+        );
+        // The retired ones are named, so an old file reads, but never offered.
+        for retired in ["minorHumanEdits", "softwareImage", "digitalArt"] {
+            assert!(
+                DIGITAL_SOURCE_TYPES
+                    .iter()
+                    .any(|(c, _, offered)| *c == retired && !offered),
+                "{retired}"
+            );
+        }
+    }
+
+    #[test]
+    fn iptc_keys_are_unique_and_the_order_is_the_maintainers() {
+        let mut keys: Vec<_> = IptcField::ALL.iter().map(|f| f.key()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), IptcField::ALL.len());
+        for (i, field) in IptcField::ALL.into_iter().enumerate() {
+            assert_eq!(field as usize, i, "{field:?} is not at its own index");
+        }
+        let primary: Vec<_> = IptcField::ALL
+            .into_iter()
+            .filter(|f| !f.secondary())
+            .map(|f| f.label())
+            .collect();
+        assert_eq!(
+            primary,
+            [
+                "Description / Caption",
+                "City",
+                "State / Province",
+                "Country",
+                "Keywords",
+                "Digital Source Type",
+                "Creator / Image Creator",
+                "Copyright Owner",
+                "Copyright Notice",
+                "Credit Line",
+                "Contact Email",
+                "Date Created",
+            ]
+        );
+        let more: Vec<_> = IptcField::ALL
+            .into_iter()
+            .filter(|f| f.secondary())
+            .map(|f| f.label())
+            .collect();
+        assert_eq!(
+            more,
+            [
+                "Alt Text (Accessibility)",
+                "Title",
+                "Headline",
+                "Person Shown",
+                "Description Writer",
+                "Source",
+                "Data Mining",
+                "Instructions",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_from_the_last_parameter_version_reads_as_this_one_does() {
+        // The claim `PARAMS_SCHEMA` makes: every version from it up to this one
+        // describes the same develop, so a file claiming it opens with exactly the
+        // parameters a current file would.
+        let mut p = Params::default();
+        p.exposure.ev = 1.25;
+        let current = to_xml(&p, &Metadata::default(), "t.dng");
+        let older = current.replace(
+            &format!("monopro:SchemaVersion=\"{SCHEMA_VERSION}\""),
+            &format!("monopro:SchemaVersion=\"{PARAMS_SCHEMA}\""),
+        );
+        assert_ne!(
+            older, current,
+            "the version attribute was not found to rewrite"
+        );
+        let a = from_xml(&current).ok().expect("current reads");
+        let b = from_xml(&older).ok().expect("older reads");
+        assert_eq!(b.schema, PARAMS_SCHEMA);
+        assert_eq!(a.params, b.params);
     }
 
     #[test]

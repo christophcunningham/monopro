@@ -273,7 +273,7 @@ fn notice_of(event: UpdateEvent) -> Option<Notice> {
             version: choice.version,
         },
         UpdateEvent::WillRelaunchApplication => Notice::Installing,
-        UpdateEvent::UserDidCancelDownload => Notice::Failed("download cancelled".to_owned()),
+        UpdateEvent::UserDidCancelDownload => Notice::Failed("download canceled".to_owned()),
         // The end of a cycle is the cue a pending skip waits for: the check
         // that downloaded and staged the update has finished, so a resumed
         // check now sees the installer in progress instead of a live session.

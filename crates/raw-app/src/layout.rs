@@ -160,8 +160,12 @@ fn closable(pane: Pane) -> bool {
 /// has to read it rather than quote it — a develop panel that started narrower would
 /// shorten every slider in the app, and nothing else would say so.
 pub(crate) const DEVELOP_W: f32 = 350.0;
-// Fit the complete tab headers, including close buttons and a small rounding margin.
-const INFO_W: f32 = 304.0;
+/// Fit the complete tab headers, including close buttons and a small rounding margin.
+///
+/// `pub(crate)` because the Lightbox's sidebar starts at this width too — the
+/// maintainer's call, so the two modes' reading columns match when you switch between
+/// them.
+pub(crate) const INFO_W: f32 = 304.0;
 const IMAGE_W: f32 = 746.0;
 
 /// Those three, which is the default window width.
@@ -365,15 +369,262 @@ pub struct Layout {
     /// What each tile measured last frame. See [`Layout::keep_panel_sizes`].
     measured: std::collections::HashMap<TileId, egui::Vec2>,
     restore_pixels: bool,
-    /// Edge columns dragged off the side of the window, and the width each goes back
-    /// to. Hidden like a closed panel but reached by the strip left at the edge, not
-    /// by `tab`. Not persisted: a column that came back tucked after a restart would
-    /// look like a column that had gone missing.
+    /// Edge columns dragged off the side of the window. Hidden like a closed panel but
+    /// reached by the strip left at the edge, not by `tab`. See [`Tuck`].
+    tuck: Tuck,
+}
+
+/// Edge columns dragged off the side of the window, and the width each goes back to.
+///
+/// **One implementation for both trees**, for the reason `normalise_shares` is one:
+/// the Lightbox has the same row of panels around a flexible middle, and a fix made
+/// to one copy never reached the other. The flexible tile — the image here, the grid
+/// there — is passed in rather than known, and everything else is the same gesture.
+///
+/// Not persisted: a column that came back tucked after a restart would look like a
+/// column that had gone missing.
+#[derive(Default)]
+pub(crate) struct Tuck {
     tucked: Vec<(TileId, f32)>,
     /// Where the edge seams were, and how wide their columns, when the pointer last
     /// went down. A tuck only fires for a drag that *started* on that column's seam —
     /// dragging the other seam across the window must not take this column with it.
     press: [Option<(f32, f32)>; 2],
+}
+
+impl Tuck {
+    pub(crate) fn contains(&self, id: TileId) -> bool {
+        self.tucked.iter().any(|(t, _)| *t == id)
+    }
+
+    /// Each tucked column and the width it goes back to.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (TileId, f32)> + '_ {
+        self.tucked.iter().copied()
+    }
+
+    /// Tuck `id`. False if it already was.
+    pub(crate) fn push(&mut self, id: TileId, width: f32) -> bool {
+        if self.contains(id) {
+            return false;
+        }
+        self.tucked.push((id, width));
+        true
+    }
+
+    /// Bring `id` back, returning the width it left at.
+    pub(crate) fn remove(&mut self, id: TileId) -> Option<f32> {
+        let i = self.tucked.iter().position(|(t, _)| *t == id)?;
+        Some(self.tucked.remove(i).1)
+    }
+
+    /// Every tucked column, taken out of the tuck.
+    pub(crate) fn take(&mut self) -> Vec<(TileId, f32)> {
+        std::mem::take(&mut self.tucked)
+    }
+
+    /// The tucked column that holds `tile`, taken out of the tuck — for a panel that is
+    /// asked for by name while its column is off the edge.
+    pub(crate) fn release_containing<P>(
+        &mut self,
+        tree: &egui_tiles::Tree<P>,
+        tile: TileId,
+    ) -> Option<(TileId, f32)> {
+        let mut at = Some(tile);
+        while let Some(id) = at {
+            if let Some(width) = self.remove(id) {
+                return Some((id, width));
+            }
+            at = tree.tiles.parent_of(id);
+        }
+        None
+    }
+
+    /// The root row's first and last children — `[left, right]` — when they are not
+    /// the column holding `flex`. Tucked ones included, so a tucked column is still
+    /// found to bring it back. Anything but a horizontal root has no side columns.
+    pub(crate) fn edge_columns<P>(
+        &self,
+        tree: &egui_tiles::Tree<P>,
+        flex: TileId,
+    ) -> [Option<(TileId, egui::Rect)>; 2] {
+        let none = [None, None];
+        let Some(root) = tree.root else {
+            return none;
+        };
+        let Some(Tile::Container(Container::Linear(row))) = tree.tiles.get(root) else {
+            return none;
+        };
+        if row.dir != LinearDir::Horizontal || row.children.len() < 2 {
+            return none;
+        }
+        let holds_flex = |mut id: TileId| loop {
+            if id == flex {
+                return true;
+            }
+            match tree.tiles.parent_of(id) {
+                Some(p) if p != root => id = p,
+                _ => return false,
+            }
+        };
+        // Only children that are showing or tucked count as the edge: a closed column
+        // at the end of the row is not what is at the window's edge.
+        let on_edge: Vec<TileId> = row
+            .children
+            .iter()
+            .copied()
+            .filter(|c| self.contains(*c) || tree.is_visible(*c))
+            .collect();
+        let pick = |id: Option<&TileId>| {
+            let id = *id?;
+            if holds_flex(id) {
+                return None;
+            }
+            Some((id, tree.tiles.rect(id).unwrap_or(egui::Rect::NOTHING)))
+        };
+        [pick(on_edge.first()), pick(on_edge.last())]
+    }
+
+    /// Hide every tucked column, and let go of any that is no longer on the window's
+    /// edge — one that has since been dropped somewhere else, or whose tile is gone.
+    ///
+    /// After the caller has settled its own visibility, since this only ever hides.
+    pub(crate) fn settle<P>(&mut self, tree: &mut egui_tiles::Tree<P>, flex: TileId) {
+        let edges = self.edge_columns(tree, flex);
+        self.tucked
+            .retain(|(id, _)| edges.iter().any(|e| e.map(|(t, _)| t) == Some(*id)));
+        for (id, _) in &self.tucked {
+            tree.set_visible(*id, false);
+        }
+    }
+
+    /// **Drag a side column past its stop and it tucks away.** `min_size` holds the
+    /// seam at [`MIN_PANE`]; carry on dragging toward the window's edge by
+    /// [`TUCK_PAST`] and the column goes, leaving the strip [`Tuck::strips`] draws.
+    ///
+    /// Returns true on the frame a column tucks, and **the caller must then end the
+    /// drag** (`Context::stop_dragging`). `egui_tiles` keys each seam by its index among
+    /// the *visible* children, so once the left column is hidden, seam 0 is the one
+    /// between the image and the right column — and the drag still held on seam 0
+    /// carries on there. That was the bug: squeeze Develop off the left and the image
+    /// was squeezed after it, handing the whole window to Info.
+    ///
+    /// `defaults` are the shipped widths, `[left, right]`, and **a column comes back no
+    /// narrower than its default** — wider only if it was wider when it left. The
+    /// maintainer's call: the width a collapse begins from is usually the one the
+    /// squeeze toward the edge has already eaten into, not one anybody chose, and a
+    /// panel that reopens narrow reads as a panel that reopened broken.
+    pub(crate) fn drag<P>(
+        &mut self,
+        tree: &egui_tiles::Tree<P>,
+        flex: TileId,
+        input: &egui::InputState,
+        resizing: bool,
+        defaults: [f32; 2],
+    ) -> bool {
+        let edges = self.edge_columns(tree, flex);
+        if input.pointer.primary_pressed() {
+            // Seam and width as they were at the press, before the drag moved them.
+            self.press = [0, 1].map(|side| {
+                edges[side]
+                    .filter(|(_, r)| r.is_positive())
+                    .map(|(_, r)| (if side == 0 { r.right() } else { r.left() }, r.width()))
+            });
+        }
+        if !resizing || !input.pointer.primary_down() {
+            return false;
+        }
+        let (Some(origin), Some(at)) = (input.pointer.press_origin(), input.pointer.interact_pos())
+        else {
+            return false;
+        };
+        let mut fired = false;
+        for (side, (edge, press)) in edges.into_iter().zip(self.press).enumerate() {
+            let (Some((id, rect)), Some((seam, width))) = (edge, press) else {
+                continue;
+            };
+            if (origin.x - seam).abs() > 6.0 || rect.width() > MIN_PANE + 1.0 {
+                continue;
+            }
+            let past = if side == 0 {
+                rect.right() - at.x
+            } else {
+                at.x - rect.left()
+            };
+            if past > TUCK_PAST {
+                fired |= self.push(id, width.max(defaults[side]));
+            }
+        }
+        if fired {
+            self.press = [None; 2];
+        }
+        fired
+    }
+
+    /// The strip a tucked column leaves at the window's edge. A click or a drag on it
+    /// brings the column back, and the column and its width are returned so the
+    /// caller can restore it.
+    pub(crate) fn strips<P>(
+        &mut self,
+        tree: &egui_tiles::Tree<P>,
+        flex: TileId,
+        ui: &mut egui::Ui,
+        area: egui::Rect,
+    ) -> Option<(TileId, f32)> {
+        let edges = self.edge_columns(tree, flex);
+        let mut back = None;
+        for (side, edge) in edges.into_iter().enumerate() {
+            let Some((id, _)) = edge else {
+                continue;
+            };
+            if !self.contains(id) {
+                continue;
+            }
+            let rect = if side == 0 {
+                egui::Rect::from_min_size(area.left_top(), egui::vec2(TUCK_STRIP, area.height()))
+            } else {
+                egui::Rect::from_min_size(
+                    egui::pos2(area.right() - TUCK_STRIP, area.top()),
+                    egui::vec2(TUCK_STRIP, area.height()),
+                )
+            };
+            let resp = ui
+                .interact(
+                    rect,
+                    ui.id().with(("tuck", side)),
+                    egui::Sense::click_and_drag(),
+                )
+                .on_hover_cursor(if side == 0 {
+                    egui::CursorIcon::ResizeEast
+                } else {
+                    egui::CursorIcon::ResizeWest
+                })
+                .on_hover_text(theme::tip("Click or drag to bring the panel back"));
+            let ink = if resp.hovered() || resp.dragged() {
+                theme::DIM
+            } else {
+                egui::Color32::from_gray(72)
+            };
+            ui.painter().rect_filled(rect, 0.0, theme::CHROME_DEEP);
+            let line = if side == 0 {
+                rect.right() - 1.5
+            } else {
+                rect.left() + 1.5
+            };
+            ui.painter().line_segment(
+                [
+                    egui::pos2(line, rect.top()),
+                    egui::pos2(line, rect.bottom()),
+                ],
+                egui::Stroke::new(3.0, ink),
+            );
+            if (resp.clicked() || resp.drag_started())
+                && let Some(width) = self.remove(id)
+            {
+                back = Some((id, width));
+            }
+        }
+        back
+    }
 }
 
 mod memory_keys {
@@ -392,8 +643,7 @@ impl Default for Layout {
             restructured: false,
             measured: Default::default(),
             restore_pixels: true,
-            tucked: Vec::new(),
-            press: [None; 2],
+            tuck: Tuck::default(),
         }
     }
 }
@@ -462,8 +712,7 @@ impl Layout {
             restructured: false,
             measured: eframe::get_value(storage, memory_keys::PIXELS).unwrap_or_default(),
             restore_pixels: true,
-            tucked: Vec::new(),
-            press: [None; 2],
+            tuck: Tuck::default(),
         };
         if !layout.heal() {
             return Self::default();
@@ -538,6 +787,12 @@ impl Layout {
             if let Some(rect) = self.tree.tiles.rect(id) {
                 measured.insert(id, rect.size());
             }
+        }
+        // A tuck is not persisted, so a column quit while tucked comes back shown —
+        // at the width it would have come back at, not the squeezed one it left at.
+        for (id, width) in self.tuck.iter() {
+            let h = measured.get(&id).map_or(0.0, |s| s.y);
+            measured.insert(id, egui::vec2(width, h));
         }
         eframe::set_value(storage, memory_keys::PIXELS, &measured);
     }
@@ -847,7 +1102,7 @@ impl Layout {
         if self.shown.is_empty() {
             self.shown = Pane::PANELS.to_vec();
             // "Every panel back" includes the ones tucked at the edge.
-            for (id, width) in std::mem::take(&mut self.tucked) {
+            for (id, width) in self.tuck.take() {
                 self.remember_width(id, width);
             }
         } else {
@@ -926,13 +1181,8 @@ impl Layout {
         if let Some(tile) = self.tree.tiles.find_pane(&pane) {
             // A mode opening onto a tucked column has to bring the column out, for
             // the same reason it reopens a closed one.
-            let mut at = Some(tile);
-            while let Some(id) = at {
-                if self.tucked.iter().any(|(t, _)| *t == id) {
-                    self.untuck(id);
-                    break;
-                }
-                at = self.tree.tiles.parent_of(id);
+            if let Some((id, width)) = self.tuck.release_containing(&self.tree, tile) {
+                self.remember_width(id, width);
             }
             self.tree.make_active(|id, _| id == tile);
         }
@@ -964,59 +1214,19 @@ impl Layout {
         if let Some(root) = self.tree.root {
             settle_container(&mut self.tree, root);
         }
-        // A tuck belongs to a column on the window's edge. One that has since been
-        // dropped somewhere else, or whose tile is gone, is simply let go.
-        let edges = self.edge_columns();
-        self.tucked
-            .retain(|(id, _)| edges.iter().any(|e| e.map(|(t, _)| t) == Some(*id)));
-        for (id, _) in &self.tucked {
-            self.tree.set_visible(*id, false);
+        if let Some(image) = self.tree.tiles.find_pane(&Pane::Image) {
+            self.tuck.settle(&mut self.tree, image);
         }
     }
 
-    /// The root row's first and last children — `[left, right]` — when they are not
-    /// the column holding the image. Tucked ones included, so a tucked column is still
-    /// found to bring it back. Anything but a horizontal root has no side columns.
+    #[cfg(test)]
+    /// The side columns, `[left, right]`, including tucked ones. See
+    /// [`Tuck::edge_columns`].
     fn edge_columns(&self) -> [Option<(TileId, egui::Rect)>; 2] {
-        let none = [None, None];
-        let Some(root) = self.tree.root else {
-            return none;
-        };
-        let Some(Tile::Container(Container::Linear(row))) = self.tree.tiles.get(root) else {
-            return none;
-        };
-        if row.dir != LinearDir::Horizontal || row.children.len() < 2 {
-            return none;
+        match self.tree.tiles.find_pane(&Pane::Image) {
+            Some(image) => self.tuck.edge_columns(&self.tree, image),
+            None => [None, None],
         }
-        let Some(image) = self.tree.tiles.find_pane(&Pane::Image) else {
-            return none;
-        };
-        let holds_image = |mut id: TileId| loop {
-            if id == image {
-                return true;
-            }
-            match self.tree.tiles.parent_of(id) {
-                Some(p) if p != root => id = p,
-                _ => return false,
-            }
-        };
-        // Only children that are showing or tucked count as the edge: a closed column
-        // at the end of the row is not what is at the window's edge.
-        let tucked = |id: TileId| self.tucked.iter().any(|(t, _)| *t == id);
-        let on_edge: Vec<TileId> = row
-            .children
-            .iter()
-            .copied()
-            .filter(|c| tucked(*c) || self.tree.is_visible(*c))
-            .collect();
-        let pick = |id: Option<&TileId>| {
-            let id = *id?;
-            if holds_image(id) {
-                return None;
-            }
-            Some((id, self.tree.tiles.rect(id).unwrap_or(egui::Rect::NOTHING)))
-        };
-        [pick(on_edge.first()), pick(on_edge.last())]
     }
 
     /// The width a hidden tile should come back at, for `keep_panel_sizes`.
@@ -1027,112 +1237,43 @@ impl Layout {
         self.dirty = true;
     }
 
+    #[cfg(test)]
     fn tuck(&mut self, id: TileId, width: f32) {
-        if !self.tucked.iter().any(|(t, _)| *t == id) {
-            self.tucked.push((id, width));
+        if self.tuck.push(id, width) {
             self.restructured = true;
             self.dirty = true;
         }
     }
 
+    #[cfg(test)]
     fn untuck(&mut self, id: TileId) {
-        if let Some(i) = self.tucked.iter().position(|(t, _)| *t == id) {
-            let (_, width) = self.tucked.remove(i);
+        if let Some(width) = self.tuck.remove(id) {
             self.remember_width(id, width);
         }
     }
 
-    /// **Drag a side column past its stop and it tucks away.** `min_size` holds the
-    /// seam at [`MIN_PANE`]; carry on dragging toward the window's edge by
-    /// [`TUCK_PAST`] and the column goes, leaving the strip [`Layout::tuck_strips`]
-    /// draws. It comes back at the width it had before the drag.
-    fn tuck_from_drag(&mut self, input: &egui::InputState, resizing: bool) {
-        let edges = self.edge_columns();
-        if input.pointer.primary_pressed() {
-            // Seam and width as they were at the press, before the drag moved them.
-            self.press = [0, 1].map(|side| {
-                edges[side]
-                    .filter(|(_, r)| r.is_positive())
-                    .map(|(_, r)| (if side == 0 { r.right() } else { r.left() }, r.width()))
-            });
-        }
-        if !resizing || !input.pointer.primary_down() {
-            return;
-        }
-        let (Some(origin), Some(at)) = (input.pointer.press_origin(), input.pointer.interact_pos())
-        else {
-            return;
+    /// See [`Tuck::drag`]. True when a column tucked, which ends the drag.
+    fn tuck_from_drag(&mut self, input: &egui::InputState, resizing: bool) -> bool {
+        let Some(image) = self.tree.tiles.find_pane(&Pane::Image) else {
+            return false;
         };
-        for (side, (edge, press)) in edges.into_iter().zip(self.press).enumerate() {
-            let (Some((id, rect)), Some((seam, width))) = (edge, press) else {
-                continue;
-            };
-            if (origin.x - seam).abs() > 6.0 || rect.width() > MIN_PANE + 1.0 {
-                continue;
-            }
-            let past = if side == 0 {
-                rect.right() - at.x
-            } else {
-                at.x - rect.left()
-            };
-            if past > TUCK_PAST {
-                self.tuck(id, width.max(MIN_PANE));
-            }
+        let fired = self
+            .tuck
+            .drag(&self.tree, image, input, resizing, [DEVELOP_W, INFO_W]);
+        if fired {
+            self.restructured = true;
+            self.dirty = true;
         }
+        fired
     }
 
-    /// The strip a tucked column leaves at the window's edge. A click or a drag on it
-    /// brings the column back.
+    /// See [`Tuck::strips`].
     fn tuck_strips(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
-        let edges = self.edge_columns();
-        for (side, edge) in edges.into_iter().enumerate() {
-            let Some((id, _)) = edge else {
-                continue;
-            };
-            if !self.tucked.iter().any(|(t, _)| *t == id) {
-                continue;
-            }
-            let rect = if side == 0 {
-                egui::Rect::from_min_size(area.left_top(), egui::vec2(TUCK_STRIP, area.height()))
-            } else {
-                egui::Rect::from_min_size(
-                    egui::pos2(area.right() - TUCK_STRIP, area.top()),
-                    egui::vec2(TUCK_STRIP, area.height()),
-                )
-            };
-            let resp = ui
-                .interact(
-                    rect,
-                    ui.id().with(("tuck", side)),
-                    egui::Sense::click_and_drag(),
-                )
-                .on_hover_cursor(if side == 0 {
-                    egui::CursorIcon::ResizeEast
-                } else {
-                    egui::CursorIcon::ResizeWest
-                })
-                .on_hover_text(theme::tip("Click or drag to bring the panel back"));
-            let ink = if resp.hovered() || resp.dragged() {
-                theme::DIM
-            } else {
-                egui::Color32::from_gray(72)
-            };
-            ui.painter().rect_filled(rect, 0.0, theme::CHROME_DEEP);
-            let line = if side == 0 {
-                rect.right() - 1.5
-            } else {
-                rect.left() + 1.5
-            };
-            ui.painter().line_segment(
-                [
-                    egui::pos2(line, rect.top()),
-                    egui::pos2(line, rect.bottom()),
-                ],
-                egui::Stroke::new(3.0, ink),
-            );
-            if resp.clicked() || resp.drag_started() {
-                self.untuck(id);
-            }
+        let Some(image) = self.tree.tiles.find_pane(&Pane::Image) else {
+            return;
+        };
+        if let Some((id, width)) = self.tuck.strips(&self.tree, image, ui, area) {
+            self.remember_width(id, width);
         }
     }
 
@@ -1645,78 +1786,81 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         self.dropped |= action == egui_tiles::EditAction::TileDropped;
         self.resizing |= action == egui_tiles::EditAction::TileResized;
     }
+
+    fn on_seam_double_click(
+        &mut self,
+        tiles: &egui_tiles::Tiles<Pane>,
+        shares: &mut egui_tiles::Shares,
+        dir: LinearDir,
+        children: &[TileId],
+        pair: [TileId; 2],
+    ) -> bool {
+        tiles.find_pane(&Pane::Image).is_some_and(|image| {
+            reset_seam(
+                tiles,
+                shares,
+                dir,
+                children,
+                pair,
+                image,
+                [DEVELOP_W, INFO_W],
+            )
+            .is_some()
+        })
+    }
 }
 
-/// Restore a side panel's shipped width instead of egui_tiles' equal split.
-fn reset_panel_edge(tree: &mut egui_tiles::Tree<Pane>, at: egui::Pos2) -> bool {
-    let Some(image) = tree.tiles.find_pane(&Pane::Image) else {
-        return false;
+/// **Double-click a seam and the side panel on it goes back to its shipped width**;
+/// the tile on the path to `flex` — the image, or the Lightbox's grid — takes up the
+/// difference. `defaults` are `[panel left of flex, panel right of flex]`.
+///
+/// Called from `Behavior::on_seam_double_click`, which `egui_tiles` asks with the
+/// seam egui itself hit (see `vendor/egui_tiles/LOCAL-PATCH.md`). This used to run
+/// after the tree instead, re-deriving the seam from the pointer; egui's hit test
+/// reaches a few points further than that did, so a double-click on a panel's scroll
+/// bar landed on the seam, missed the reset, and got upstream's even split — the
+/// panel went to half the window.
+///
+/// `None` for a seam with the flexible tile on neither side, or on both, which is
+/// left to upstream's evening-out.
+pub(crate) fn reset_seam<P>(
+    tiles: &egui_tiles::Tiles<P>,
+    shares: &mut egui_tiles::Shares,
+    dir: LinearDir,
+    children: &[TileId],
+    [left, right]: [TileId; 2],
+    flex: TileId,
+    defaults: [f32; 2],
+) -> Option<(TileId, f32)> {
+    if dir != LinearDir::Horizontal {
+        return None;
+    }
+    let mut flex_path = vec![flex];
+    while let Some(parent) = tiles.parent_of(*flex_path.last().expect("seeded")) {
+        flex_path.push(parent);
+    }
+    let flex_left = flex_path.contains(&left);
+    if flex_left == flex_path.contains(&right) {
+        return None;
+    }
+    let (panel, flex_side, desired) = if flex_left {
+        (right, left, defaults[1])
+    } else {
+        (left, right, defaults[0])
     };
-    let mut image_path = vec![image];
-    while let Some(parent) = tree.tiles.parent_of(*image_path.last().unwrap()) {
-        image_path.push(parent);
-    }
-    for id in tree.tiles.tile_ids().collect::<Vec<_>>() {
-        let Some(Tile::Container(Container::Linear(row))) = tree.tiles.get(id) else {
-            continue;
+    let total = tiles.rect(left)?.width() + tiles.rect(right)?.width();
+    let width = desired.min(total - MIN_PANE).max(MIN_PANE);
+    for child in children {
+        let size = if *child == panel {
+            width
+        } else if *child == flex_side {
+            total - width
+        } else {
+            tiles.rect(*child)?.width()
         };
-        if row.dir != LinearDir::Horizontal {
-            continue;
-        }
-        let children: Vec<_> = row
-            .children
-            .iter()
-            .copied()
-            .filter(|c| tree.is_visible(*c))
-            .collect();
-        for pair in children.windows(2) {
-            let (Some(left), Some(right)) = (tree.tiles.rect(pair[0]), tree.tiles.rect(pair[1]))
-            else {
-                continue;
-            };
-            let seam = egui::Rect::from_min_max(
-                egui::pos2(left.right() - 4.0, left.top().max(right.top())),
-                egui::pos2(right.left() + 4.0, left.bottom().min(right.bottom())),
-            );
-            if !seam.contains(at) {
-                continue;
-            }
-            let image_left = image_path.contains(&pair[0]);
-            let image_right = image_path.contains(&pair[1]);
-            if image_left == image_right {
-                continue;
-            }
-            let panel = if image_left { pair[1] } else { pair[0] };
-            let flex = if image_left { pair[0] } else { pair[1] };
-            let total = left.width() + right.width();
-            let desired = if image_left { INFO_W } else { DEVELOP_W };
-            let width = desired.min(total - MIN_PANE).max(MIN_PANE);
-            let sizes: Vec<_> = children
-                .iter()
-                .filter_map(|c| {
-                    tree.tiles.rect(*c).map(|r| {
-                        (
-                            *c,
-                            if *c == panel {
-                                width
-                            } else if *c == flex {
-                                total - width
-                            } else {
-                                r.width()
-                            },
-                        )
-                    })
-                })
-                .collect();
-            if let Some(Tile::Container(Container::Linear(row))) = tree.tiles.get_mut(id) {
-                for (child, width) in sizes {
-                    row.shares.set_share(child, width);
-                }
-            }
-            return true;
-        }
+        shares.set_share(*child, size);
     }
-    false
+    Some((panel, width))
 }
 
 fn drag(started: bool) -> UiResponse {
@@ -1769,22 +1913,15 @@ impl App {
         };
         let area = ui.available_rect_before_wrap();
         tree.ui(&mut panes, ui);
-        if let Some(at) = ui.input(|input| {
-            input
-                .pointer
-                .button_double_clicked(egui::PointerButton::Primary)
-                .then(|| input.pointer.interact_pos())
-                .flatten()
-        }) && reset_panel_edge(&mut tree, at)
-        {
-            ui.ctx().request_repaint();
-        }
         let (float, close, edited, dropped) =
             (panes.float, panes.close, panes.edited, panes.dropped);
         let (drew_develop, drew_dodgeburn) = (panes.drew_develop, panes.drew_dodgeburn);
         let resizing = panes.resizing;
         self.layout.tree = tree;
-        ui.input(|i| self.layout.tuck_from_drag(i, resizing));
+        // Outside `input`: ending the drag writes to the context `input` is reading.
+        if ui.input(|i| self.layout.tuck_from_drag(i, resizing)) {
+            ui.ctx().stop_dragging();
+        }
         self.layout.tuck_strips(ui, area);
 
         // **Leaving the brush behind leaves paint mode.** the maintainer's ask, and the default
@@ -1840,6 +1977,7 @@ mod tests {
         icons: icons::Icons,
         tabbed: Vec<TileId>,
         dropped: bool,
+        resizing: bool,
     }
 
     impl Bare {
@@ -1849,6 +1987,7 @@ mod tests {
                 icons: icons::Icons::empty(),
                 tabbed: Vec::new(),
                 dropped: false,
+                resizing: false,
             }
         }
     }
@@ -1888,11 +2027,43 @@ mod tests {
 
         fn on_edit(&mut self, action: egui_tiles::EditAction) {
             self.dropped |= action == egui_tiles::EditAction::TileDropped;
+            self.resizing |= action == egui_tiles::EditAction::TileResized;
         }
 
         fn simplification_options(&self) -> SimplificationOptions {
             // The real ones, so what these tests pin is what ships.
             SIMPLIFY
+        }
+
+        // The real stop, or a squeeze would never reach the point where a column tucks.
+        fn min_size(&self) -> f32 {
+            MIN_PANE
+        }
+
+        fn on_seam_double_click(
+            &mut self,
+            tiles: &egui_tiles::Tiles<Pane>,
+            shares: &mut egui_tiles::Shares,
+            dir: LinearDir,
+            children: &[TileId],
+            pair: [TileId; 2],
+        ) -> bool {
+            tiles.find_pane(&Pane::Image).is_some_and(|image| {
+                reset_seam(
+                    tiles,
+                    shares,
+                    dir,
+                    children,
+                    pair,
+                    image,
+                    [DEVELOP_W, INFO_W],
+                )
+                .is_some()
+            })
+        }
+
+        fn gap_width(&self, _style: &egui::Style) -> f32 {
+            GAP
         }
     }
 
@@ -1935,8 +2106,7 @@ mod tests {
             restructured: false,
             measured: Default::default(),
             restore_pixels: true,
-            tucked: Vec::new(),
-            press: [None; 2],
+            tuck: Tuck::default(),
         }
     }
 
@@ -2171,6 +2341,179 @@ mod tests {
             layout.tree.is_visible(left),
             "a mode opening onto a tucked panel brings it out"
         );
+    }
+
+    /// Hold the primary button down at `from` and drag it through `path`, a frame per
+    /// point, then let go at the last one.
+    fn drag_seam(ctx: &egui::Context, layout: &mut Layout, from: egui::Pos2, path: &[f32]) {
+        frame(
+            ctx,
+            layout,
+            vec![egui::Event::PointerMoved(from), press(from, true)],
+        );
+        let mut at = from;
+        for x in path {
+            at = egui::pos2(*x, from.y);
+            frame(ctx, layout, vec![egui::Event::PointerMoved(at)]);
+        }
+        frame(ctx, layout, vec![press(at, false)]);
+        frame(ctx, layout, vec![]);
+        frame(ctx, layout, vec![]);
+    }
+
+    fn width_of(layout: &Layout, id: TileId) -> f32 {
+        layout.tree.tiles.rect(id).map_or(0.0, |r| r.width())
+    }
+
+    #[test]
+    fn squeezing_a_column_off_the_edge_leaves_the_other_side_alone() {
+        // **The maintainer's report**: squeeze Develop off the left and Info grew to fill
+        // the window. `egui_tiles` keys each seam by its index among the *visible*
+        // children, so the moment Develop tucked, seam 0 was the image | Info seam —
+        // and the drag still held on seam 0 carried on there, squeezing the image
+        // against its own stop and handing everything to Info.
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut layout = Layout::default();
+        frame(&ctx, &mut layout, vec![]);
+        frame(&ctx, &mut layout, vec![]);
+        let [Some((left, rect)), Some((right, _))] = layout.edge_columns() else {
+            panic!("the default layout has a column on each side");
+        };
+        let info_before = width_of(&layout, right);
+        let seam = egui::pos2(rect.right() + GAP / 2.0, rect.center().y);
+
+        // Well past the stop, then on to the window's edge, all in one held drag.
+        let path: Vec<f32> = (1..=12).map(|i| seam.x - 40.0 * i as f32).collect();
+        let path: Vec<f32> = path.into_iter().map(|x| x.max(2.0)).collect();
+        drag_seam(&ctx, &mut layout, seam, &path);
+
+        assert!(
+            !layout.tree.is_visible(left),
+            "the column should have tucked"
+        );
+        assert!(
+            (width_of(&layout, right) - info_before).abs() < 2.0,
+            "Info went from {info_before} to {} — the drag carried on into its seam",
+            width_of(&layout, right)
+        );
+        let image = tile_of(&layout.tree, Pane::Image);
+        assert!(
+            width_of(&layout, image) > WINDOW.x - info_before - 40.0,
+            "the image did not take the tucked column's room: {}",
+            width_of(&layout, image)
+        );
+
+        // And it comes back at the width it had before the drag began.
+        layout.untuck(left);
+        frame(&ctx, &mut layout, vec![]);
+        frame(&ctx, &mut layout, vec![]);
+        assert!(
+            (width_of(&layout, left) - rect.width()).abs() < 2.0,
+            "came back at {} rather than {}",
+            width_of(&layout, left),
+            rect.width()
+        );
+    }
+
+    #[test]
+    fn a_column_squeezed_before_it_tucks_comes_back_at_its_default_width() {
+        // Squeeze to the stop, let go, then drag again to tuck it: the width at the
+        // second press is the stop, which is not a width anybody chose. Bringing the
+        // panel back there is what "super narrow" was — and the same for a squeeze
+        // that stopped short of the stop, which is what "narrower" was the next time.
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut layout = Layout::default();
+        frame(&ctx, &mut layout, vec![]);
+        frame(&ctx, &mut layout, vec![]);
+        let [Some((left, rect)), _] = layout.edge_columns() else {
+            panic!("a left column");
+        };
+        let seam = egui::pos2(rect.right() + GAP / 2.0, rect.center().y);
+        let to_stop = seam.x - (rect.width() - MIN_PANE) - 20.0;
+        drag_seam(&ctx, &mut layout, seam, &[seam.x - 40.0, to_stop]);
+        assert!(
+            layout.tree.is_visible(left),
+            "meeting the stop is not tucking"
+        );
+        let squeezed = width_of(&layout, left);
+        assert!(squeezed < MIN_PANE + 2.0, "not at the stop: {squeezed}");
+
+        let rect = layout.tree.tiles.rect(left).unwrap();
+        let seam = egui::pos2(rect.right() + GAP / 2.0, rect.center().y);
+        drag_seam(&ctx, &mut layout, seam, &[seam.x - 40.0, seam.x - 120.0]);
+        assert!(
+            !layout.tree.is_visible(left),
+            "the second drag should tuck it"
+        );
+
+        layout.untuck(left);
+        frame(&ctx, &mut layout, vec![]);
+        frame(&ctx, &mut layout, vec![]);
+        assert!(
+            (width_of(&layout, left) - DEVELOP_W).abs() < 2.0,
+            "came back at {}",
+            width_of(&layout, left)
+        );
+    }
+
+    #[test]
+    fn a_column_reopens_no_narrower_than_its_default_and_no_narrower_than_it_was() {
+        // Narrowed to 250 and then collapsed: back at the default. Widened to 470 and
+        // then collapsed: back at 470. Reopened the way a person does, by clicking the
+        // strip at the edge.
+        for (moved, expected) in [(-100.0, DEVELOP_W), (120.0, DEVELOP_W + 120.0)] {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut layout = Layout::default();
+            frame(&ctx, &mut layout, vec![]);
+            frame(&ctx, &mut layout, vec![]);
+            let [Some((left, rect)), _] = layout.edge_columns() else {
+                panic!("a left column");
+            };
+            let seam = egui::pos2(rect.right() + GAP / 2.0, rect.center().y);
+            drag_seam(
+                &ctx,
+                &mut layout,
+                seam,
+                &[seam.x + moved / 2.0, seam.x + moved],
+            );
+            let rect = layout.tree.tiles.rect(left).unwrap();
+            let seam = egui::pos2(rect.right() + GAP / 2.0, rect.center().y);
+            let path: Vec<f32> = (1..=12)
+                .map(|i| (seam.x - 60.0 * i as f32).max(2.0))
+                .collect();
+            drag_seam(&ctx, &mut layout, seam, &path);
+            assert!(!layout.tree.is_visible(left), "it should have tucked");
+
+            let image = layout
+                .tree
+                .tiles
+                .rect(tile_of(&layout.tree, Pane::Image))
+                .unwrap();
+            let strip = egui::pos2(image.left() + TUCK_STRIP / 2.0, image.center().y);
+            for _ in 0..30 {
+                frame(&ctx, &mut layout, vec![]);
+            }
+            frame(
+                &ctx,
+                &mut layout,
+                vec![egui::Event::PointerMoved(strip), press(strip, true)],
+            );
+            frame(&ctx, &mut layout, vec![press(strip, false)]);
+            frame(&ctx, &mut layout, vec![]);
+            frame(&ctx, &mut layout, vec![]);
+            assert!(
+                layout.tree.is_visible(left),
+                "the strip should bring it back"
+            );
+            assert!(
+                (width_of(&layout, left) - expected).abs() < 2.0,
+                "moved {moved}pt then tucked: came back at {} rather than {expected}",
+                width_of(&layout, left)
+            );
+        }
     }
 
     #[test]
@@ -2541,38 +2884,76 @@ mod tests {
         assert!((restored.tree.tiles.rect(row.children[2]).unwrap().width() - INFO_W).abs() < 1.0);
     }
 
+    /// A double-click, as egui sees one: two clicks at `at`, well clear in time of any
+    /// click before them — a third inside the window would make it a triple.
+    fn double_click(ctx: &egui::Context, layout: &mut Layout, at: egui::Pos2, size: egui::Vec2) {
+        for _ in 0..60 {
+            frame_sized(ctx, layout, vec![], size);
+        }
+        frame_sized(
+            ctx,
+            layout,
+            vec![egui::Event::PointerMoved(at), press(at, true)],
+            size,
+        );
+        frame_sized(ctx, layout, vec![press(at, false)], size);
+        frame_sized(ctx, layout, vec![press(at, true)], size);
+        frame_sized(ctx, layout, vec![press(at, false)], size);
+        frame_sized(ctx, layout, vec![], size);
+        frame_sized(ctx, layout, vec![], size);
+    }
+
     #[test]
     fn double_click_edges_restore_default_panel_widths() {
-        let ctx = egui::Context::default();
-        theme::apply(&ctx);
-        let mut layout = Layout::default();
-        frame_sized(&ctx, &mut layout, vec![], egui::vec2(2200.0, 900.0));
-        let root = layout.tree.root.unwrap();
-        let children = match layout.tree.tiles.get(root).unwrap() {
-            Tile::Container(Container::Linear(row)) => row.children.clone(),
-            _ => panic!("expected horizontal root"),
-        };
-        for (panel, neighbour, desired) in [
-            (children[0], children[1], DEVELOP_W),
-            (children[2], children[1], INFO_W),
-        ] {
-            let r = layout.tree.tiles.rect(panel).unwrap();
-            let n = layout.tree.tiles.rect(neighbour).unwrap();
-            let edge = if r.center().x < n.center().x {
-                r.right() + GAP / 2.0
-            } else {
-                r.left() - GAP / 2.0
+        // The maintainer: double-clicking the edge sent Develop to half the window.
+        // egui's hit test reaches past the seam's own few points, so a double-click
+        // just inside the panel — on its scroll bar — still hit the seam; upstream
+        // evened out the split, and the reset, which re-derived the seam from the
+        // pointer afterwards, missed. Hence the offsets: on the seam, and 6pt either
+        // side of it.
+        let size = egui::vec2(2200.0, 900.0);
+        for offset in [0.0, -6.0, 6.0] {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut layout = Layout::default();
+            frame_sized(&ctx, &mut layout, vec![], size);
+            frame_sized(&ctx, &mut layout, vec![], size);
+            let root = layout.tree.root.unwrap();
+            let children = match layout.tree.tiles.get(root).unwrap() {
+                Tile::Container(Container::Linear(row)) => row.children.clone(),
+                _ => panic!("expected horizontal root"),
             };
-            assert!(reset_panel_edge(
-                &mut layout.tree,
-                egui::pos2(edge, r.center().y)
-            ));
-            frame_sized(&ctx, &mut layout, vec![], egui::vec2(2200.0, 900.0));
-            let width = layout.tree.tiles.rect(panel).unwrap().width();
-            assert!(
-                (width - desired).abs() < 2.0,
-                "{width} instead of {desired}"
-            );
+            // Both panels well off their defaults first, or there is nothing to reset.
+            {
+                let Some(Tile::Container(Container::Linear(row))) = layout.tree.tiles.get_mut(root)
+                else {
+                    panic!()
+                };
+                row.shares.set_share(children[0], 250.0);
+                row.shares.set_share(children[1], 1500.0);
+                row.shares.set_share(children[2], 450.0);
+            }
+            frame_sized(&ctx, &mut layout, vec![], size);
+            frame_sized(&ctx, &mut layout, vec![], size);
+            for (panel, desired, inward) in
+                [(children[0], DEVELOP_W, -1.0), (children[2], INFO_W, 1.0)]
+            {
+                let r = layout.tree.tiles.rect(panel).unwrap();
+                let edge = if inward < 0.0 {
+                    r.right() + GAP / 2.0
+                } else {
+                    r.left() - GAP / 2.0
+                };
+                // `inward` points into the panel, so a negative offset is toward the
+                // image and a positive one onto the panel's own contents.
+                let at = egui::pos2(edge - inward * offset, r.center().y);
+                double_click(&ctx, &mut layout, at, size);
+                let width = layout.tree.tiles.rect(panel).unwrap().width();
+                assert!(
+                    (width - desired).abs() < 2.0,
+                    "{width} instead of {desired}, double-clicked {offset}pt from the seam"
+                );
+            }
         }
     }
 
@@ -2602,7 +2983,12 @@ mod tests {
         let _ = ctx.run_ui(input, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 layout.restore_pixel_widths(ui.available_width());
+                let area = ui.available_rect_before_wrap();
                 layout.tree.ui(&mut bare, ui);
+                if ui.input(|i| layout.tuck_from_drag(i, bare.resizing)) {
+                    ui.ctx().stop_dragging();
+                }
+                layout.tuck_strips(ui, area);
             });
         });
         layout.restructured |= bare.dropped;

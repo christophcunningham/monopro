@@ -3,7 +3,9 @@ use egui::{
     vec2,
 };
 
-use super::{ResizeState, SimplificationOptions, Tile, TileId, Tiles, UiResponse};
+use super::{
+    LinearDir, ResizeState, Shares, SimplificationOptions, Tile, TileId, Tiles, UiResponse,
+};
 
 /// The kind of edit that triggered the call to [`Behavior::on_edit`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -454,6 +456,22 @@ pub trait Behavior<Pane> {
     /// Called if the user edits the tree somehow, e.g. changes the size of some container,
     /// clicks a tab, or drags a tile.
     fn on_edit(&mut self, _edit_action: EditAction) {}
+
+    /// LOCAL PATCH (monopro): the seam between `pair` in a linear container was
+    /// double-clicked. `children` are the container's visible children, in order.
+    ///
+    /// Return `true` if the behavior set `shares` itself; `false` keeps upstream's
+    /// answer, which evens out the two sides of the seam.
+    fn on_seam_double_click(
+        &mut self,
+        _tiles: &Tiles<Pane>,
+        _shares: &mut Shares,
+        _dir: LinearDir,
+        _children: &[TileId],
+        _pair: [TileId; 2],
+    ) -> bool {
+        false
+    }
 }
 
 /// How many columns should we use to fit `n` children in a grid?

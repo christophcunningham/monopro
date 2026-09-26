@@ -671,7 +671,7 @@ impl Dialog {
             &mut self.settings.caption_align,
             &[
                 (TextAlignment::Left, "text-align-left", "L", "Left"),
-                (TextAlignment::Center, "text-align-center", "C", "Centre"),
+                (TextAlignment::Center, "text-align-center", "C", "Center"),
                 (TextAlignment::Right, "text-align-right", "R", "Right"),
             ],
         );
@@ -729,7 +729,7 @@ impl Dialog {
                     TextPosition::Center,
                     "text-align-center",
                     "C",
-                    "Upper centre",
+                    "Upper center",
                 ),
                 (TextPosition::Right, "text-align-right", "R", "Upper right"),
             ],
@@ -786,7 +786,7 @@ impl Dialog {
                     TextPosition::Center,
                     "text-align-center",
                     "C",
-                    "Lower centre",
+                    "Lower center",
                 ),
                 (TextPosition::Right, "text-align-right", "R", "Lower right"),
             ],
@@ -846,7 +846,7 @@ impl Dialog {
                             TextPosition::Center,
                             "text-align-center",
                             "C",
-                            "Upper centre",
+                            "Upper center",
                         ),
                         (TextPosition::Right, "text-align-right", "R", "Upper right"),
                     ]
@@ -857,7 +857,7 @@ impl Dialog {
                             TextPosition::Center,
                             "text-align-center",
                             "C",
-                            "Lower centre",
+                            "Lower center",
                         ),
                         (TextPosition::Right, "text-align-right", "R", "Lower right"),
                     ]
@@ -2212,21 +2212,27 @@ fn write_document_info(pdf: &mut Pdf, id: Ref, template: Option<&iptc_templates:
     {
         info.subject(TextStr(value));
     }
-    let keywords = [
-        IptcField::Copyright,
-        IptcField::Credit,
-        IptcField::Source,
-        IptcField::City,
-        IptcField::State,
-        IptcField::Country,
-        IptcField::Instructions,
-    ]
-    .into_iter()
-    .filter_map(|field| {
-        template_value(template, field).map(|value| format!("{}: {value}", field.label()))
-    })
-    .collect::<Vec<_>>()
-    .join("; ");
+    // Everything the three fields above did not take, in the pane's order. A
+    // vocabulary value in its published words: the value itself is a URI nobody reads.
+    let keywords = IptcField::ALL
+        .into_iter()
+        .filter(|field| {
+            !field.per_image()
+                && !matches!(
+                    field,
+                    IptcField::Title
+                        | IptcField::Creator
+                        | IptcField::Description
+                        | IptcField::Headline
+                )
+        })
+        .filter_map(|field| {
+            let value = template_value(template, field)?;
+            let value = field.term_label(value).unwrap_or(value);
+            Some(format!("{}: {value}", field.label()))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
     if !keywords.is_empty() {
         info.keywords(TextStr(&keywords));
     }

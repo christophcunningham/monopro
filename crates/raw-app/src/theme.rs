@@ -182,6 +182,12 @@ pub mod size {
     /// Footer notes and compact state labels, one point below ordinary captions.
     pub const FOOTER_CAPTION: f32 = CAPTION - 1.0;
 
+    /// The footer's icon buttons, and what the bar's height is built from: the mode
+    /// tabs are this plus two, and the bar is those plus its frame. 21 — the app's
+    /// `icons::BIG` control size — since the maintainer found the bar too thin at 18,
+    /// where it came out 24 points tall; it is now 27.
+    pub const FOOTER_ICON: f32 = 21.0;
+
     /// Section headings *inside* a module — `SHAPE`, `LAYERS`, and the `DODGE+` /
     /// `BURN+` pair that reads as one.
     ///

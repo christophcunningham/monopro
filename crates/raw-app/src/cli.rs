@@ -456,7 +456,12 @@ fn render_one(
     // Read now, as the button reads it: IPTC edited in Lightbox lives in the sidecar.
     let metadata = sidecar::effective_metadata(input)?;
     let meta = settings.export_metadata.then_some(&metadata);
-    let spec = export::Spec::for_params(target, proof, &params, meta, settings.proof_dither);
+    let camera = settings
+        .export_camera_exif
+        .then(|| raw_core::camera_exif::CameraExif::read(input))
+        .flatten();
+    let spec = export::Spec::for_params(target, proof, &params, meta, settings.proof_dither)
+        .with_camera(camera);
     // Before the render, not after: FRAME margins are physical and can take even a
     // proof past the limits, and a refused file should not cost a GPU pass first.
     spec.checked_layout(frame.output_dims())?;

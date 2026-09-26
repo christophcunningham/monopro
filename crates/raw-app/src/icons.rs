@@ -228,6 +228,14 @@ const SOURCES: &[(&str, &str)] = &[
     ("file-png", include_str!("../../../icons/file-png.svg")),
     ("article", include_str!("../../../icons/article.svg")),
     ("rectangle", include_str!("../../../icons/rectangle.svg")),
+    // The Metadata pane's frame stepping, and Copy to Next — `copy` then `next`,
+    // which is "copy, then go on".
+    (
+        "previous",
+        include_str!("../../../icons/arrow-fat-left.svg"),
+    ),
+    ("next", include_str!("../../../icons/arrow-fat-right.svg")),
+    ("copy", include_str!("../../../icons/copy.svg")),
     (
         "rectangle-dashed",
         include_str!("../../../icons/rectangle-dashed.svg"),
@@ -535,6 +543,60 @@ pub fn labelled_toggle(
         box_size,
         0.0,
     )
+}
+
+/// A word and then two glyphs in one button — Copy to Next, which is two actions and
+/// says so: the name, then `copy` and `next`.
+///
+/// Its own routine rather than a `names` parameter on [`button_in`], which every
+/// other button in the app goes through and none of them needs; this paints the same
+/// hover fill and the same tints, so it cannot look like a different kind of control.
+pub fn pair(
+    ui: &mut egui::Ui,
+    icons: &Icons,
+    label: &str,
+    names: [&str; 2],
+    glyph: &str,
+    enabled: bool,
+    box_size: f32,
+) -> egui::Response {
+    let state = if enabled { State::Off } else { State::Disabled };
+    let pad = 5.0;
+    let font = egui::FontId::new(crate::theme::size::BODY, egui::FontFamily::Proportional);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font, crate::theme::DIM));
+    // The two glyphs overlap by a quarter box: side by side at full spacing they read
+    // as two buttons.
+    let glyphs = box_size * 1.75;
+    let w = pad + galley.size().x + glyphs;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(w, box_size),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let hot = enabled && resp.hovered();
+    let color = ink(state, hot);
+    if hot {
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_gray(64));
+    }
+    let at = egui::pos2(rect.left() + pad, rect.center().y - galley.size().y * 0.5);
+    let text_right = at.x + galley.size().x;
+    ui.painter().galley(at, galley, color);
+    for (i, name) in names.into_iter().enumerate() {
+        let at = egui::Rect::from_min_size(
+            egui::pos2(text_right + box_size * 0.75 * i as f32, rect.top()),
+            egui::vec2(box_size, box_size),
+        );
+        paint_at(ui, icons, name, glyph, at, color, box_size * GLYPH / BOX);
+    }
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
 }
 
 pub fn sized(

@@ -291,3 +291,43 @@ fn lightbox() {
 fn lightbox_light() {
     scene_lightbox(Ground::Light);
 }
+
+/// The Metadata pane on a selected frame: the IPTC fields in the maintainer's order,
+/// and the stepping row under the template menu.
+fn scene_lightbox_metadata(ground: Ground) {
+    let _turn = one_at_a_time();
+    let name = format!("lightbox-metadata{}", ground.suffix());
+    let Some(folder) = corpus_folder(&name) else {
+        eprintln!("{name}: skipped, no corpus folder");
+        return;
+    };
+    let mut h = launch(Some(folder), ground);
+    settle(&mut h, &name, |app| app.lightbox.tiles_settled());
+    let lightbox = &mut h.state_mut().lightbox;
+    lightbox.step(true);
+    lightbox.step(true);
+    lightbox.reveal_pane(crate::lightbox::Pane::Exif);
+    lightbox.expand_iptc_more();
+    settle(&mut h, &name, |app| app.lightbox.tiles_settled());
+    save(&mut h, &name);
+
+    // And scrolled to the end, for the fields below the fold.
+    h.event(egui::Event::PointerMoved(egui::pos2(150.0, 500.0)));
+    for _ in 0..6 {
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -400.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        });
+        h.step();
+    }
+    settle(&mut h, &name, |app| app.lightbox.tiles_settled());
+    save(&mut h, &format!("{name}-scrolled"));
+}
+
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn lightbox_metadata() {
+    scene_lightbox_metadata(Ground::Dark);
+}

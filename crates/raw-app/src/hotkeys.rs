@@ -509,7 +509,7 @@ pub const TABLE: &[Binding] = &[
         Key::Period,
         None,
         ".",
-        "Hotkey HUD",
+        "Keyboard Shortcuts",
         Navigation,
         true,
     ),

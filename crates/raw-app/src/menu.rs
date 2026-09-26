@@ -214,7 +214,7 @@ fn item(i: usize, claimed: &mut Vec<Action>) -> MenuItem {
     // becoming a native key equivalent and stealing that key from egui. Do not fake
     // the column by appending the chord to the title: proportional menu text makes the
     // result ragged and look broken. Bare keys remain functional and are listed in the
-    // Hotkey HUD, while the native menu stays typographically native.
+    // Keyboard Shortcuts overlay, while the native menu stays typographically native.
     MenuItem::with_id(id_for(i), b.what, b.built, accel)
 }
 

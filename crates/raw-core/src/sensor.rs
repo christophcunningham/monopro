@@ -516,25 +516,42 @@ pub fn raw_dimensions(path: &std::path::Path) -> Option<(usize, usize)> {
     (w > 0 && h > 0).then_some((w, h))
 }
 
-/// The file's own XMP packet, if it carries one.
+/// The file's own XMP packet, if it carries one, and the EXIF capture time as
+/// ISO 8601 — **from one open of the file**, since the open is the expensive part
+/// (see [`capture_time`]) and the Metadata pane wants both.
 ///
-/// **This is where IPTC lives now.** The legacy IPTC-IIM block is a binary record
-/// almost nothing writes any more; IPTC Core is XMP, in the same `dc:` and
+/// **The packet is where IPTC lives now.** The legacy IPTC-IIM block is a binary
+/// record almost nothing writes any more; IPTC Core is XMP, in the same `dc:` and
 /// `photoshop:` namespaces this app's own sidecar already speaks. So the packet comes
 /// back as text and [`crate::sidecar::from_xml`] reads it — the same parser, which is
 /// what stops this app having two ideas of what a creator field is.
 ///
-/// `None` for most raws: rawler defaults `xpacket` to nothing and only some decoders
-/// override it. A file with no packet is not an error; it is a file nobody has
-/// captioned.
-pub fn xmp_packet(path: &std::path::Path) -> Option<String> {
-    let src = RawSource::new(path).ok()?;
-    let decoder = rawler::get_decoder(&src).ok()?;
-    let bytes = decoder
-        .xpacket(&src, &RawDecodeParams::default())
-        .ok()
-        .flatten()?;
-    String::from_utf8(bytes).ok()
+/// No packet for most raws: rawler defaults `xpacket` to nothing and only some
+/// decoders override it. A file with no packet is not an error; it is a file nobody
+/// has captioned. A picture rawler does not decode has no packet from here, but can
+/// still have a date: that comes from [`probe_rendered`], the reader the pane already
+/// uses for it.
+pub fn xmp_and_capture_date(path: &std::path::Path) -> (Option<String>, Option<String>) {
+    if let Ok(src) = RawSource::new(path)
+        && let Ok(decoder) = rawler::get_decoder(&src)
+    {
+        let params = RawDecodeParams::default();
+        let packet = decoder
+            .xpacket(&src, &params)
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        let taken = decoder.raw_metadata(&src, &params).ok().and_then(|meta| {
+            let e = meta.exif;
+            let when = e.date_time_original.or(e.create_date)?;
+            crate::sidecar::exif_date_to_iso(&when, e.offset_time_original.as_deref())
+        });
+        return (packet, taken);
+    }
+    let taken = probe_rendered(path)
+        .and_then(|(_, meta)| meta.date_time)
+        .and_then(|when| crate::sidecar::exif_date_to_iso(&when, None));
+    (None, taken)
 }
 
 /// When the frame was taken, from EXIF `DateTimeOriginal`.

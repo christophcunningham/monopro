@@ -15,6 +15,7 @@
 //! - The per-channel gains are photosite equalisation, not white balance.
 
 pub mod atomic_file;
+pub mod camera_exif;
 pub mod colour;
 pub mod composition;
 pub mod curve;
