@@ -1,6 +1,22 @@
 # monopro
 
-A monochrome RAW processor written in Rust, for editing photographs and preparing prints.
+monopro is a free, open-source, cross-platform RAW editor for monochrome photography
+and printing.
+
+Instead of converting a color image to grayscale, monopro calculates luminance
+directly from the camera's sensor data. Every edit starts from the light your camera
+recorded, before any color rendering or tone curve is applied.
+
+Lightbox is where you review and organize your files. Develop handles global
+adjustments, Dodge / Burn handles local ones, and Toning adds color modeled on
+historical print processes and toners.
+
+monopro is designed to feel familiar to photographers who use other RAW editors,
+while offering a keyboard-driven interface, panels you can arrange, dock and float,
+and the tools a print workflow needs: a print loupe, snapshots for comparing edits,
+contact sheets, IPTC metadata and a command line for batch work. It's built in Rust
+with egui and wgpu for fast GPU rendering and flexible panel layouts, and uses rawler,
+an actively maintained RAW library, for broad camera support.
 
 In development. A website with further documentation and a manual is in progress.
 
