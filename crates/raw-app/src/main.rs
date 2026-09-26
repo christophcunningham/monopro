@@ -55,6 +55,7 @@ mod rename;
 mod search;
 mod settings;
 mod snapshot;
+mod splash;
 mod tabs;
 mod theme;
 mod toning;
@@ -234,6 +235,14 @@ struct App {
     /// Where the open dialog last landed. App memory, not a setting — nobody
     /// configures this, the app just remembers.
     last_dir: Option<PathBuf>,
+    /// Folders and images opened lately, for the start page. App memory, like
+    /// `last_dir`; see `splash`.
+    recent: splash::Recent,
+    /// Home has laid the start page over Develop's tabs. The tabs stay open under it;
+    /// see `App::go_home`.
+    home: bool,
+    /// A click on Develop's start page, carried out once the panels have drawn.
+    splash_go: Option<splash::Go>,
     /// Configured preferences, as distinct from app memory. See `settings`.
     settings: settings::Settings,
     settings_open: bool,
@@ -427,6 +436,9 @@ impl App {
             export_requested: None,
             status: "drop a raw file on the window, or use lightbox (L)".to_owned(),
             last_dir: None,
+            recent: splash::Recent::default(),
+            home: false,
+            splash_go: None,
             settings: settings::Settings::default(),
             settings_open: false,
             settings_raise: false,
@@ -487,6 +499,7 @@ impl App {
                 .get_string(memory_keys::LAST_DIR)
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir());
+            app.recent = splash::Recent::restore(storage);
             // `remember_lightbox_sort` becomes live here. The setting is read from
             // `settings.toml`, which was loaded above, so the preference decides
             // whether the remembered order is honoured on this launch.
@@ -666,6 +679,11 @@ impl App {
             self.status = format!("{} tabs is the cap — close one first", tabs::MAX_TABS);
             return false;
         };
+        // Canonical, so one file reached by two spellings is one row on the start page.
+        self.recent
+            .image(&std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()));
+        // The picture you just asked for is the thing to look at, not the page over it.
+        self.home = false;
         if let Some(tab) = self.tabs.by_id_mut(id) {
             tab.params = opening;
         }
@@ -1635,6 +1653,11 @@ impl App {
     /// shell and Develop's panels are simply not drawn while it is up. See `lightbox`.
     fn set_lightbox(&mut self, active: bool) {
         self.lightbox.active = active;
+        // The start page over Develop's tabs is Develop's. Coming back finds the
+        // picture, not the page you left it under.
+        if active {
+            self.home = false;
+        }
         // **Coming back from Develop, re-check which frames have a sidecar.** Developing
         // one writes a `.mono.xmp` that the grid knows nothing about, so the edited rule
         // and the Developed sort were both answering from whenever the folder was last
@@ -1655,6 +1678,81 @@ impl App {
             t.loupe.forget();
             t.mode = tabs::Mode::View;
         }
+    }
+}
+
+impl App {
+    /// The title strip's Home button.
+    ///
+    /// In Lightbox it chooses no folder, which puts the start page where the grid
+    /// was. In Develop it lays the page over the open tabs, and takes it off again.
+    /// Nothing is closed either way, so the way back is the picture exactly as it
+    /// was left. With no tab open Develop is already showing the page, so there is
+    /// nothing to do.
+    fn go_home(&mut self) {
+        if self.lightbox.active {
+            self.lightbox.close_folder();
+        } else if !self.tabs.is_empty() {
+            self.home = !self.home;
+        }
+    }
+
+    /// Whether the start page is laid over Develop's tabs this frame.
+    fn home_showing(&self) -> bool {
+        self.home && !self.lightbox.active && !self.tabs.is_empty()
+    }
+
+    /// Carry out a click on the start page. See `splash::Go`.
+    fn follow(&mut self, go: splash::Go, ctx: &egui::Context, rs: &egui_wgpu::RenderState) {
+        match go {
+            splash::Go::Folder(dir) => self.lightbox.open_folder(&dir),
+            splash::Go::Browse => self.lightbox.reveal_pane(lightbox::Pane::Folders),
+            splash::Go::Image(path) => {
+                self.home = false;
+                // An image that already has a tab is brought forward rather than
+                // opened twice, which is what a list of recent files promises.
+                if let Some(i) = self.tab_showing(&path) {
+                    self.tabs.focus(i);
+                    if let Some(id) = self.tabs.active_id() {
+                        self.queue.promote(id);
+                        self.luma_queue.promote(id);
+                    }
+                } else {
+                    self.open(path, ctx);
+                }
+            }
+            splash::Go::Open => self.pick_and_open(ctx),
+            // The same errand as `l`, so the same preparation: the sidecar and the
+            // edited tile go first so the grid is right when it appears.
+            splash::Go::Lightbox => {
+                if let Some(id) = self.tabs.active_id() {
+                    self.save_sidecar(id);
+                }
+                self.store_edited_tile(rs);
+                self.set_lightbox(true);
+            }
+            splash::Go::Develop => self.set_lightbox(false),
+            splash::Go::Settings => {
+                self.settings_open = true;
+                self.settings_raise = true;
+            }
+            splash::Go::Shortcuts => self.hotkey_hud = true,
+            splash::Go::Back => self.home = false,
+        }
+    }
+
+    /// The tab already showing `path`. Compared canonically, because the start page
+    /// keeps canonical paths and a tab keeps whichever spelling opened it.
+    fn tab_showing(&self, path: &Path) -> Option<usize> {
+        let want = std::fs::canonicalize(path).ok()?;
+        self.tabs.iter().position(|t| {
+            t.image
+                .as_ref()
+                .map(|i| i.path.as_path())
+                .or(t.opening_path.as_deref())
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .is_some_and(|p| p == want)
+        })
     }
 }
 
@@ -2732,6 +2830,7 @@ impl eframe::App for App {
                 self.lightbox.descending.to_string(),
             );
         }
+        self.recent.save(storage);
         // The one thing here that is not four plain strings. A tile tree is not a
         // shape anyone would hand-write, and `egui_tiles` derives `serde` for it, so
         // it goes through eframe's own RON helpers rather than an encoding invented
@@ -2801,6 +2900,11 @@ impl eframe::App for App {
                 .collect::<Vec<_>>()
         }) {
             self.open(p, &ctx);
+        }
+        // A folder opened by any route — the tree, a favorite, the folder of a file
+        // opened in Develop — is a recent one. Free when it is already first.
+        if let Some(dir) = &self.lightbox.folder {
+            self.recent.folder(dir);
         }
 
         // Both panels at once. Hiding them one at a time would be two keys for a
@@ -2941,12 +3045,21 @@ impl eframe::App for App {
                 hotkeys::Action::CloseTab => {
                     self.pending_note = Some("⌘W closes Settings while it is open".into());
                 }
-                hotkeys::Action::CycleTabs => self.tabs.step(1),
-                hotkeys::Action::CycleTabsBack => self.tabs.step(-1),
+                hotkeys::Action::CycleTabs => {
+                    self.home = false;
+                    self.tabs.step(1);
+                }
+                hotkeys::Action::CycleTabsBack => {
+                    self.home = false;
+                    self.tabs.step(-1);
+                }
                 // Not the same as cycling: this toggles a *pair*, which is what
                 // flicker comparison needs and what walking a strip of three or
                 // more cannot do.
-                hotkeys::Action::FlickTab => self.tabs.flicker(),
+                hotkeys::Action::FlickTab => {
+                    self.home = false;
+                    self.tabs.flicker();
+                }
                 // Opens it, and closes it when the main window is the one with
                 // focus. The settings viewport handles its own copy of this key —
                 // see `settings_window`, which is where the interesting half is.
@@ -3081,7 +3194,13 @@ impl eframe::App for App {
                 // forward, and from the browser the only thing it can sensibly mean
                 // is the other half of the pair.
                 hotkeys::Action::Develop if self.lightbox.active => self.set_lightbox(false),
-                hotkeys::Action::Develop => self.layout.bring_forward(layout::Pane::Develop),
+                hotkeys::Action::Home => self.go_home(),
+                // The panel is under the start page when Home is up, so bringing it
+                // forward has to take the page off too.
+                hotkeys::Action::Develop => {
+                    self.home = false;
+                    self.layout.bring_forward(layout::Pane::Develop);
+                }
                 // **In Lightbox the rotate pair turns the selection**, for display,
                 // rather than the open frame's composition — same gesture, and the
                 // thing it acts on is whatever the mode is about.
@@ -3236,6 +3355,9 @@ impl eframe::App for App {
                 // in Lightbox the preview is the mode you are in — falling through to
                 // Develop's tab state would leave a full-frame view up while
                 // cancelling a crop you cannot see.
+                // **`Esc` takes the start page off the tabs before anything under it.**
+                // A crop or a loupe hidden by the page is not what you are leaving.
+                hotkeys::Action::ExitMode if self.home_showing() => self.home = false,
                 hotkeys::Action::ExitMode if self.lightbox.active && self.lightbox.previewing() => {
                     self.lightbox.close_preview();
                 }
@@ -3415,17 +3537,24 @@ impl eframe::App for App {
                         detail: b.detail,
                         failed: b.failed,
                     });
-                match widgets::title_strip(
+                let home_on = self.home_showing();
+                let clicks = widgets::title_strip(
                     ui,
+                    &self.icons,
                     platform::strip_title(self.lightbox.active),
                     &exposure,
                     badge.as_ref(),
-                ) {
+                    home_on,
+                );
+                match clicks.badge {
                     widgets::BadgeClick::None => {}
                     widgets::BadgeClick::Open => self.update_sheet_open = true,
                     widgets::BadgeClick::Dismiss => {
                         self.update_badge_dismissed = badge.map(|b| (b.text, b.failed));
                     }
+                }
+                if clicks.home {
+                    self.go_home();
                 }
             });
 
@@ -3448,6 +3577,8 @@ impl eframe::App for App {
         match action {
             StripAction::None => {}
             StripAction::Focus(i) => {
+                // A tab is a way off the start page: you asked to see that picture.
+                self.home = false;
                 self.tabs.focus(i);
                 if let Some(id) = self.tabs.active_id() {
                     self.queue.promote(id);
@@ -3918,7 +4049,10 @@ impl eframe::App for App {
         // Nothing is recorded to undo here. These windows are drawn *because* `out`
         // says so, so not drawing them is the whole of hiding them, and returning to
         // Develop puts them back untouched.
-        if !self.layout.panels_hidden() && !self.lightbox.active {
+        // **And Home takes them**, for the same reason: the start page over the tabs
+        // is Develop out of the way, and a floating panel over it is the half that
+        // did not hear.
+        if !self.layout.panels_hidden() && !self.lightbox.active && !self.home_showing() {
             if self.layout.is_out(Pane::Info) {
                 self.float_info(&ctx);
             }
@@ -3994,7 +4128,7 @@ impl eframe::App for App {
                         .settings
                         .lightbox_grounds()
                         .map(|v| theme::background_of(v).r());
-                    open_in_develop = self.lightbox.ui(ui, &self.icons)
+                    open_in_develop = self.lightbox.ui(ui, &self.icons, &self.recent.folders)
                 });
             let renamed = self.lightbox.take_rename_events();
             for (id, path) in self.tabs.rename_paths(&renamed) {
@@ -4012,12 +4146,37 @@ impl eframe::App for App {
             {
                 self.set_lightbox(false);
             }
+        } else if self.home_showing() {
+            // **Home, over the tabs.** The tile tree is simply not drawn, which is the
+            // whole of hiding it — the arrangement Lightbox already relies on. Nothing
+            // is closed or moved, so taking the page away puts every panel and every
+            // tab back exactly as it was.
+            let back = self.tabs.active().map(|t| t.display_name());
+            let page = splash::Page::Develop {
+                images: &self.recent.images,
+                back: back.as_deref(),
+            };
+            let mut go = None;
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| go = splash::show(ui, &self.icons, page));
+            if go.is_some() {
+                self.splash_go = go;
+            }
         } else {
             let panel = theme::background_of(self.settings.panel_background());
             theme::set_module_ground(self.settings.module_background());
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(panel))
                 .show(ui, |ui| self.tile_tree(ui, &ctx, &rs, &actions));
+        }
+        // A start-page click from either mode, now that no panel is holding `self`.
+        if let Some(go) = self
+            .splash_go
+            .take()
+            .or_else(|| self.lightbox.splash.take())
+        {
+            self.follow(go, &ctx, &rs);
         }
 
         if self.hotkey_hud {
@@ -4099,7 +4258,11 @@ impl eframe::App for App {
         // fires on a drag, a resize or a tab click, which is every way the tree can
         // move, and it is cheaper and more honest than cloning a tree each frame to
         // diff it.
-        if self.last_dir != self.persisted || std::mem::take(&mut self.layout.dirty) {
+        // Both flags are taken every frame, so neither can ride along unwritten behind
+        // the other and cost a second write on the frame after.
+        let layout_moved = std::mem::take(&mut self.layout.dirty);
+        let recent_moved = std::mem::take(&mut self.recent.dirty);
+        if self.last_dir != self.persisted || layout_moved || recent_moved {
             self.persist(frame);
         }
     }
@@ -8967,7 +9130,13 @@ impl App {
         let brush_pan = self.brush_pan;
         let Some(gpu) = &mut self.gpu else { return };
         let Some(tab) = self.tabs.active_mut() else {
-            welcome(ui);
+            let page = splash::Page::Develop {
+                images: &self.recent.images,
+                back: None,
+            };
+            if let Some(go) = splash::show(ui, &self.icons, page) {
+                self.splash_go = Some(go);
+            }
             return;
         };
         if let Some(e) = &tab.error {
@@ -10803,53 +10972,6 @@ impl App {
             egui::CursorIcon::Crosshair
         });
     }
-}
-
-/// The viewport with no tab open: the app's name, the two ways in, and the two
-/// references that make the rest of the interface discoverable.
-///
-/// **the maintainer's wording, and the shape of it is the point.** What was there was one line
-/// of status text — "drop a raw file on the window, or use lightbox (L)" —
-/// repeated verbatim in the footer two inches below, which made the emptiest screen in
-/// the app the one that said the same thing twice. And it named the *command line*,
-/// which is not a route anybody takes twice; the menu is, and the menu was the one it
-/// did not mention.
-///
-/// The name first, because an application with nothing open should say what it is. It
-/// is set in the heading size and left dim: this is a title card, not a splash screen,
-/// and the instruction under it is the part that is being read. Settings and the
-/// Keyboard Shortcuts overlay sit one line below as a quiet quick reference rather than competing
-/// with the primary action.
-fn welcome(ui: &mut egui::Ui) {
-    let chord = |action| {
-        hotkeys::TABLE
-            .iter()
-            .find(|binding| binding.action == action)
-            .map(hotkeys::Binding::chord)
-            .unwrap_or_default()
-    };
-    let settings = chord(hotkeys::Action::Settings);
-    let hud = chord(hotkeys::Action::HotkeyHud);
-
-    ui.centered_and_justified(|ui| {
-        ui.vertical_centered(|ui| {
-            // Pushed down by a third rather than centred on the pane. Optical centre:
-            // a two-line block sitting on the exact middle reads as low, and this pane
-            // is tall.
-            ui.add_space((ui.available_height() * 0.38).max(0.0));
-            ui.label(egui::RichText::new("monopro").heading().color(theme::DIM));
-            ui.add_space(9.0);
-            ui.label(theme::caption("File > Open | ⌘ O"));
-            ui.add_space(5.0);
-            ui.label(theme::caption("or Drag & Drop"));
-            ui.add_space(18.0);
-            ui.label(theme::caption(format!("Press {settings} for Settings")));
-            ui.add_space(5.0);
-            ui.label(theme::caption(format!(
-                "Press {hud} for keyboard shortcuts"
-            )));
-        });
-    });
 }
 
 /// The bearing of `p` from `centre`, in degrees, increasing **clockwise**.

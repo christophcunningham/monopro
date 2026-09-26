@@ -115,6 +115,7 @@ fn code(key: egui::Key) -> Option<Code> {
         K::C => Code::KeyC,
         K::D => Code::KeyD,
         K::E => Code::KeyE,
+        K::H => Code::KeyH,
         K::I => Code::KeyI,
         K::J => Code::KeyJ,
         K::K => Code::KeyK,

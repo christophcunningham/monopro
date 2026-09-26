@@ -1808,6 +1808,14 @@ pub struct UpdateBadge {
     pub failed: bool,
 }
 
+/// What was clicked in the title strip this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StripClicks {
+    pub badge: BadgeClick,
+    /// The Home button at the strip's right end.
+    pub home: bool,
+}
+
 /// What the title strip's update badge was asked to do this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BadgeClick {
@@ -1841,12 +1849,21 @@ pub enum BadgeClick {
 /// `update` is the badge that occupies the strip's right end when the updater has
 /// something to say. The centre readout stays centred on the *window* whether or
 /// not the badge is up; a badge appearing never displaces it.
+///
+/// **Home is the last thing on the right**, and the badge sits to its left when it
+/// is up. The maintainer's placement: the left end belongs to the window buttons and
+/// the app's name. The glyph is drawn in the panel rule's gray at rest, so it is
+/// there to be found rather than competing with the readout, and in ruby under the
+/// pointer. `home_on` holds it in ruby while the start page is laid over Develop's
+/// tabs, because it is then a state you are in and the button is how you leave it.
 pub fn title_strip(
     ui: &mut egui::Ui,
+    icons: &crate::icons::Icons,
     title: &str,
     centre: &str,
     update: Option<&UpdateBadge>,
-) -> BadgeClick {
+    home_on: bool,
+) -> StripClicks {
     let h = crate::theme::TITLE_STRIP;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -1871,18 +1888,48 @@ pub fn title_strip(
         );
     }
 
-    let Some(badge) = update else {
-        return BadgeClick::None;
+    let home_box = crate::icons::BIG;
+    let home_rect = Rect::from_min_size(
+        pos2(
+            rect.right() - 8.0 - home_box,
+            rect.center().y - home_box / 2.0,
+        ),
+        vec2(home_box, home_box),
+    );
+    let home = ui
+        .interact(home_rect, ui.id().with("home"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(crate::theme::tip(format!(
+            "{}  {}",
+            if home_on {
+                "Back to the picture"
+            } else {
+                "Home"
+            },
+            crate::splash::chord(crate::hotkeys::Action::Home)
+        )));
+    let ink = if home_on || home.hovered() {
+        RUBY
+    } else {
+        crate::layout::panel_rule().color
     };
-    // Pinned to the right end, clear of the edge by the strip's own inset. Square,
-    // like every other control, with the body opening the sheet and the `×` at its
-    // right end dismissing it.
+    crate::icons::paint_at(ui, icons, "house", "⌂", home_rect, ink, 13.0);
+    let home = home.clicked();
+
+    let Some(badge) = update else {
+        return StripClicks {
+            badge: BadgeClick::None,
+            home,
+        };
+    };
+    // Pinned to the right end, left of Home. Square, like every other control, with
+    // the body opening the sheet and the `×` at its right end dismissing it.
     let font = egui::FontId::proportional(crate::theme::size::CAPTION);
     let galley = painter.layout_no_wrap(badge.text.clone(), font.clone(), Color32::WHITE);
     let pad_x = 8.0;
     let close_w = h - 8.0;
     let height = h - 8.0;
-    let right = rect.right() - crate::theme::TITLE_INSET.min(16.0);
+    let right = home_rect.left() - 8.0;
     let close = Rect::from_min_size(
         pos2(right - close_w, rect.center().y - height / 2.0),
         vec2(close_w, height),
@@ -1935,13 +1982,14 @@ pub fn title_strip(
         ink,
     );
     painter.text(close.center(), egui::Align2::CENTER_CENTER, "×", font, ink);
-    if close_response.clicked() {
+    let badge = if close_response.clicked() {
         BadgeClick::Dismiss
     } else if body_response.clicked() {
         BadgeClick::Open
     } else {
         BadgeClick::None
-    }
+    };
+    StripClicks { badge, home }
 }
 
 /// The toning placement curve: **strength against print tone**.

@@ -32,6 +32,7 @@ Letter shortcuts are suppressed while typing into text fields.
 | `Backtick` | Flick to the previous tab — A/B comparison |
 | `l` | Lightbox |
 | `e` | Bring the Develop panel forward |
+| `Alt+H` | Home — the start page |
 | `,` | Settings |
 | `.` | Keyboard shortcuts overlay |
 
@@ -130,6 +131,9 @@ Letter shortcuts are suppressed while typing into text fields.
 `Esc` leaves the active tool. In Crop it cancels the pending change; in Dodge / Burn
 it restores the brush session to its starting state. `Enter` applies and leaves.
 The print loupe closes with either key.
+
+When Home has laid the start page over Develop's tabs, `Esc` closes the start page
+first and leaves any tool under it as it was.
 
 While the brush is open, its shortcuts take precedence over tab duplication and
 rotation. `Alt+drag` erases; `Shift+click` draws a straight pass.
