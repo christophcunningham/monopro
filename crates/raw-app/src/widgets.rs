@@ -113,7 +113,8 @@ pub struct Module<'a> {
 pub struct Plain<'a> {
     name: &'a str,
     open_on_start: bool,
-    open_this_frame: bool,
+    /// Open (`Some(true)`) or fold (`Some(false)`) the section on this frame only.
+    force: Option<bool>,
 }
 
 /// A module whose dot is a switch, reached only through [`Module::switch`].
@@ -221,7 +222,7 @@ impl<'a> Module<'a> {
             None,
             self.resettable.unwrap_or(self.modified),
             self.open_on_start,
-            false,
+            None,
             ui,
             body,
         )
@@ -233,7 +234,7 @@ impl<'a> Plain<'a> {
         Self {
             name,
             open_on_start: true,
-            open_this_frame: false,
+            force: None,
         }
     }
 
@@ -244,7 +245,18 @@ impl<'a> Plain<'a> {
 
     /// Reveal this section now, without pinning it open on later frames.
     pub fn open_when(mut self, yes: bool) -> Self {
-        self.open_this_frame = yes;
+        if yes {
+            self.force = Some(true);
+        }
+        self
+    }
+
+    /// Fold this section now, without holding it shut: a click on its header still
+    /// opens it on the next frame.
+    pub fn close_when(mut self, yes: bool) -> Self {
+        if yes {
+            self.force = Some(false);
+        }
         self
     }
 
@@ -255,7 +267,7 @@ impl<'a> Plain<'a> {
             None,
             false,
             self.open_on_start,
-            self.open_this_frame,
+            self.force,
             ui,
             body,
         );
@@ -270,7 +282,7 @@ impl<'a> Switchable<'a> {
             Some(self.enabled),
             self.module.resettable.unwrap_or(self.module.modified),
             self.module.open_on_start,
-            false,
+            None,
             ui,
             body,
         )
@@ -329,7 +341,7 @@ fn draw(
     enabled: Option<bool>,
     resettable: bool,
     open_on_start: bool,
-    open_this_frame: bool,
+    force: Option<bool>,
     ui: &mut egui::Ui,
     body: impl FnOnce(&mut egui::Ui),
 ) -> Clicked {
@@ -344,7 +356,10 @@ fn draw(
     let mut open = ui
         .data_mut(|d| d.get_temp::<bool>(id))
         .unwrap_or(open_on_start);
-    if open_this_frame || opened_for_a_test(name) {
+    if let Some(forced) = force {
+        open = forced;
+    }
+    if opened_for_a_test(name) {
         open = true;
     }
 
@@ -833,25 +848,12 @@ pub fn check(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Response {
 
 /// A slider that resets to its default on double-click.
 ///
-/// **Kept as one line of delegation.** It was `egui::Slider` — track, then value, then
-/// label, reading right to left — and the app had two control rows for one job.
-/// the maintainer settled the design: one row everywhere, `Label · DragValue · Slider`. Rather
-/// than convert eighteen call sites by hand and leave the two shapes coexisting for a
-/// commit, this forwards to [`Row`] and the call sites did not change at all.
-///
-/// It stays because the argument order differs — `Slider::new(v, default, range,
-/// text)` is what the Develop panel already reads — and collapsing that too would have
-/// made one change into two.
-/// The app's slider **track and handle alone**, with no label column and no value.
-///
-/// The footer has room for a control and not for a row: a 78 pt label column and a
-/// `DragValue` beside a size slider would be most of the bar spent saying what the
-/// grid in front of you already shows. This is the same 1 pt track and the same
-/// rectangular handle [`Row`] draws, at the same greys and with the same rule about
-/// ruby — so it *is* the app's slider rather than something that resembles it.
-///
-/// `steps` snaps to whole positions when it is `Some`; a size ladder has rungs and
-/// nothing between them.
+/// **Whole numbers only, and it holds them every frame.** egui's `integer()` slider
+/// rounds the value it is handed each time it is drawn, not only when it is dragged,
+/// so a default between two integers is one it can never show: the value is rounded
+/// away the moment the page appears, the row reads as modified, and its reset puts
+/// back a number the next frame rounds away again. Every default given to this has to
+/// be whole; `every_slider_default_is_a_value_the_slider_can_hold` checks Settings'.
 pub fn settings_slider(
     ui: &mut egui::Ui,
     value: &mut f32,
@@ -936,6 +938,16 @@ pub fn settings_slider(
     response.on_hover_text("Double-click to reset to default")
 }
 
+/// The app's slider **track and handle alone**, with no label column and no value.
+///
+/// The footer has room for a control and not for a row: a 78 pt label column and a
+/// `DragValue` beside a size slider would be most of the bar spent saying what the
+/// grid in front of you already shows. This is the same 1 pt track and the same
+/// rectangular handle [`Row`] draws, at the same greys and with the same rule about
+/// ruby — so it *is* the app's slider rather than something that resembles it.
+///
+/// `steps` snaps to whole positions when it is `Some`; a size ladder has rungs and
+/// nothing between them.
 pub fn bare_slider(
     ui: &mut egui::Ui,
     value: &mut f32,
@@ -993,6 +1005,15 @@ pub fn bare_slider(
     resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
 }
 
+/// **Kept as one line of delegation.** It was `egui::Slider` — track, then value, then
+/// label, reading right to left — and the app had two control rows for one job.
+/// the maintainer settled the design: one row everywhere, `Label · DragValue · Slider`. Rather
+/// than convert eighteen call sites by hand and leave the two shapes coexisting for a
+/// commit, this forwards to [`Row`] and the call sites did not change at all.
+///
+/// It stays because the argument order differs — `Slider::new(v, default, range,
+/// text)` is what the Develop panel already reads — and collapsing that too would have
+/// made one change into two.
 pub struct Slider<'a>(Row<'a>);
 
 impl<'a> Slider<'a> {

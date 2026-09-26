@@ -93,6 +93,9 @@ Letter shortcuts are suppressed while typing into text fields.
 | `Cmd+Shift+R` | Rename selected file(s) |
 | `Cmd+Shift+P` | Contact Sheet |
 | `Cmd+R` | Refresh folder: pick up files added or removed while it was open |
+| `Shift+S` | Search — cursor in the search field (also `Cmd+F`) |
+| `Shift+M` | Metadata panel |
+| `Cmd+A` | Select all images |
 | `Cmd+1` | One star |
 | `Cmd+2` | Two stars |
 | `Cmd+3` | Three stars |

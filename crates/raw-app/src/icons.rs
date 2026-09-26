@@ -187,6 +187,12 @@ const SOURCES: &[(&str, &str)] = &[
     ("link-break", include_str!("../../../icons/link-break.svg")),
     // the maintainer's folder glyphs, and the file marks for what the grid cannot draw.
     ("folder", include_str!("../../../icons/folder-simple.svg")),
+    // An expanded folder in the Lightbox tree, so an open branch says so in its glyph
+    // as well as its triangle.
+    (
+        "folder-open",
+        include_str!("../../../icons/folder-open.svg"),
+    ),
     (
         "folder-plus",
         include_str!("../../../icons/folder-simple-plus.svg"),
@@ -227,6 +233,12 @@ const SOURCES: &[(&str, &str)] = &[
     ("file-jpg", include_str!("../../../icons/file-jpg.svg")),
     ("file-png", include_str!("../../../icons/file-png.svg")),
     ("article", include_str!("../../../icons/article.svg")),
+    // The Contact Sheet button: a sheet of frames in rows, which is what it makes.
+    // It was `file-pdf`, which named the container rather than the thing.
+    (
+        "contact-sheet",
+        include_str!("../../../icons/contact-sheet-7-sheet-4row.svg"),
+    ),
     ("rectangle", include_str!("../../../icons/rectangle.svg")),
     // The Metadata pane's frame stepping, and Copy to Next — `copy` then `next`,
     // which is "copy, then go on".

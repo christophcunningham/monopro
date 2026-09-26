@@ -605,10 +605,13 @@ impl Default for Settings {
             lightbox_gray: true,
             lightbox_matches_viewer: true,
             // Lightbox's own look before these were settings: the grid on `CHROME`,
-            // panels and cards on `CHROME_DEEP`.
+            // panels and cards on `CHROME_DEEP`. **12, not 11.8**, which is grey 31
+            // against `CHROME_DEEP`'s 30: the slider holds whole numbers, and 11.8 —
+            // the exact grey — was a default it rounded away the moment the page drew,
+            // so both rows showed as modified and their reset could never clear it.
             lightbox_canvas: 15.0,
-            lightbox_panel: 11.8,
-            lightbox_module: 11.8,
+            lightbox_panel: 12.0,
+            lightbox_module: 12.0,
             lightbox_folder_root: None,
             quick_export: false,
             remember_lightbox_sort: true,
@@ -1672,6 +1675,30 @@ mod tests {
     fn defaults_round_trip() {
         let s = Settings::default();
         assert_eq!(roundtrip(&s), s);
+    }
+
+    #[test]
+    fn every_slider_default_is_a_value_the_slider_can_hold() {
+        // `widgets::settings_slider` rounds to a whole number every frame it is drawn,
+        // so a fractional default is unreachable: the row reads as modified as soon as
+        // the page appears, and its reset restores a value the next frame rounds away.
+        // Lightbox's Panel and Tiles shipped at 11.8 and did exactly that.
+        let d = Settings::default();
+        for (name, v) in [
+            ("viewer_background", d.viewer_background),
+            ("panel_background", d.panel_background),
+            ("module_background", d.module_background),
+            ("surround_width", d.surround_width),
+            ("lightbox_canvas", d.lightbox_canvas),
+            ("lightbox_panel", d.lightbox_panel),
+            ("lightbox_module", d.lightbox_module),
+        ] {
+            assert_eq!(
+                v,
+                v.round(),
+                "{name} defaults to {v}, which its slider rounds away"
+            );
+        }
     }
 
     #[test]

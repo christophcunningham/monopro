@@ -147,6 +147,11 @@ pub struct Loupe {
     /// the panel is actually drawn, so a hidden or floating Develop pane cannot lose
     /// the request.
     reveal_module: bool,
+    /// Whether the loupe was open the last time the Develop module was drawn, so the
+    /// module can fold itself on the frame it sees the loupe go off. Tracked here
+    /// rather than at each of the places that close the loupe — the eye, its key,
+    /// Escape, a crop or brush taking over — so none of them has to remember.
+    module_saw_open: bool,
     /// Where the loupe is sampling, in **frame** pixels — the composed, straightened
     /// picture, the space `Frame::crop` lives in. `None` until first shown, which
     /// puts it in the middle of the crop.
@@ -182,6 +187,17 @@ impl Loupe {
 
     pub fn take_module_reveal(&mut self) -> bool {
         std::mem::take(&mut self.reveal_module)
+    }
+
+    /// True once, on the first module draw after the loupe closed.
+    ///
+    /// **A transition, not a state.** The eye that opens the loupe lives inside the
+    /// module, so holding the module shut while the loupe is off would leave no way to
+    /// turn it on; it folds when the loupe goes off and opens on a click like any other.
+    pub fn take_module_collapse(&mut self) -> bool {
+        let closed = self.module_saw_open && !self.open;
+        self.module_saw_open = self.open;
+        closed
     }
 
     /// True while a render is in flight, which the overlay dims itself for.
@@ -635,6 +651,21 @@ pub fn refresh(
 mod tests {
     use super::*;
     use raw_core::composition::{IRect, Orientation};
+
+    #[test]
+    fn the_module_folds_once_when_the_loupe_goes_off() {
+        let mut loupe = Loupe::default();
+        assert!(
+            !loupe.take_module_collapse(),
+            "never opened, nothing to fold"
+        );
+        loupe.open = true;
+        assert!(!loupe.take_module_collapse());
+        loupe.open = false;
+        assert!(loupe.take_module_collapse(), "the frame it went off");
+        // Once only: after that the module is yours to open again with the loupe off.
+        assert!(!loupe.take_module_collapse());
+    }
 
     fn frame_of(w: u32, h: u32) -> Frame {
         Frame::resolve(
