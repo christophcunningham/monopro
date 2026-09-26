@@ -9917,14 +9917,19 @@ impl App {
         let k = raw.x.clamp(6.0, win_w) / raw.x;
         let reticle = egui::Rect::from_center_size(centre, raw * k * 2.0);
         let painter = ui.painter_at(rect);
-        // Amber, hairline, no fill — the prototype's, and it has to read over both a
-        // white sky and a black shadow without hiding either.
-        painter.rect_stroke(
-            reticle,
-            0.0,
-            egui::Stroke::new(1.0, theme::AMBER),
-            egui::StrokeKind::Inside,
+        // Hairline, no fill — the prototype's, and it has to read over both a white
+        // sky and a black shadow without hiding either. **Amber for the print, bright
+        // for Before**: both strokes say which of the two crops the window holds, so
+        // the original is never mistaken for the grain and sharpening being judged.
+        let ring = egui::Stroke::new(
+            1.0,
+            if tab.loupe.before {
+                theme::BRIGHT
+            } else {
+                theme::AMBER
+            },
         );
+        painter.rect_stroke(reticle, 0.0, ring, egui::StrokeKind::Inside);
 
         // ── The window ───────────────────────────────────────────────────────
         //
@@ -9946,8 +9951,8 @@ impl App {
                 //
                 // What the circle was buying — a window that reads as a lens rather
                 // than as another panel in a viewport full of rectangles — is carried
-                // by the amber stroke and by the offset placement above, which are the
-                // two things that say "this floats over the picture".
+                // by the stroke and by the offset placement above, which are the two
+                // things that say "this floats over the picture".
                 //
                 // Dimmed while a new tile is in flight, so a stale picture never
                 // silently passes for a fresh one during a drag.
@@ -9967,12 +9972,7 @@ impl App {
                 painter.rect_filled(win, 0.0, egui::Color32::from_gray(26));
             }
         }
-        painter.rect_stroke(
-            win,
-            0.0,
-            egui::Stroke::new(1.0, theme::AMBER),
-            egui::StrokeKind::Inside,
-        );
+        painter.rect_stroke(win, 0.0, ring, egui::StrokeKind::Inside);
     }
 
     /// The brush: where a press lands on the negative, and the pass it builds.
@@ -12420,12 +12420,17 @@ impl App {
 
     /// The update sheet, reached from the badge, the menu route or Settings → About.
     ///
-    /// **Three choices, in order of caution.** *Update on quit* is the default and
-    /// the safest — the staged installer completes after a clean quit, never under
-    /// a live session. *Restart now* runs Sparkle's user-initiated install and is
-    /// offered only when the update is staged and the machine idle. *Skip this
-    /// version* is remembered and shown in Settings → About until the feed moves
-    /// past it.
+    /// **The only update window there is.** Sparkle runs with an in-app user
+    /// driver and draws nothing of its own, so a manual check's progress, "up to
+    /// date", an offer, download progress and failures all land here — see
+    /// `updater`. A check or download in flight can be canceled from here.
+    ///
+    /// **Three choices, in order of caution**, shown only while an update is on
+    /// offer. *Update on quit* is the default and the safest — the staged
+    /// installer completes after a clean quit, never under a live session.
+    /// *Restart now* installs and relaunches, downloading first if it has to, and
+    /// is offered only when the machine is idle. *Skip this version* is
+    /// remembered and shown in Settings → About until the feed moves past it.
     ///
     /// While an export writes, or the quit confirmation is still unanswered, both
     /// install routes stand down: an install must never race a file being written
@@ -12445,7 +12450,7 @@ impl App {
             self.update_sheet_open = false;
             return;
         }
-        let (version_line, notes, date, status, failed, skip_warning) = {
+        let (version_line, notes, date, status, failed, skip_warning, offer, cancelable) = {
             let u = self.updates.as_ref().expect("checked above");
             (
                 u.sheet_version_line(),
@@ -12454,6 +12459,8 @@ impl App {
                 u.sheet_status().map(str::to_owned),
                 u.badge().is_some_and(|b| b.failed),
                 u.skip_warning_active(),
+                u.has_offer(),
+                u.cancelable(),
             )
         };
         // **Busy is the export thread or an unresolved quit confirmation.** A
@@ -12467,6 +12474,7 @@ impl App {
         let mut update_on_quit = false;
         let mut restart_now = false;
         let mut skip = false;
+        let mut cancel = false;
         let response = egui::Modal::new(egui::Id::new("update-sheet")).show(ctx, |ui| {
             ui.set_width(420.0);
             theme::tracked(ui, "SOFTWARE UPDATE", theme::AMBER);
@@ -12493,7 +12501,7 @@ impl App {
                     theme::caption(line.clone())
                 });
             }
-            if busy && !skip_warning {
+            if busy && offer && !skip_warning {
                 ui.add_space(6.0);
                 ui.label(theme::caption(
                     "Wait for the export to finish — and answer the quit prompt if one is \
@@ -12501,12 +12509,18 @@ impl App {
                 ));
             }
             ui.add_space(10.0);
-            if skip_warning || failed {
-                // Nothing is staged to install: a rejected or failed update, or a
-                // skip Sparkle has not confirmed. Settings can stop skipping later.
-                if ui.button("Close").clicked() {
-                    close = true;
-                }
+            if skip_warning || failed || !offer {
+                // Nothing to install: a check that is running or found nothing, a
+                // rejected or failed update, or a skip Sparkle has not confirmed.
+                // Settings can stop skipping later.
+                ui.horizontal(|ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                    if cancelable && ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
             } else {
                 ui.horizontal(|ui| {
                     // The default choice, first and safest. Installs after a clean
@@ -12527,6 +12541,11 @@ impl App {
                         .clicked()
                     {
                         restart_now = true;
+                    }
+                    // A download the sheet started can still be stopped before it
+                    // is unpacked; the offer stays for the next check.
+                    if cancelable && ui.button("Cancel").clicked() {
+                        cancel = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Skip this version").clicked() {
@@ -12555,10 +12574,14 @@ impl App {
         if restart_now {
             close = true;
             if let Some(updates) = &mut self.updates
-                && let Some(why) = updates.check_now(&mut self.settings)
+                && let Some(why) = updates.restart_now()
             {
                 note = Some(why);
             }
+        }
+        if cancel && let Some(updates) = &mut self.updates {
+            updates.cancel();
+            note = updates.sheet_status().map(str::to_owned);
         }
         if skip {
             if let Some(updates) = &mut self.updates {

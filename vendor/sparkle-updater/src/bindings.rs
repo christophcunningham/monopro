@@ -1,7 +1,7 @@
 use objc2::rc::Retained;
 use objc2::runtime::NSObject;
 use objc2::{extern_class, extern_methods, MainThreadOnly};
-use objc2_foundation::{NSDate, NSDictionary, NSError, NSNumber, NSString, NSURL};
+use objc2_foundation::{NSBundle, NSDate, NSDictionary, NSError, NSNumber, NSString, NSURL};
 
 extern_class!(
     #[unsafe(super(NSObject))]
@@ -39,6 +39,18 @@ extern_class!(
 
 impl SPUUpdater {
     extern_methods!(
+        /// The updater without `SPUStandardUpdaterController`, so the user
+        /// driver is the caller's. Sparkle holds `user_driver` strongly and
+        /// `delegate` weakly.
+        #[unsafe(method(initWithHostBundle:applicationBundle:userDriver:delegate:))]
+        pub fn init_with_host_bundle(
+            this: objc2::rc::Allocated<Self>,
+            host_bundle: &NSBundle,
+            application_bundle: &NSBundle,
+            user_driver: &NSObject,
+            delegate: Option<&NSObject>,
+        ) -> Retained<Self>;
+
         #[unsafe(method(canCheckForUpdates))]
         pub fn can_check_for_updates(&self) -> bool;
 

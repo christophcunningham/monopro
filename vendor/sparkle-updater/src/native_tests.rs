@@ -8,6 +8,7 @@ mod callbacks;
 mod delegate;
 #[allow(unused_imports)]
 mod events;
+mod user_driver;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -15,13 +16,14 @@ use std::rc::Rc;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
-use objc2::{msg_send, MainThreadMarker, MainThreadOnly};
-use objc2_foundation::{NSDictionary, NSString};
+use objc2::{msg_send, ClassType, MainThreadMarker, MainThreadOnly};
+use objc2_foundation::{NSDictionary, NSError, NSString};
 
 use bindings::{SPUAppcastItem, SPUUserUpdateState};
 use callbacks::{GentleReminders, RelaunchContinuation};
 use delegate::SparkleDelegate;
 use events::{UpdateEvent, UpdateInfo, UserUpdateStage, UserUpdateState};
+use user_driver::{InAppUserDriver, Prompt, UpdateChoice};
 
 fn update_item(mtm: MainThreadMarker) -> Retained<SPUAppcastItem> {
     let version_key = NSString::from_str("sparkle:version");
@@ -149,6 +151,121 @@ fn main() {
         };
         assert!(!postponed);
         assert_eq!(calls.get(), 1);
-        println!("native selectors: state object, gentle reminders, deferred and synchronous relaunch passed");
+
+        in_app_user_driver(mtm, &item, &state);
+        println!("native selectors: state object, gentle reminders, deferred and synchronous relaunch, in-app user driver passed");
     });
+}
+
+/// The in-app driver against the real selectors Sparkle sends: every prompt
+/// reaches the host, every reply is held until the host answers it once, and
+/// nothing survives Sparkle dismissing the session.
+fn in_app_user_driver(
+    mtm: MainThreadMarker,
+    item: &SPUAppcastItem,
+    state: &SPUUserUpdateState,
+) {
+    let missing = user_driver::missing_user_driver_methods();
+    assert!(missing.is_empty(), "the in-app driver lacks {missing:?}");
+
+    let prompts: Rc<RefCell<Vec<Prompt>>> = Rc::new(RefCell::new(Vec::new()));
+    let captured = prompts.clone();
+    let driver = InAppUserDriver::new(mtm, Rc::new(move |p| captured.borrow_mut().push(p)));
+
+    // An update found: the prompt carries the item and state, the reply
+    // waits, and the answer is delivered once with Sparkle's raw choice.
+    let choice = Rc::new(Cell::new(-1isize));
+    let captured = choice.clone();
+    let reply = RcBlock::new(move |c: isize| captured.set(c));
+    unsafe {
+        let _: () = msg_send![&*driver, showUpdateFoundWithAppcastItem: item, state: state, reply: &*reply];
+    }
+    drop(reply);
+    match prompts.borrow().last() {
+        Some(Prompt::UpdateFound { update, state }) => {
+            assert_eq!(update.version, "2.0");
+            assert_eq!(state.stage, UserUpdateStage::Downloaded);
+            assert!(state.user_initiated);
+        }
+        other => panic!("expected UpdateFound, got {other:?}"),
+    }
+    assert!(driver.awaiting_update_answer());
+    assert_eq!(choice.get(), -1, "nothing is answered on the host's behalf");
+    assert!(driver.answer_update(UpdateChoice::Skip));
+    assert_eq!(choice.get(), 0);
+    assert!(!driver.answer_update(UpdateChoice::Install), "a reply is one-shot");
+    assert_eq!(choice.get(), 0);
+
+    // Ready to install: the same, through its own slot.
+    let captured = choice.clone();
+    let reply = RcBlock::new(move |c: isize| captured.set(c));
+    unsafe {
+        let _: () = msg_send![&*driver, showReadyToInstallAndRelaunch: &*reply];
+    }
+    assert!(matches!(prompts.borrow().last(), Some(Prompt::ReadyToInstall)));
+    assert!(driver.awaiting_install_answer());
+    assert!(driver.answer_ready_to_install(UpdateChoice::Install));
+    assert_eq!(choice.get(), 1);
+
+    // Not found: reported, then acknowledged without waiting on the host.
+    let acknowledged = Rc::new(Cell::new(false));
+    let captured = acknowledged.clone();
+    let ack = RcBlock::new(move || captured.set(true));
+    let domain = NSString::from_str("SUSparkleErrorDomain");
+    let error: Retained<NSError> = unsafe {
+        msg_send![NSError::class(), errorWithDomain: &*domain, code: 1001isize, userInfo: None::<&NSObject>]
+    };
+    unsafe {
+        let _: () = msg_send![&*driver, showUpdateNotFoundWithError: &*error, acknowledgement: &*ack];
+    }
+    assert!(acknowledged.get());
+    assert!(matches!(prompts.borrow().last(), Some(Prompt::NotFound(e)) if e.code == 1001));
+
+    // A download can be canceled until extraction starts, and only once.
+    let canceled = Rc::new(Cell::new(0));
+    let captured = canceled.clone();
+    let cancel = RcBlock::new(move || captured.set(captured.get() + 1));
+    unsafe {
+        let _: () = msg_send![&*driver, showDownloadInitiatedWithCancellation: &*cancel];
+        let _: () = msg_send![&*driver, showDownloadDidReceiveExpectedContentLength: 2048u64];
+        let _: () = msg_send![&*driver, showDownloadDidReceiveDataOfLength: 1024u64];
+    }
+    assert!(matches!(prompts.borrow().last(), Some(Prompt::DownloadReceived(1024))));
+    assert!(driver.cancel());
+    assert!(!driver.cancel());
+    assert_eq!(canceled.get(), 1);
+    unsafe {
+        let _: () = msg_send![&*driver, showDownloadInitiatedWithCancellation: &*cancel];
+        let _: () = msg_send![&*driver, showDownloadDidStartExtractingUpdate];
+    }
+    assert!(!driver.cancel(), "extraction ends the window for canceling");
+    assert_eq!(canceled.get(), 1);
+
+    // Dismissal voids a waiting reply without calling it.
+    let captured = choice.clone();
+    let reply = RcBlock::new(move |c: isize| captured.set(c + 100));
+    unsafe {
+        let _: () = msg_send![&*driver, showUpdateFoundWithAppcastItem: item, state: state, reply: &*reply];
+        let _: () = msg_send![&*driver, dismissUpdateInstallation];
+    }
+    assert!(matches!(prompts.borrow().last(), Some(Prompt::Dismissed)));
+    assert!(!driver.awaiting_update_answer());
+    assert!(!driver.answer_update(UpdateChoice::Install));
+    assert_eq!(choice.get(), 1);
+
+    // The permission request is answered with a real Sparkle response.
+    let automatic = Rc::new(Cell::new(None));
+    let captured = automatic.clone();
+    let reply = RcBlock::new(move |response: *mut AnyObject| {
+        assert!(!response.is_null());
+        let checks: bool = unsafe { msg_send![&*response, automaticUpdateChecks] };
+        captured.set(Some(checks));
+    });
+    let request = NSObject::new();
+    unsafe {
+        let _: () = msg_send![&*driver, showUpdatePermissionRequest: &*request, reply: &*reply];
+    }
+    assert!(matches!(prompts.borrow().last(), Some(Prompt::PermissionRequest)));
+    assert!(driver.answer_permission(false));
+    assert_eq!(automatic.get(), Some(false));
 }

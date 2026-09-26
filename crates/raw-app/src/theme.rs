@@ -97,7 +97,9 @@ pub const RUBY_FILL_DIM: Color32 = Color32::from_rgb(0x38, 0x20, 0x1F);
 /// chip changed how a number reads mid-edit.
 pub const RUBY_GROUND: Color32 = Color32::from_rgb(0x44, 0x27, 0x27);
 
-/// The grain loupe's ring and its caption. The prototype's amber, transcribed.
+/// The grain loupe's ring and its caption. The prototype's amber, transcribed. While
+/// the loupe shows Before — the crop without grain and sharpening — its strokes turn
+/// [`BRIGHT`] instead, so the two crops cannot be confused.
 ///
 /// **Not [`RUBY`], deliberately.** Ruby means "something is on that would not be on
 /// by default" — a mode, an overlay, a modified module — and it is the colour every

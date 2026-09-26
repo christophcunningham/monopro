@@ -73,8 +73,18 @@ Changed
   which file is in front.
 - American spelling throughout: Center in contact sheet captions, Digitized in
   Digital Source Type, canceled in update messages.
+- The Print Loupe's outline is white while it shows Before (grain and sharpening
+  off) and amber while it shows the print, so the two are never confused.
+- Software updates stay inside the monopro window. Check for Updates, the update
+  offer, download progress, "up to date" and update errors all appear in the
+  Software Update sheet, which can also cancel a check or download in progress.
+  Restart now can install an update that has not been downloaded yet.
 
 Fixed
+- Checking for updates no longer opens a separate system alert on top of the
+  Software Update sheet.
+- The Software Update sheet no longer offers Update on quit, Restart now and Skip
+  this version when there is no update to act on.
 - Squeezing Develop off the left edge no longer squeezes the image after it and
   hands the whole window to the right-hand panels.
 - A panel brought back from the edge returns at no less than its default width,

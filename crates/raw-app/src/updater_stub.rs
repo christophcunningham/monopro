@@ -51,6 +51,10 @@ impl Updates {
         false
     }
 
+    pub fn has_offer(&self) -> bool {
+        false
+    }
+
     pub fn skip_warning_active(&self) -> bool {
         false
     }
@@ -75,7 +79,17 @@ impl Updates {
         false
     }
 
+    pub fn cancelable(&self) -> bool {
+        false
+    }
+
     pub fn choose_update_on_quit(&mut self) {}
+
+    pub fn restart_now(&mut self) -> Option<String> {
+        Some("updates are not available on this platform yet".to_owned())
+    }
+
+    pub fn cancel(&mut self) {}
 
     pub fn check_now(&mut self, _config: &mut Settings) -> Option<String> {
         Some("updates are not available on this platform yet".to_owned())

@@ -4,29 +4,15 @@ use std::rc::Rc;
 
 use log::warn;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject};
-use objc2::{msg_send, sel, ClassType, MainThreadMarker};
+use objc2::runtime::NSObject;
+use objc2::{msg_send, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_foundation::{NSBundle, NSDictionary, NSError, NSString, NSURL};
 
 use super::bindings::{SPUStandardUpdaterController, SPUUpdater};
 use super::delegate::{EventCallback, SparkleDelegate};
+use super::user_driver::{InAppUserDriver, PromptCallback, UpdateChoice};
 use crate::events::UpdateInfo;
 use crate::{Error, GentleReminders, RelaunchHandler, Result};
-
-/// What [`SparkleUpdater::skip_current_update`] was able to do.
-///
-/// `NoAlert` and `Unsupported` are different facts and must not be collapsed:
-/// the first is ordinary timing and worth retrying, the second means this
-/// binding and the linked framework have drifted and retrying cannot help.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkipOutcome {
-    /// The pending alert was answered with Skip.
-    Sent,
-    /// No alert is waiting to be answered yet.
-    NoAlert,
-    /// An alert is waiting but does not answer `skipThisVersion:`.
-    Unsupported,
-}
 
 fn is_valid_bundle() -> bool {
     unsafe {
@@ -54,7 +40,14 @@ fn is_valid_bundle() -> bool {
 pub struct UpdaterConfig {
     pub event_callback: Option<EventCallback>,
     pub relaunch_handler: Option<RelaunchHandler>,
+    /// Consulted only by Sparkle's standard user driver, so ignored when
+    /// `prompt_callback` is set.
     pub gentle_reminders: Option<Rc<dyn GentleReminders>>,
+    /// `Some` replaces Sparkle's standard user driver with an in-app one:
+    /// Sparkle draws no window at all, and every prompt — user-initiated or
+    /// scheduled — arrives here to be presented by the host and answered
+    /// through [`SparkleUpdater`]. See [`crate::Prompt`].
+    pub prompt_callback: Option<PromptCallback>,
 }
 
 /// Starts Sparkle with an optional event listener. Returns `None` outside an app bundle.
@@ -87,19 +80,35 @@ fn initialize(mtm: MainThreadMarker, config: UpdaterConfig) -> Result<Option<Spa
     delegate.set_relaunch_handler(config.relaunch_handler);
     delegate.set_gentle_reminders(config.gentle_reminders);
 
-    let controller = unsafe {
-        let alloc: objc2::rc::Allocated<SPUStandardUpdaterController> =
-            objc2::msg_send![SPUStandardUpdaterController::class(), alloc];
-        let delegate_obj: &NSObject = &delegate;
-        SPUStandardUpdaterController::init_with_starting_updater(
-            alloc,
-            false,
-            Some(delegate_obj),
-            Some(delegate_obj),
-        )
+    let delegate_obj: &NSObject = &delegate;
+    let (updater, controller, user_driver) = match config.prompt_callback {
+        Some(prompts) => {
+            let driver = InAppUserDriver::new(mtm, prompts);
+            let bundle = NSBundle::mainBundle();
+            let updater = SPUUpdater::init_with_host_bundle(
+                SPUUpdater::alloc(mtm),
+                &bundle,
+                &bundle,
+                &driver,
+                Some(delegate_obj),
+            );
+            (updater, None, Some(driver))
+        }
+        None => {
+            let controller = unsafe {
+                let alloc: objc2::rc::Allocated<SPUStandardUpdaterController> =
+                    objc2::msg_send![SPUStandardUpdaterController::class(), alloc];
+                SPUStandardUpdaterController::init_with_starting_updater(
+                    alloc,
+                    false,
+                    Some(delegate_obj),
+                    Some(delegate_obj),
+                )
+            };
+            (controller.updater(), Some(controller), None)
+        }
     };
 
-    let updater: Retained<SPUUpdater> = controller.updater();
     let mut error: *mut NSError = ptr::null_mut();
     let success = updater.start_updater(&mut error);
 
@@ -114,7 +123,9 @@ fn initialize(mtm: MainThreadMarker, config: UpdaterConfig) -> Result<Option<Spa
     }
 
     Ok(Some(SparkleUpdater {
-        controller,
+        updater,
+        _controller: controller,
+        user_driver,
         delegate,
     }))
 }
@@ -147,12 +158,17 @@ fn check_info_plist_keys() {
     }
 }
 
-/// Owns Sparkle's controller and delegates on the macOS main thread.
+/// Owns Sparkle's updater, user driver and delegate on the macOS main thread.
 ///
 /// This type is neither `Send` nor `Sync`. Keep it alive for the application's
 /// lifetime; callers must provide an AppKit event loop and a signed app bundle.
 pub struct SparkleUpdater {
-    controller: Retained<SPUStandardUpdaterController>,
+    updater: Retained<SPUUpdater>,
+    /// Owns the standard user driver when Sparkle draws its own windows.
+    /// Held only to keep it alive; every call goes to `updater`.
+    _controller: Option<Retained<SPUStandardUpdaterController>>,
+    /// The in-app driver, when the host asked for one.
+    user_driver: Option<Retained<InAppUserDriver>>,
     delegate: Retained<SparkleDelegate>,
 }
 
@@ -169,52 +185,68 @@ impl SparkleUpdater {
         self.delegate.set_relaunch_handler(handler);
     }
 
-    fn with_controller<T>(&self, f: impl FnOnce(&SPUStandardUpdaterController) -> T) -> T {
-        f(&self.controller)
+    fn with_updater<T>(&self, f: impl FnOnce(&SPUUpdater) -> T) -> T {
+        f(&self.updater)
     }
 
     fn with_delegate<T>(&self, f: impl FnOnce(&SparkleDelegate) -> T) -> T {
         f(&self.delegate)
     }
 
+    /// A user-initiated check. With the standard driver Sparkle shows its
+    /// own progress, result and alerts; with the in-app driver each arrives
+    /// as a [`crate::Prompt`].
     pub fn check_for_updates(&self) -> Result<()> {
-        self.with_controller(|c| c.check_for_updates(None));
+        self.with_updater(|u| u.check_for_updates());
         Ok(())
     }
 
     pub fn check_for_updates_in_background(&self) -> Result<()> {
-        self.with_controller(|c| c.updater().check_for_updates_in_background());
+        self.with_updater(|u| u.check_for_updates_in_background());
         Ok(())
     }
 
-    /// Answers Sparkle's pending update alert with the user's Skip choice.
-    ///
-    /// The standard user driver holds the reply block that reaches the update
-    /// driver. This sends the same Skip action the alert's "Skip This Version"
-    /// button sends, so Sparkle records its own skipped version and, when an
-    /// update has already been staged for install-on-quit, cancels that staged
-    /// installation instead of letting it run at quit.
-    ///
-    /// `activeUpdateAlert` is declared in the Sparkle framework's shipped
-    /// private headers; the pinned framework version is part of this binding.
-    pub fn skip_current_update(&self) -> Result<SkipOutcome> {
-        let user_driver: Retained<NSObject> = unsafe { msg_send![&*self.controller, userDriver] };
-        let alert: Option<Retained<NSObject>> =
-            unsafe { msg_send![&*user_driver, activeUpdateAlert] };
-        let Some(alert) = alert else {
-            return Ok(SkipOutcome::NoAlert);
-        };
-        let responds: bool =
-            unsafe { msg_send![&*alert, respondsToSelector: sel!(skipThisVersion:)] };
-        if !responds {
-            return Ok(SkipOutcome::Unsupported);
-        }
-        let _: () = unsafe { msg_send![&*alert, skipThisVersion: None::<&AnyObject>] };
-        Ok(SkipOutcome::Sent)
+    /// Answer the waiting [`crate::Prompt::UpdateFound`]. `Ok(false)` when
+    /// none waits — Sparkle ended the session, or it was already answered.
+    /// Only the in-app driver has prompts to answer.
+    pub fn answer_update(&self, choice: UpdateChoice) -> Result<bool> {
+        Ok(self.in_app_driver()?.answer_update(choice))
+    }
+
+    /// Answer the waiting [`crate::Prompt::ReadyToInstall`]. `Ok(false)` when
+    /// none waits.
+    pub fn answer_ready_to_install(&self, choice: UpdateChoice) -> Result<bool> {
+        Ok(self.in_app_driver()?.answer_ready_to_install(choice))
+    }
+
+    /// Answer the waiting [`crate::Prompt::PermissionRequest`]. The system
+    /// profile is never sent. `Ok(false)` when none waits.
+    pub fn answer_permission(&self, automatic_checks: bool) -> Result<bool> {
+        Ok(self.in_app_driver()?.answer_permission(automatic_checks))
+    }
+
+    /// Cancel the running user-initiated check, or a download that has not
+    /// begun extracting. `Ok(false)` when there is nothing to cancel.
+    pub fn cancel(&self) -> Result<bool> {
+        Ok(self.in_app_driver()?.cancel())
+    }
+
+    /// Whether a [`crate::Prompt::UpdateFound`] is waiting for its answer.
+    pub fn awaiting_update_answer(&self) -> Result<bool> {
+        Ok(self.in_app_driver()?.awaiting_update_answer())
+    }
+
+    /// Whether a [`crate::Prompt::ReadyToInstall`] is waiting for its answer.
+    pub fn awaiting_install_answer(&self) -> Result<bool> {
+        Ok(self.in_app_driver()?.awaiting_install_answer())
+    }
+
+    fn in_app_driver(&self) -> Result<&InAppUserDriver> {
+        self.user_driver.as_deref().ok_or(Error::NoInAppDriver)
     }
 
     pub fn can_check_for_updates(&self) -> Result<bool> {
-        Ok(self.with_controller(|c| c.updater().can_check_for_updates()))
+        Ok(self.with_updater(|u| u.can_check_for_updates()))
     }
 
     pub fn current_version(&self) -> Result<String> {
@@ -228,8 +260,8 @@ impl SparkleUpdater {
     }
 
     pub fn feed_url(&self) -> Result<Option<String>> {
-        Ok(self.with_controller(|c| {
-            c.updater().feed_url().and_then(|url| {
+        Ok(self.with_updater(|u| {
+            u.feed_url().and_then(|url| {
                 let abs: Option<Retained<NSString>> =
                     unsafe { objc2::msg_send![&url, absoluteString] };
                 abs.map(|s| s.to_string())
@@ -241,38 +273,38 @@ impl SparkleUpdater {
         url::Url::parse(url).map_err(|_| Error::InvalidFeedUrl(url.to_string()))?;
         let url_string = url.to_string();
 
-        self.with_controller(move |c| {
+        self.with_updater(move |u| {
             let ns_string = NSString::from_str(&url_string);
             let ns_url: Option<Retained<NSURL>> =
                 unsafe { objc2::msg_send![NSURL::class(), URLWithString: &*ns_string] };
             if let Some(url) = ns_url {
-                c.updater().set_feed_url(Some(&url));
+                u.set_feed_url(Some(&url));
             }
         });
         Ok(())
     }
 
     pub fn automatically_checks_for_updates(&self) -> Result<bool> {
-        Ok(self.with_controller(|c| c.updater().automatically_checks_for_updates()))
+        Ok(self.with_updater(|u| u.automatically_checks_for_updates()))
     }
 
     pub fn set_automatically_checks_for_updates(&self, enabled: bool) -> Result<()> {
-        self.with_controller(|c| c.updater().set_automatically_checks_for_updates(enabled));
+        self.with_updater(|u| u.set_automatically_checks_for_updates(enabled));
         Ok(())
     }
 
     pub fn automatically_downloads_updates(&self) -> Result<bool> {
-        Ok(self.with_controller(|c| c.updater().automatically_downloads_updates()))
+        Ok(self.with_updater(|u| u.automatically_downloads_updates()))
     }
 
     pub fn set_automatically_downloads_updates(&self, enabled: bool) -> Result<()> {
-        self.with_controller(|c| c.updater().set_automatically_downloads_updates(enabled));
+        self.with_updater(|u| u.set_automatically_downloads_updates(enabled));
         Ok(())
     }
 
     pub fn last_update_check_date(&self) -> Result<Option<f64>> {
-        Ok(self.with_controller(|c| {
-            c.updater().last_update_check_date().map(|date| {
+        Ok(self.with_updater(|u| {
+            u.last_update_check_date().map(|date| {
                 let seconds: f64 = unsafe { objc2::msg_send![&date, timeIntervalSince1970] };
                 seconds * 1000.0
             })
@@ -280,31 +312,31 @@ impl SparkleUpdater {
     }
 
     pub fn reset_update_cycle(&self) -> Result<()> {
-        self.with_controller(|c| c.updater().reset_update_cycle());
+        self.with_updater(|u| u.reset_update_cycle());
         Ok(())
     }
 
     pub fn update_check_interval(&self) -> Result<f64> {
-        Ok(self.with_controller(|c| c.updater().update_check_interval()))
+        Ok(self.with_updater(|u| u.update_check_interval()))
     }
 
     pub fn set_update_check_interval(&self, interval: f64) -> Result<()> {
-        self.with_controller(|c| c.updater().set_update_check_interval(interval));
+        self.with_updater(|u| u.set_update_check_interval(interval));
         Ok(())
     }
 
     pub fn check_for_update_information(&self) -> Result<()> {
-        self.with_controller(|c| c.updater().check_for_update_information());
+        self.with_updater(|u| u.check_for_update_information());
         Ok(())
     }
 
     pub fn session_in_progress(&self) -> Result<bool> {
-        Ok(self.with_controller(|c| c.updater().session_in_progress()))
+        Ok(self.with_updater(|u| u.session_in_progress()))
     }
 
     pub fn http_headers(&self) -> Result<Option<HashMap<String, String>>> {
-        Ok(self.with_controller(|c| {
-            c.updater().http_headers().map(|dict| {
+        Ok(self.with_updater(|u| {
+            u.http_headers().map(|dict| {
                 let mut map = HashMap::new();
                 let count: usize = unsafe { objc2::msg_send![&dict, count] };
                 if count > 0 {
@@ -325,7 +357,7 @@ impl SparkleUpdater {
     }
 
     pub fn set_http_headers(&self, headers: Option<HashMap<String, String>>) -> Result<()> {
-        self.with_controller(move |c| {
+        self.with_updater(move |u| {
             let ns_dict = headers.map(|h| {
                 let keys: Vec<Retained<NSString>> =
                     h.keys().map(|k| NSString::from_str(k)).collect();
@@ -335,37 +367,36 @@ impl SparkleUpdater {
                 let value_refs: Vec<&NSString> = values.iter().map(|v| v.as_ref()).collect();
                 NSDictionary::from_slices(&key_refs, &value_refs)
             });
-            c.updater().set_http_headers(ns_dict.as_deref());
+            u.set_http_headers(ns_dict.as_deref());
         });
         Ok(())
     }
 
     pub fn user_agent_string(&self) -> Result<String> {
-        Ok(self.with_controller(|c| c.updater().user_agent_string().to_string()))
+        Ok(self.with_updater(|u| u.user_agent_string().to_string()))
     }
 
     pub fn set_user_agent_string(&self, user_agent: &str) -> Result<()> {
         let ua = user_agent.to_string();
-        self.with_controller(move |c| {
+        self.with_updater(move |u| {
             let ns_string = NSString::from_str(&ua);
-            c.updater().set_user_agent_string(&ns_string);
+            u.set_user_agent_string(&ns_string);
         });
         Ok(())
     }
 
     pub fn sends_system_profile(&self) -> Result<bool> {
-        Ok(self.with_controller(|c| c.updater().sends_system_profile()))
+        Ok(self.with_updater(|u| u.sends_system_profile()))
     }
 
     pub fn set_sends_system_profile(&self, sends: bool) -> Result<()> {
-        self.with_controller(|c| c.updater().set_sends_system_profile(sends));
+        self.with_updater(|u| u.set_sends_system_profile(sends));
         Ok(())
     }
 
     pub fn clear_feed_url_from_user_defaults(&self) -> Result<Option<String>> {
-        Ok(self.with_controller(|c| {
-            c.updater()
-                .clear_feed_url_from_user_defaults()
+        Ok(self.with_updater(|u| {
+            u.clear_feed_url_from_user_defaults()
                 .and_then(|url| {
                     let abs: Option<Retained<NSString>> =
                         unsafe { objc2::msg_send![&url, absoluteString] };
@@ -375,7 +406,7 @@ impl SparkleUpdater {
     }
 
     pub fn reset_update_cycle_after_short_delay(&self) -> Result<()> {
-        self.with_controller(|c| c.updater().reset_update_cycle_after_short_delay());
+        self.with_updater(|u| u.reset_update_cycle_after_short_delay());
         Ok(())
     }
 

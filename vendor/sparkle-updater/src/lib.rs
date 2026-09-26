@@ -7,13 +7,15 @@ mod delegate;
 mod error;
 pub mod events;
 mod updater;
+mod user_driver;
 
 pub use callbacks::{GentleReminders, RelaunchContinuation, RelaunchHandler};
 pub use delegate::EventCallback;
 pub use error::{Error, Result};
 pub use events::{UpdateEvent, UserUpdateStage, UserUpdateState};
 pub use objc2::MainThreadMarker;
-pub use updater::{init, SkipOutcome, SparkleUpdater, UpdaterConfig};
+pub use updater::{init, SparkleUpdater, UpdaterConfig};
+pub use user_driver::{missing_user_driver_methods, Prompt, PromptCallback, UpdateChoice};
 
 #[cfg(test)]
 mod tests {

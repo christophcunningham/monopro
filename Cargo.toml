@@ -82,11 +82,12 @@ roxmltree = "0.21"
 thiserror = "2"
 pollster = "0.4"
 
-# `sparkle-updater` 0.1.0, vendored, for one binding the release lacks:
-# `skip_current_update`, which answers Sparkle's pending update alert with Skip
-# so a staged install is canceled rather than run at quit. The single delta and
-# provenance are in vendor/sparkle-updater/LOCAL-PATCH.md; the private APIs it
-# touches are pinned by the Sparkle 2.9.6 framework in packaging/macos/Sparkle.
+# `sparkle-updater` 0.1.0, vendored, for what the release lacks: an in-app user
+# driver, so Sparkle draws no window of its own and each prompt — including the
+# offer whose Skip answer cancels a staged install — is answered by monopro's
+# update sheet. The delta and provenance are in vendor/sparkle-updater/LOCAL-PATCH.md;
+# the protocol it implements is pinned by the Sparkle 2.9.6 framework in
+# packaging/macos/Sparkle.
 [patch.crates-io]
 sparkle-updater = { path = "vendor/sparkle-updater" }
 # `egui_tiles` 0.16.0, vendored so a tab bar's scroll arrows step one tab at a

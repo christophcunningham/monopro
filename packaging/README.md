@@ -51,17 +51,17 @@ macOS builds carry a [Sparkle](https://sparkle-project.org) 2 updater with a
 Mole-like surface: a silent daily background check that shows nothing when up to
 date, a badge at the right end of the title strip when an update exists, and a
 sheet offering *Update on quit* (default), *Restart now* (idle only) and *Skip
-this version*. The binding is [`sparkle-updater`
-0.1.0](https://crates.io/crates/sparkle-updater), chosen over
-`slint-ui/sparklers` because it registers as the user-driver delegate and can
-keep Sparkle's own alerts off scheduled checks. It is vendored at
-`vendor/sparkle-updater` with one local addition — `skip_current_update`, which
-answers Sparkle's pending alert with its own Skip choice so a skipped update
-that was already staged for install-on-quit is canceled. Upstream 0.1.0 cannot
-reach that reply; `vendor/sparkle-updater/LOCAL-PATCH.md` records the delta and
-the private APIs it depends on. Feed hosting is a single stable, unversioned URL
-— the `releases/latest/download/appcast.xml` alias of the release assets —
-because the URL is baked into each shipped bundle.
+this version*. Sparkle draws no window of its own: a manual check, its result,
+download progress and errors all appear in that sheet. The binding is
+[`sparkle-updater` 0.1.0](https://crates.io/crates/sparkle-updater), chosen over
+`slint-ui/sparklers` because its user-driver side can be taken over. It is
+vendored at `vendor/sparkle-updater` with one local addition — an in-app
+implementation of Sparkle's `SPUUserDriver` protocol, which hands every prompt to
+the app and holds Sparkle's reply until the sheet answers it. That reply is also
+how *Skip this version* cancels an update already staged for install on quit.
+`vendor/sparkle-updater/LOCAL-PATCH.md` records the delta. Feed hosting is a
+single stable, unversioned URL — the `releases/latest/download/appcast.xml` alias
+of the release assets — because the URL is baked into each shipped bundle.
 
 Everything Sparkle needs is vendored and pinned in `packaging/macos/Sparkle/`:
 
