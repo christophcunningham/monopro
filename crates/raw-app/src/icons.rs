@@ -252,6 +252,14 @@ const SOURCES: &[(&str, &str)] = &[
         "rectangle-dashed",
         include_str!("../../../icons/rectangle-dashed.svg"),
     ),
+    // The title strip's Home: the start page, from Lightbox or over Develop's tabs.
+    ("house", include_str!("../../../icons/house-simple.svg")),
+    // The start page's Open Image row. A camera with a plus is "bring a picture in",
+    // which says more than a folder does about what the dialog is for.
+    (
+        "camera-plus",
+        include_str!("../../../icons/camera-plus.svg"),
+    ),
 ];
 
 pub struct Icons {

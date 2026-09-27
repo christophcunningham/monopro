@@ -70,6 +70,9 @@ pub enum Action {
     CaptureSnapshot,
     Lightbox,
     Develop,
+    /// The start page: in Lightbox it chooses no folder, in Develop it lays the page
+    /// over the open tabs and takes it off again. The title strip's Home button.
+    Home,
     ValuePinMode,
     ToggleValuePins,
     Crop,
@@ -498,6 +501,17 @@ pub const TABLE: &[Binding] = &[
         None,
         "e",
         "Bring the Develop panel forward",
+        Navigation,
+        true,
+    ),
+    // **`⌥H`, the maintainer's chord**, and the one Option binding outside the brush.
+    // Kept out of text fields in `pressed`: on macOS it types `˙`.
+    b(
+        Action::Home,
+        Key::H,
+        Alt,
+        "h",
+        "Home — the start page",
         Navigation,
         true,
     ),
@@ -1185,9 +1199,13 @@ pub fn pressed(ctx: &egui::Context, modal: bool, enabled: bool) -> Vec<Action> {
             .iter()
             .filter(|bind| enabled || bind.action == Action::Settings)
             .filter(|bind| {
+                // Home too: on macOS `⌥H` types `˙`, so in a text field it is a letter.
                 !(typing
                     && (bind.mods.is_typing()
-                        || matches!(bind.action, Action::Undo | Action::Redo | Action::SelectAll)))
+                        || matches!(
+                            bind.action,
+                            Action::Undo | Action::Redo | Action::SelectAll | Action::Home
+                        )))
             })
             .filter(|bind| {
                 if bind.modal {
@@ -1372,6 +1390,14 @@ mod tests {
     /// Draw a widget, give it focus, press `key`, and report what `pressed` made of
     /// it. Two passes because egui applies a focus request on the frame after it.
     fn with_focus_on(text_field: bool, key: egui::Key) -> Vec<Action> {
+        with_focus_on_holding(text_field, key, egui::Modifiers::default())
+    }
+
+    fn with_focus_on_holding(
+        text_field: bool,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) -> Vec<Action> {
         let ctx = egui::Context::default();
         let (mut text, mut number) = (String::new(), 0.5f32);
         let mut got = Vec::new();
@@ -1389,10 +1415,15 @@ mod tests {
                         physical_key: Option::<egui::Key>::None,
                         pressed: true,
                         repeat: false,
-                        modifiers: egui::Modifiers::default(),
+                        modifiers,
                     }]
                 } else {
                     Vec::new()
+                },
+                modifiers: if pass == 1 {
+                    modifiers
+                } else {
+                    egui::Modifiers::default()
                 },
                 ..Default::default()
             };
@@ -1501,6 +1532,27 @@ mod tests {
         assert!(
             !with_focus_on(true, egui::Key::P).contains(&Action::PreviewOriginal),
             "`p` reached the table while a text field had focus — it is a letter there"
+        );
+    }
+
+    #[test]
+    fn option_h_goes_home_except_while_typing() {
+        let option = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(press(egui::Key::H, option, false), vec![Action::Home]);
+        assert!(
+            !press(egui::Key::H, egui::Modifiers::default(), false).contains(&Action::Home),
+            "a bare h went home"
+        );
+        assert!(
+            with_focus_on_holding(false, egui::Key::H, option).contains(&Action::Home),
+            "a focused slider kept ⌥H from going home"
+        );
+        assert!(
+            !with_focus_on_holding(true, egui::Key::H, option).contains(&Action::Home),
+            "⌥H types a character on macOS and must stay in the text field"
         );
     }
 

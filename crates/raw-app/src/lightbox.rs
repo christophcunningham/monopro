@@ -952,6 +952,8 @@ pub struct Lightbox {
     panels_hidden: bool,
     /// Folders you keep. Order is the order you added them.
     pub favorites: Vec<PathBuf>,
+    /// A click on the start page, waiting for `App` to carry it out.
+    pub splash: Option<crate::splash::Go>,
     /// The full-frame preview: which entry it is showing, and its texture.
     ///
     /// **`Space` opens it, `Space` or `Esc` closes it** — the pair every mode in this
@@ -1118,6 +1120,7 @@ impl Lightbox {
             tuck: Default::default(),
             panels_hidden: false,
             favorites: Vec::new(),
+            splash: None,
             preview: None,
             preview_textures: HashMap::new(),
             preview_failed: std::collections::HashSet::new(),
@@ -1267,7 +1270,12 @@ impl Lightbox {
     /// behavior needs `&mut Lightbox` and the tree lives on it — `Tree::ui` borrows
     /// the tree mutably at the same time. A cheap move of a small struct, and the
     /// alternative is putting the tree somewhere it does not belong.
-    pub fn ui(&mut self, ui: &mut egui::Ui, icons: &crate::icons::Icons) -> Option<PathBuf> {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        icons: &crate::icons::Icons,
+        recent: &[PathBuf],
+    ) -> Option<PathBuf> {
         self.commit_blurred_iptc(ui.ctx());
         self.poll_search();
         if self.search.busy() {
@@ -1280,7 +1288,7 @@ impl Lightbox {
         // `tab` leaves the grid and nothing else. Drawn directly rather than by
         // emptying the tree, so the arrangement that comes back is the one that left.
         if self.panels_hidden {
-            let open = self.grid_ui(ui, icons);
+            let open = self.grid_ui(ui, icons, recent);
             self.preload_selected();
             self.preview_ui(ui);
             self.rename_dialog_ui(ui.ctx());
@@ -1340,13 +1348,21 @@ impl Lightbox {
             tree_id,
             open: None,
             nav: None,
+            close: false,
+            recent,
             dropped: false,
             resizing: false,
             panel_width: sidebar_width,
         };
         let area = ui.available_rect_before_wrap();
         tree.ui(&mut panes, ui);
-        let (open, nav, dropped, resizing) = (panes.open, panes.nav, panes.dropped, panes.resizing);
+        let (open, nav, close, dropped, resizing) = (
+            panes.open,
+            panes.nav,
+            panes.close,
+            panes.dropped,
+            panes.resizing,
+        );
         self.tree = tree;
         if let Some(grid) = self.tree.tiles.find_pane(&Pane::Grid) {
             // Outside `input`: ending the drag writes to the context `input` reads.
@@ -1369,6 +1385,8 @@ impl Lightbox {
 
         if let Some(dir) = nav {
             self.open_folder(&dir);
+        } else if close {
+            self.close_folder();
         }
         // Selection itself begins Quick Look's load. By the time `Space` is pressed,
         // the disk read is commonly already complete rather than only just starting.
@@ -2715,6 +2733,35 @@ impl Lightbox {
         if self.sort == Sort::Captured {
             self.sweep_dates();
         }
+    }
+
+    /// Choose no folder, which puts the start page where the grid was.
+    ///
+    /// Reached from the Home button and from clicking the empty space under the folder
+    /// tree. Everything [`Self::open_folder`] would replace is dropped rather than
+    /// kept, because each of it indexes into a folder that is no longer open: the
+    /// entries, their thumbnails, the selection, the manual order, and a re-read of
+    /// the old folder still in flight.
+    pub fn close_folder(&mut self) {
+        if self.folder.is_none() && !self.search_showing {
+            return;
+        }
+        self.close_preview();
+        self.folder = None;
+        self.search_showing = false;
+        self.search_offline.clear();
+        self.search_metadata.clear();
+        self.entries.clear();
+        self.generation = self.generation.wrapping_add(1);
+        self.tiles.clear();
+        self.clear_selection();
+        self.exif = None;
+        self.drag = None;
+        self.enter = None;
+        self.manual.clear();
+        self.relist = None;
+        self.reset_scroll = true;
+        self.reindex();
     }
 
     /// Re-read the open folder in the background, and fold what changed into the grid
@@ -4466,7 +4513,7 @@ pub fn edited_ink(key: &str) -> egui::Color32 {
 /// `sample-session_0008_architecture.dng` and `…0009…` differ in the middle of a name
 /// whose head and tail are identical, so a plain truncation would make every tile in
 /// a folder read the same.
-fn elide(ui: &egui::Ui, text: &str, font: &egui::FontId, width: f32) -> String {
+pub(crate) fn elide(ui: &egui::Ui, text: &str, font: &egui::FontId, width: f32) -> String {
     let measure = |s: &str| {
         ui.painter()
             .layout_no_wrap(s.to_owned(), font.clone(), theme::NAME)
@@ -4724,6 +4771,10 @@ struct Panes<'a> {
     tree_id: egui::Id,
     open: Option<PathBuf>,
     nav: Option<PathBuf>,
+    /// The tree asked to deselect the folder. See [`Nav::Close`].
+    close: bool,
+    /// Recent folders, for the start page the grid shows when there is no folder.
+    recent: &'a [PathBuf],
     dropped: bool,
     /// A seam was dragged this frame. See [`crate::layout::Tuck::drag`].
     resizing: bool,
@@ -4804,15 +4855,15 @@ impl Panes<'_> {
 
         match *pane {
             Pane::Grid => {
-                if let Some(p) = self.lb.grid_ui(ui, self.icons) {
+                if let Some(p) = self.lb.grid_ui(ui, self.icons, self.recent) {
                     self.open = Some(p);
                 }
             }
-            Pane::Folders => {
-                if let Nav::Open(dir) = self.lb.tree_ui(ui, self.icons) {
-                    self.nav = Some(dir);
-                }
-            }
+            Pane::Folders => match self.lb.tree_ui(ui, self.icons) {
+                Nav::None => {}
+                Nav::Open(dir) => self.nav = Some(dir),
+                Nav::Close => self.close = true,
+            },
             Pane::Search => self.lb.search_ui(ui, self.icons),
             Pane::Favorites => {
                 if let Some(dir) = self.lb.favorites_ui(ui, self.icons) {
@@ -5034,6 +5085,8 @@ pub struct FooterActions {
 pub enum Nav {
     None,
     Open(PathBuf),
+    /// Empty space under the folders was clicked: no folder, and the start page.
+    Close,
 }
 
 impl Lightbox {
@@ -5323,6 +5376,18 @@ impl Lightbox {
                 let roots = self.folders.roots.clone();
                 for root in roots {
                     self.folder_row(ui, icons, &root, 0, &mut nav);
+                }
+                // **The space under the last folder deselects.** The maintainer's way
+                // back to the start page from the tree itself: click where there is
+                // no folder and you have chosen none. Sensed over the leftover rect
+                // only, so it can never take a click meant for a row.
+                let blank = ui.available_rect_before_wrap();
+                if blank.height() > 0.0
+                    && ui
+                        .interact(blank, ui.id().with("tree-blank"), egui::Sense::click())
+                        .clicked()
+                {
+                    nav = Nav::Close;
                 }
             });
         nav
@@ -6819,12 +6884,22 @@ impl Lightbox {
     /// Returns a file to open in Develop when one is double-clicked. Returned rather
     /// than acted on for the reason the tree's `Nav` is: opening a file is `App`'s,
     /// and this type has no business knowing how a tab is made.
-    pub fn grid_ui(&mut self, ui: &mut egui::Ui, icons: &crate::icons::Icons) -> Option<PathBuf> {
+    pub fn grid_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        icons: &crate::icons::Icons,
+        recent: &[PathBuf],
+    ) -> Option<PathBuf> {
         self.frame = self.frame.wrapping_add(1);
         let mut open = None;
 
-        if self.folder.is_none() {
-            crate::layout::empty_state(ui, "⌘O  Open a folder\nor browse the folder panel");
+        // No folder is the start page, unless a search has put results in the grid:
+        // those need no folder, and hiding them behind the page would lose them.
+        if self.folder.is_none() && !self.search_showing {
+            let page = crate::splash::Page::Lightbox { folders: recent };
+            if let Some(go) = crate::splash::show(ui, icons, page) {
+                self.splash = Some(go);
+            }
             return None;
         }
         if self.entries.is_empty() {
@@ -8613,6 +8688,56 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn clicking_the_empty_space_under_the_folders_chooses_no_folder() {
+        let ctx = egui::Context::default();
+        let icons = crate::icons::Icons::empty();
+        let mut lb = Lightbox::new();
+        // Well below the handful of roots any machine has, all of them collapsed.
+        let at = egui::pos2(120.0, 760.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut closed = false;
+        for pass in 0..4 {
+            let events = match pass {
+                1 => vec![egui::Event::PointerMoved(at), button(true)],
+                2 => vec![button(false)],
+                _ => vec![],
+            };
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                closed |= matches!(lb.tree_ui(ui, &icons), Nav::Close);
+            });
+        }
+        assert!(
+            closed,
+            "a click on empty tree space should deselect the folder"
+        );
+    }
+
+    #[test]
+    fn choosing_no_folder_forgets_everything_that_indexed_the_last_one() {
+        let (mut lb, dir) = opened("close-folder", &["a.dng", "b.dng"]);
+        assert_eq!(lb.visible.len(), 2);
+        lb.selected = Some(1);
+        lb.close_folder();
+        assert!(lb.folder.is_none());
+        assert!(lb.entries.is_empty() && lb.visible.is_empty());
+        assert!(lb.selected.is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

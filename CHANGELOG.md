@@ -16,6 +16,17 @@ changes belong in [docs/known-limitations.md](docs/known-limitations.md).
 
 ## Unreleased
 
+New
+- A start page: with no folder chosen, Lightbox shows the monopro mark, a way into
+  the folder tree and your ten most recent folders, and Develop with no image open
+  shows Open Image and your ten most recent images. Both link to Settings and the
+  keyboard shortcuts, over a field of the raw sensor's own mosaic.
+- A Home button at the right end of the title strip, also Option-H. In Lightbox it
+  clears the folder and shows the start page; in Develop it lays the start page over
+  your open tabs without closing any. Home again, Esc, or clicking a tab goes back.
+- Clicking the empty space under the Lightbox folder tree clears the folder and
+  shows the start page.
+
 ## 0.2.1 — 2026-09-26
 
 This release fills out the Lightbox Metadata pane with the IPTC fields a caption

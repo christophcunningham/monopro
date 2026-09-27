@@ -331,3 +331,78 @@ fn scene_lightbox_metadata(ground: Ground) {
 fn lightbox_metadata() {
     scene_lightbox_metadata(Ground::Dark);
 }
+
+/// Recent folders and images for the start page to list: the workspace's own folders
+/// and the corpus, so every row is a path that exists on the machine drawing it.
+fn seed_recent(app: &mut App) {
+    let root = workspace();
+    app.recent.folders = ["crates", "docs", "icons", "packaging", "fonts"]
+        .iter()
+        .map(|d| root.join(d))
+        .chain(corpus())
+        .filter(|d| d.is_dir())
+        .filter_map(|d| std::fs::canonicalize(d).ok())
+        .collect();
+    let mut images: Vec<PathBuf> = corpus()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    images.sort();
+    images.truncate(crate::splash::RECENT);
+    app.recent.images = images;
+}
+
+/// Lightbox with no folder chosen: the start page where the grid would be.
+#[test]
+#[ignore = "draws with the GPU; cargo test -p raw-app visual -- --ignored"]
+fn start_lightbox() {
+    let _turn = one_at_a_time();
+    let mut h = launch(None, Ground::Dark);
+    seed_recent(h.state_mut());
+    h.state_mut().lightbox.close_folder();
+    settle(&mut h, "start-lightbox", |_| true);
+    save(&mut h, "start-lightbox");
+}
+
+/// Develop with no image open.
+#[test]
+#[ignore = "draws with the GPU; cargo test -p raw-app visual -- --ignored"]
+fn start_develop() {
+    let _turn = one_at_a_time();
+    let mut h = launch(None, Ground::Dark);
+    seed_recent(h.state_mut());
+    h.state_mut().set_lightbox(false);
+    settle(&mut h, "start-develop", |_| true);
+    save(&mut h, "start-develop");
+}
+
+/// Home over an open image: the page laid over Develop, with the tab still open.
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn start_home() {
+    let _turn = one_at_a_time();
+    let name = "start-home";
+    let Some(path) = raw("L1000016.DNG") else {
+        eprintln!("{name}: skipped, no corpus raw L1000016.DNG");
+        return;
+    };
+    let mut h = launch(Some(path), Ground::Dark);
+    settle(&mut h, name, develop_ready);
+    seed_recent(h.state_mut());
+    h.state_mut().go_home();
+    assert!(
+        h.state().home_showing(),
+        "{name}: Home should lay the page over the tab"
+    );
+    settle(&mut h, name, |_| true);
+    save(&mut h, name);
+    assert_eq!(
+        h.state().tabs.len(),
+        1,
+        "{name}: Home must not close the tab"
+    );
+}

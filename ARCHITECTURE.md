@@ -128,6 +128,7 @@ but runs only `--lib`.
 | `menu.rs` / `menu_fallback.rs` | 590 | The macOS menu bar; the no-menu boundary elsewhere |
 | `platform.rs`, `dialogs.rs` | 520 | File-manager and volume differences; native dialogs and path checks |
 | `icons.rs` | 760 | SVG icons rasterised at startup |
+| `splash.rs` | 790 | The start page (Lightbox with no folder, Develop with no image, and Home over the tabs), its sensor-mosaic ground, and the recent-files memory |
 | `curve_presets.rs`, `iptc_templates.rs` | 530 | Presets stored with the app, not beside images |
 | `visual.rs` | 260 | Test only: frames of the real app drawn without a window |
 
