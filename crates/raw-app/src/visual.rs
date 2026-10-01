@@ -332,6 +332,95 @@ fn lightbox_metadata() {
     scene_lightbox_metadata(Ground::Dark);
 }
 
+/// Dodge & Burn with a stack of layers: the SHAPE row's glyphs, and each layer's mask
+/// flag, lit on the two that have a tone mask. The selected layer is open, so its
+/// TONE MASK shows the same state as its flag.
+///
+/// **The layers go on a copy of the corpus raw**, in a folder of this scene's own. A
+/// changed stack saves a sidecar beside the image it belongs to, and on the corpus
+/// file that would be a stray edit in the maintainer's own photographs.
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn dodgeburn() {
+    use raw_core::Sign;
+    use raw_core::dodgeburn::{Instance, Linear, Nib, Radial, Shape, ZoneMask};
+
+    let _turn = one_at_a_time();
+    let name = "dodgeburn";
+    let Some(src) = raw("L1000016.DNG") else {
+        eprintln!("{name}: skipped, no corpus raw L1000016.DNG");
+        return;
+    };
+    let dir = workspace().join("target/visual-fixtures").join(name);
+    std::fs::create_dir_all(&dir).expect("create the scene's fixture folder");
+    let path = dir.join("L1000016.DNG");
+    if !path.exists() {
+        reflink_copy::reflink_or_copy(&src, &path).expect("copy the corpus raw");
+    }
+    // The last run's layers would otherwise open underneath this run's.
+    let _ = std::fs::remove_file(raw_core::sidecar::path_for(&path));
+
+    let mut h = launch(Some(path), Ground::Dark);
+    settle(&mut h, name, develop_ready);
+    {
+        let app = h.state_mut();
+        app.layout.bring_forward(crate::layout::Pane::DodgeBurn);
+        let tab = app.tabs.active_mut().expect("the photograph's tab");
+        let (_, lo, hi, f_lo, f_hi) = ZoneMask::PRESETS[2];
+        let highlights = ZoneMask {
+            enabled: true,
+            lo,
+            hi,
+            f_lo,
+            f_hi,
+            ..ZoneMask::default()
+        };
+        let mut sky = Instance::of(
+            Sign::Burn,
+            "Sky".into(),
+            Shape::Linear(Linear {
+                x0: 0.5,
+                y0: 0.0,
+                x1: 0.5,
+                y1: 0.45,
+                feather: 1.0,
+                ev: -0.8,
+            }),
+        );
+        sky.mask = highlights;
+        let mut face = Instance::of(
+            Sign::Dodge,
+            "Face".into(),
+            Shape::Radial(Radial {
+                cx: 0.5,
+                cy: 0.45,
+                inner: 0.05,
+                outer: 0.25,
+                aspect: 1.0,
+                angle: 0.0,
+                feather: 1.0,
+                invert: false,
+                ev: 0.4,
+            }),
+        );
+        face.mask = highlights;
+        let edge = Instance::of(
+            Sign::Burn,
+            "Edge".into(),
+            Shape::Brush {
+                nib: Nib::Card,
+                passes: Vec::new(),
+            },
+        );
+        let db = &mut tab.params.dodgeburn;
+        db.instances = vec![sky, face, edge];
+        // Newest is drawn first, so the open layer is the middle row.
+        tab.db_active = Some(1);
+    }
+    settle(&mut h, name, |_| true);
+    save(&mut h, name);
+}
+
 /// Recent folders and images for the start page to list: the workspace's own folders
 /// and the corpus, so every row is a path that exists on the machine drawing it.
 fn seed_recent(app: &mut App) {

@@ -4698,25 +4698,23 @@ impl App {
         // stack: it is where you go to start something, and a control that walks off
         // the bottom as the list grows is one you hunt for.
         // `Panel`, which in egui 0.35 replaced the four `*Panel` types with one.
-        // Built on `CHROME` like a module and re-greyed like one, so it follows the
-        // module value rather than staying dark under a light stack.
-        theme::module_ground_ui(ui, |ui| {
-            egui::containers::panel::Panel::bottom("db-add")
-                .frame(
-                    egui::Frame::NONE
-                        .fill(theme::CHROME)
-                        .inner_margin(egui::Margin {
-                            left: 10,
-                            right: 10,
-                            top: 8,
-                            bottom: 10,
-                        }),
-                )
-                .show_separator_line(false)
-                .show(ui, |ui| {
-                    theme::rule(ui, theme::DIM.gamma_multiply(0.5));
-                    ui.add_space(8.0);
-
+        //
+        // **A card like the modules above it**, at the maintainer's request: `widgets::card`
+        // draws the module's own fill, stroke and padding, re-greyed like a module so
+        // it follows the module value. The panel itself is bare, and its margin is
+        // the gap a card has: 7pt above, as a module leaves below itself, and the
+        // pane's inset below, so the box clears the status bar the way it clears the
+        // pane's side. The rule that used to head it went with the edge-to-edge fill
+        // it was separating from the stack.
+        egui::containers::panel::Panel::bottom("db-add")
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                top: 7,
+                bottom: PANEL_INSET,
+                ..Default::default()
+            }))
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                widgets::card(ui, |ui| {
                     // **The two verbs first, as one wide filled pair.** the maintainer's mockup,
                     // and the change from the previous arrangement is that they are now
                     // unmistakably the *action* — everything below them describes what
@@ -4759,21 +4757,45 @@ impl App {
                     ui.add_space(10.0);
                     // **One row of four shapes**, not a tool row with a nib row under it.
                     // See `paint::Pick` for why the two collapsed into one.
-                    ui.horizontal(|ui| {
-                        theme::tracked(ui, "SHAPE", theme::DIM);
-                        ui.label(theme::caption(">"));
-                        ui.add_space(4.0);
+                    //
+                    // **Glyph and word, at the control size, and no heading.** The four
+                    // brackets became the maintainer's shape icons, and then he asked for
+                    // them bigger, named, and without the SHAPE label:
+                    // `labelled_toggle` at `BIG`, the Crop button's treatment, so the
+                    // current shape's outline takes in its word as well as its glyph.
+                    //
+                    // **Spread across the bench**: the first flush left, the last flush
+                    // right, the gaps between them equal, as the verbs above fill the
+                    // same width. Measured before drawing, because the gap is whatever
+                    // the four buttons leave. Floored so rounding cannot push the last
+                    // one onto a second line, and never under 4pt: a narrowed pane wraps
+                    // the row rather than pressing the words together.
+                    ui.horizontal_wrapped(|ui| {
+                        let widths: f32 = paint::Pick::ALL
+                            .iter()
+                            .map(|p| icons::labelled_width(ui, p.label(), icons::BIG))
+                            .sum();
+                        let gaps = (paint::Pick::ALL.len() - 1) as f32;
+                        let gap = ((ui.available_width() - widths) / gaps).floor().max(4.0);
+                        ui.spacing_mut().item_spacing = egui::vec2(gap, 4.0);
                         let current = paint::Pick::of(tool, brush.nib);
                         for p in paint::Pick::ALL {
-                            if theme::bracket(ui, p.label(), current == p, theme::size::CAPTION)
-                                .on_hover_text(theme::tip(p.tooltip()))
-                                .clicked()
+                            if icons::labelled_toggle(
+                                ui,
+                                icons,
+                                p.icon(),
+                                &p.label()[..1],
+                                p.label(),
+                                current == p,
+                                icons::BIG,
+                            )
+                            .on_hover_text(theme::tip(p.tooltip()))
+                            .clicked()
                             {
                                 pick_shape = Some(p);
                             }
                         }
                     });
-                    ui.add_space(2.0);
                     // **Nothing else lives here.** the maintainer's rule: the bench makes a layer
                     // and the layer holds its own options, which is how Radial already
                     // worked and is now how all four do. A shape's settings sitting under
@@ -4781,7 +4803,7 @@ impl App {
                     // editing were nowhere near it — the same complaint that moved the
                     // tonal range inside the layer rows in the first place.
                 });
-        });
+            });
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             let module = widgets::Module::new("DODGE / BURN")
@@ -5015,9 +5037,12 @@ impl App {
             // place that would not open it, and you had to hit the gap to its right.
             // The strip hears both gestures now and the label senses nothing.
             let row_h = 20.0;
+            // What the right-hand group takes: 78 for the close mark and the opacity,
+            // and the mask flag with its gap.
+            let right = 78.0 + icons::BOX + ui.spacing().item_spacing.x;
             let strip = ui
                 .allocate_ui_with_layout(
-                    egui::vec2(ui.available_width() - 78.0, row_h),
+                    egui::vec2(ui.available_width() - right, row_h),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 5.0;
@@ -5128,6 +5153,23 @@ impl App {
                         }),
                 )
                 .on_hover_text(theme::tip("layer opacity"));
+                // **The layer's tone mask, beside its opacity.** A flag rather than a
+                // toggle, like the pinned snapshot's diamond: ruby while the layer is
+                // limited to a tonal range, so a closed stack shows which layers are
+                // without opening each one. It switches the same `mask.enabled` the
+                // open layer's TONE MASK does, and touches nothing else, so the range
+                // you set is still there when you turn it back on.
+                let masked = inst.mask.enabled;
+                if icons::flag(ui, icons, "mask", "M", masked, true, icons::BOX)
+                    .on_hover_text(theme::tip(if masked {
+                        "tone mask on: click to turn it off"
+                    } else {
+                        "tone mask off: click to limit this layer to a tonal range"
+                    }))
+                    .clicked()
+                {
+                    inst.mask.enabled = !masked;
+                }
             });
         });
     }

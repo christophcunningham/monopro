@@ -26,6 +26,17 @@ New
   your open tabs without closing any. Home again, Esc, or clicking a tab goes back.
 - Clicking the empty space under the Lightbox folder tree clears the folder and
   shows the start page.
+- Each Dodge & Burn layer has a Mask button beside its opacity. It turns the
+  layer's tone mask on and off, and shows red while it is on, so you can see which
+  layers are limited to a tonal range without opening them.
+
+Changed
+- Dodge & Burn's shape picker has larger buttons, each with an icon beside its
+  name: Round, Card, Linear and Radial, spread evenly across the panel. The area
+  that holds them and the Dodge and Burn buttons is now a card like the modules
+  above it.
+- Icons throughout the app are drawn a little larger inside their buttons, so their
+  detail is easier to see. The buttons themselves are the same size.
 
 ## 0.2.1 — 2026-09-26
 

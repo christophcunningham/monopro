@@ -363,16 +363,71 @@ fn draw(
         open = true;
     }
 
-    // Every box the same width; see the note above. Taken before the frame, where
-    // `available_width` still knows about the scrollbar — and netting off both the
-    // margin and the stroke, because the box is content + margin + stroke on each
-    // side and anything left out of this sum is added to the panel every frame.
-    let content_w = (ui.available_width() - 2.0 * (PAD_X as f32 + STROKE)).max(0.0);
-
     let mut out = Clicked {
         bypass: false,
         reset: false,
     };
+    card(ui, |ui| {
+        ui.horizontal(|ui| {
+            match enabled {
+                // Indented by exactly the dot's own box, so the names line up
+                // down the panel whether or not a section has one.
+                _ if !has_dot => ui.add_space(13.0),
+                Some(on) => {
+                    out.bypass = dot(ui, modified, on, true)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(theme::tip(if on {
+                            "click to bypass"
+                        } else {
+                            "bypassed — click to switch back on"
+                        }))
+                        .clicked();
+                }
+                // Not switchable, so it does not offer to be clicked and does
+                // not light up under the pointer. A control that looks live and
+                // does nothing is worse than no control.
+                None => {
+                    dot(ui, modified, true, false);
+                }
+            }
+            ui.add_space(2.0);
+            let title = theme::module_header_label(ui, name)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(theme::tip(if open {
+                    "click to collapse"
+                } else {
+                    "click to expand"
+                }));
+            if title.clicked() {
+                open = !open;
+            }
+            if resettable {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    out.reset = theme::reset_button(ui, "reset", "back to default").clicked();
+                });
+            }
+        });
+        if open {
+            ui.add_space(5.0);
+            body(ui);
+        }
+    });
+
+    ui.data_mut(|d| d.insert_temp(id, open));
+    ui.add_space(7.0);
+    out
+}
+
+/// A module's box without its header: the fill, stroke, corners and padding every
+/// module has, at the same width arithmetic. For a pane's fixed part that should
+/// read as one more card in the stack, such as Dodge & Burn's ADD bench.
+pub fn card<R>(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    // Every box the same width; see the note on `STROKE`. Taken before the frame,
+    // where `available_width` still knows about the scrollbar — and netting off both
+    // the margin and the stroke, because the box is content + margin + stroke on each
+    // side and anything left out of this sum is added to the panel every frame.
+    let content_w = (ui.available_width() - 2.0 * (PAD_X as f32 + STROKE)).max(0.0);
+
     // Filled, not transparent: the panel ground behind it can follow the viewer
     // background, and the modules keep their own grey whatever it is set to. Drawn
     // at `CHROME` and then re-greyed to the chosen module ground — see
@@ -389,56 +444,10 @@ fn draw(
                 // with it.
                 ui.spacing_mut().item_spacing.y += 1.0;
                 ui.set_width(content_w);
-                ui.horizontal(|ui| {
-                    match enabled {
-                        // Indented by exactly the dot's own box, so the names line up
-                        // down the panel whether or not a section has one.
-                        _ if !has_dot => ui.add_space(13.0),
-                        Some(on) => {
-                            out.bypass = dot(ui, modified, on, true)
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text(theme::tip(if on {
-                                    "click to bypass"
-                                } else {
-                                    "bypassed — click to switch back on"
-                                }))
-                                .clicked();
-                        }
-                        // Not switchable, so it does not offer to be clicked and does
-                        // not light up under the pointer. A control that looks live and
-                        // does nothing is worse than no control.
-                        None => {
-                            dot(ui, modified, true, false);
-                        }
-                    }
-                    ui.add_space(2.0);
-                    let title = theme::module_header_label(ui, name)
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(theme::tip(if open {
-                            "click to collapse"
-                        } else {
-                            "click to expand"
-                        }));
-                    if title.clicked() {
-                        open = !open;
-                    }
-                    if resettable {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            out.reset =
-                                theme::reset_button(ui, "reset", "back to default").clicked();
-                        });
-                    }
-                });
-                if open {
-                    ui.add_space(5.0);
-                    body(ui);
-                }
-            });
-    });
-
-    ui.data_mut(|d| d.insert_temp(id, open));
-    ui.add_space(7.0);
-    out
+                body(ui)
+            })
+            .inner
+    })
 }
 
 /// The state dot.
@@ -1913,7 +1922,17 @@ pub fn title_strip(
     } else {
         crate::layout::panel_rule().color
     };
-    crate::icons::paint_at(ui, icons, "house", "⌂", home_rect, ink, 13.0);
+    // The shared share of the box, not a size of its own: at 13 it was the old 9-in-15
+    // ratio written out by hand, and stayed behind when every other icon grew.
+    crate::icons::paint_at(
+        ui,
+        icons,
+        "house",
+        "⌂",
+        home_rect,
+        ink,
+        crate::icons::glyph_size(home_box),
+    );
     let home = home.clicked();
 
     let Some(badge) = update else {

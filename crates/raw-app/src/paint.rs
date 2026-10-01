@@ -98,6 +98,16 @@ impl Pick {
         }
     }
 
+    /// The glyph the SHAPE row draws, by the name `icons::SOURCES` ships it under.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Round => "shape-round",
+            Self::Card => "shape-card",
+            Self::Linear => "shape-linear",
+            Self::Radial => "shape-radial",
+        }
+    }
+
     pub fn tooltip(self) -> &'static str {
         match self {
             Self::Round => "A disc or ellipse",
@@ -560,6 +570,24 @@ mod tests {
     use super::*;
 
     const SQUARE: f32 = 1.0;
+
+    #[test]
+    fn every_shape_has_a_shipped_glyph_of_its_own() {
+        // A name `icons` does not ship draws the fallback letter where the SHAPE
+        // row's glyph should be, silently, and two shapes sharing a glyph would be
+        // two buttons told apart only by their words.
+        let names: Vec<&str> = Pick::ALL.iter().map(|p| p.icon()).collect();
+        for name in &names {
+            assert!(
+                crate::icons::shipped(name),
+                "{name} is not in icons::SOURCES"
+            );
+        }
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "two shapes share a glyph");
+    }
 
     #[test]
     fn a_slow_drag_and_a_fast_one_deposit_the_same_dabs() {
