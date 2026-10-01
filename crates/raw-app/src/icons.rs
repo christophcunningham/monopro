@@ -1,5 +1,6 @@
 //! SVG icons from `icons/`, rasterised once at startup. Phosphor, plus a Lucide pair
-//! for float and dock — see [`SOURCES`].
+//! for float and dock and three glyphs drawn for monopro (the mask and the two
+//! gradient shapes) — see [`SOURCES`].
 //!
 //! egui does not draw SVG, so something has to. The alternative considered was
 //! painting these by hand — `plus.svg` is two lines and `copy-simple.svg` is a rect
@@ -62,6 +63,11 @@ fn wants_large(name: &str) -> bool {
 /// Lucide 1.25/24, so the Lucide pair is marginally the finer of the two. Both families
 /// are credited in `ACKNOWLEDGMENTS`; Lucide is ISC, where attribution is a licence term
 /// rather than a courtesy.
+///
+/// **Three are monopro's own**: `mask`, `shape-linear` and `shape-radial`, drawn on
+/// Phosphor's grid and stroke (16 on 256, round caps) because no family had a gradient
+/// shape that read as one beside Phosphor's circle and square. They need no credit.
+/// `icons/README.md` says which files they are.
 const SOURCES: &[(&str, &str)] = &[
     ("plus", include_str!("../../../icons/plus.svg")),
     // Curve point sampler. The same Phosphor eyedropper and the same cursor drawing
@@ -260,6 +266,26 @@ const SOURCES: &[(&str, &str)] = &[
         "camera-plus",
         include_str!("../../../icons/camera-plus.svg"),
     ),
+    // Dodge & Burn's SHAPE row, in `paint::Pick` order; `Pick::icon` maps each shape
+    // to its name. One rule runs through all four: a solid mark is the shape and a
+    // dashed one is its falloff. Round and Card are Phosphor's circle and square;
+    // Linear (a rule between dashed bounds, set at 45° so it says "any angle") and
+    // Radial (a solid core in a dashed ring, the one mark Round never has) are
+    // monopro's.
+    ("shape-round", include_str!("../../../icons/circle.svg")),
+    ("shape-card", include_str!("../../../icons/square.svg")),
+    (
+        "shape-linear",
+        include_str!("../../../icons/gradient-linear.svg"),
+    ),
+    (
+        "shape-radial",
+        include_str!("../../../icons/gradient-radial.svg"),
+    ),
+    // A layer's tone mask, beside its opacity: a filled square with a round hole,
+    // which is what a mask does to the picture under it. Its outer edge is the outer
+    // edge of Card's stroke, so the filled and the outlined square measure the same.
+    ("mask", include_str!("../../../icons/mask.svg")),
 ];
 
 pub struct Icons {
@@ -366,8 +392,31 @@ fn rasterise_at(src: &str, raster: usize) -> Option<egui::ColorImage> {
 /// Two numbers rather than one derived from the other: the padding between them is
 /// the point. The first version fitted the button tightly to the glyph, which made
 /// a row of controls that looked crowded against the filenames beside them.
+///
+/// **11, not the 9 it was.** At 9 the glyph sat in nearly half its box as margin, and
+/// the detail in a glyph — the hole in the mask, the dashes of a gradient's feather —
+/// was the first thing lost. the maintainer asked for every icon a little bigger
+/// with every button the same size, so the box stays 15 and the margin is now 2pt a
+/// side: still clear of the hover fill's edge, and still not the crowded fit the first
+/// version had. Every button scales from this ratio, so a `BIG` one grows with it,
+/// apart from the few solid glyphs [`compact`] keeps at the old share.
 pub const BOX: f32 = 15.0;
-const GLYPH: f32 = 9.0;
+const GLYPH: f32 = 11.0;
+
+/// The glyph for a button `box_size` across: the same share of the box at every size,
+/// so a `BIG` button's icon grows with the box as a `BOX` one's does. For a button
+/// drawn by hand rather than through [`button_in`], which uses it too.
+pub fn glyph_size(box_size: f32) -> f32 {
+    box_size * GLYPH / BOX
+}
+
+/// The share of the box every glyph had before [`GLYPH`] grew: 9 in 15. Kept for the
+/// solid glyphs the maintainer left at that size — see [`compact`].
+const GLYPH_COMPACT: f32 = 9.0;
+
+fn compact_size(box_size: f32) -> f32 {
+    box_size * GLYPH_COMPACT / BOX
+}
 
 /// An icon button, falling back to `glyph` if the icon is missing.
 ///
@@ -447,7 +496,17 @@ pub fn toggle(
     active: bool,
     box_size: f32,
 ) -> egui::Response {
-    button_in(ui, icons, name, glyph, None, on(active), box_size, 0.0)
+    button_in(
+        ui,
+        icons,
+        name,
+        glyph,
+        None,
+        on(active),
+        box_size,
+        0.0,
+        glyph_size(box_size),
+    )
 }
 
 /// [`toggle`] that can also be greyed out.
@@ -468,7 +527,17 @@ pub fn toggle_enabled(
     box_size: f32,
 ) -> egui::Response {
     let state = if enabled { on(active) } else { State::Disabled };
-    button_in(ui, icons, name, glyph, None, state, box_size, 0.0)
+    button_in(
+        ui,
+        icons,
+        name,
+        glyph,
+        None,
+        state,
+        box_size,
+        0.0,
+        glyph_size(box_size),
+    )
 }
 
 /// How much wider than tall a bare-glyph toggle is allowed to be, in points.
@@ -492,7 +561,17 @@ pub fn wide_toggle(
     active: bool,
     box_size: f32,
 ) -> egui::Response {
-    button_in(ui, icons, name, glyph, None, on(active), box_size, WIDE)
+    button_in(
+        ui,
+        icons,
+        name,
+        glyph,
+        None,
+        on(active),
+        box_size,
+        WIDE,
+        glyph_size(box_size),
+    )
 }
 
 /// An icon that is a **state**, not a button: [`crate::theme::RUBY`] when it is on.
@@ -530,7 +609,7 @@ pub fn flag(
         ui.painter()
             .rect_filled(rect, 0.0, egui::Color32::from_gray(64));
     }
-    paint_at(ui, icons, name, glyph, rect, colour, box_size * GLYPH / BOX);
+    paint_at(ui, icons, name, glyph, rect, colour, glyph_size(box_size));
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
@@ -562,6 +641,7 @@ pub fn labelled_toggle(
         on(active),
         box_size,
         0.0,
+        glyph_size(box_size),
     )
 }
 
@@ -585,7 +665,9 @@ pub fn pair(
     let font = egui::FontId::new(crate::theme::size::BODY, egui::FontFamily::Proportional);
     let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font, crate::theme::DIM));
     // The two glyphs overlap by a quarter box: side by side at full spacing they read
-    // as two buttons.
+    // as two buttons. At the compact share, because at the full one the overlap
+    // closed and the copy and the arrow touched — the maintainer kept this button,
+    // like the fat arrows beside it, at the old size. See [`compact`].
     let glyphs = box_size * 1.75;
     let w = pad + galley.size().x + glyphs;
     let (rect, resp) = ui.allocate_exact_size(
@@ -610,7 +692,7 @@ pub fn pair(
             egui::pos2(text_right + box_size * 0.75 * i as f32, rect.top()),
             egui::vec2(box_size, box_size),
         );
-        paint_at(ui, icons, name, glyph, at, color, box_size * GLYPH / BOX);
+        paint_at(ui, icons, name, glyph, at, color, compact_size(box_size));
     }
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -628,7 +710,60 @@ pub fn sized(
     box_size: f32,
 ) -> egui::Response {
     let state = if enabled { State::Off } else { State::Disabled };
-    button_in(ui, icons, name, glyph, None, state, box_size, 0.0)
+    button_in(
+        ui,
+        icons,
+        name,
+        glyph,
+        None,
+        state,
+        box_size,
+        0.0,
+        glyph_size(box_size),
+    )
+}
+
+/// [`sized`] with its glyph at the old, smaller share of the box ([`GLYPH_COMPACT`]).
+///
+/// For solid glyphs: the Metadata pane's fat arrows are filled shapes, which read
+/// heavier than an outline of the same size, and when every other icon grew the
+/// maintainer kept them, and Copy to Next beside them, at the size they were.
+pub fn compact(
+    ui: &mut egui::Ui,
+    icons: &Icons,
+    name: &str,
+    glyph: &str,
+    enabled: bool,
+    box_size: f32,
+) -> egui::Response {
+    let state = if enabled { State::Off } else { State::Disabled };
+    button_in(
+        ui,
+        icons,
+        name,
+        glyph,
+        None,
+        state,
+        box_size,
+        0.0,
+        compact_size(box_size),
+    )
+}
+
+/// The gap before a button's word and after it. See [`button_in`].
+const LABEL_PAD: f32 = 5.0;
+
+/// A button's word, laid out the way [`button_in`] draws it.
+fn label_galley(ui: &egui::Ui, label: &str) -> std::sync::Arc<egui::Galley> {
+    let font = egui::FontId::new(crate::theme::size::BODY, egui::FontFamily::Proportional);
+    ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font, crate::theme::DIM))
+}
+
+/// How wide [`labelled_toggle`] draws `label` at `box_size`, for a row that spaces
+/// its buttons before drawing them. The same sum [`button_in`] allocates, from the
+/// same measurement.
+pub fn labelled_width(ui: &egui::Ui, label: &str, box_size: f32) -> f32 {
+    box_size + label_galley(ui, label).size().x + LABEL_PAD * 2.0
 }
 
 /// Every icon button in the app, in one place: claim a box, fill it on hover, tint the
@@ -648,16 +783,16 @@ fn button_in(
     state: State,
     box_size: f32,
     pad_x: f32,
+    glyph_px: f32,
 ) -> egui::Response {
     let enabled = state != State::Disabled;
     // The word is measured before the box is claimed, because it is inside the button
     // rather than beside it — a label that allocated for itself would be a second
     // widget with its own hover, and the fill would stop halfway along the thing you
     // are pointing at.
-    let pad = 5.0;
+    let pad = LABEL_PAD;
     let text = label.map(|l| {
-        let font = egui::FontId::new(crate::theme::size::BODY, egui::FontFamily::Proportional);
-        let galley = ui.fonts_mut(|f| f.layout_no_wrap(l.to_owned(), font, crate::theme::DIM));
+        let galley = label_galley(ui, l);
         (galley.size().x, galley)
     });
     // **The word gets the same `pad` after it as before it.** the maintainer's note on the Crop
@@ -685,15 +820,7 @@ fn button_in(
         rect.min + egui::vec2(pad_x * 0.5, 0.0),
         egui::vec2(box_size, box_size),
     );
-    paint_at(
-        ui,
-        icons,
-        name,
-        glyph,
-        box_rect,
-        colour,
-        box_size * GLYPH / BOX,
-    );
+    paint_at(ui, icons, name, glyph, box_rect, colour, glyph_px);
     if let Some((_, galley)) = text {
         let at = egui::pos2(
             box_rect.right() + pad,

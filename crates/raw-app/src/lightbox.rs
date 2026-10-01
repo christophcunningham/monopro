@@ -6336,13 +6336,13 @@ impl Lightbox {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.spacing_mut().item_spacing.x = 5.0;
-            if crate::icons::sized(ui, icons, "previous", "◀", previous, crate::icons::BIG)
+            if crate::icons::compact(ui, icons, "previous", "◀", previous, crate::icons::BIG)
                 .on_hover_text(theme::tip("Previous image"))
                 .clicked()
             {
                 nav = Some(IptcNav::Previous);
             }
-            if crate::icons::sized(ui, icons, "next", "▶", next, crate::icons::BIG)
+            if crate::icons::compact(ui, icons, "next", "▶", next, crate::icons::BIG)
                 .on_hover_text(theme::tip("Next image"))
                 .clicked()
             {
