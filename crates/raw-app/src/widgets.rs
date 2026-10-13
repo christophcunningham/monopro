@@ -1086,6 +1086,7 @@ pub fn curve_editor(
     selected: &mut Option<usize>,
     ghost: Option<&[u32]>,
     masked: Option<(f32, f32)>,
+    hover: Option<f32>,
 ) -> bool {
     const HIT: f32 = 9.0;
     let width = ui.available_width();
@@ -1329,6 +1330,21 @@ pub fn curve_editor(
         line,
         Stroke::new(1.5, Color32::from_gray(215)),
     ));
+
+    // **Where the point sampler would put a point**, for the pixel under the pointer
+    // on the picture: a hollow ring on the curve, so it reads as "here, if you click"
+    // beside the solid points already placed, and a faint rule down to the axis to say
+    // which input it is. Drawn under the points, which it must not hide.
+    if let Some(x) = hover.filter(|x| x.is_finite()) {
+        let x = x.clamp(0.0, 1.0);
+        let at = to_screen([x, curve.eval(x)]);
+        painter.line_segment(
+            [pos2(at.x, rect.bottom()), pos2(at.x, at.y + 5.0)],
+            Stroke::new(1.0, Color32::from_gray(110)),
+        );
+        painter.circle_stroke(at, 5.0, Stroke::new(3.0, Color32::from_gray(20)));
+        painter.circle_stroke(at, 5.0, Stroke::new(1.5, crate::theme::BRIGHT));
+    }
 
     for (i, p) in curve.points().iter().enumerate() {
         let c = to_screen(*p);
@@ -2650,7 +2666,7 @@ mod tests {
                 if pass == 0 {
                     ui.memory_mut(|m| m.request_focus(id));
                 }
-                curve_editor(ui, &mut curve, &mut drag, &mut selected, None, None);
+                curve_editor(ui, &mut curve, &mut drag, &mut selected, None, None, None);
                 let _ = ui.button("focusable control below");
             });
             assert_eq!(
@@ -2691,7 +2707,7 @@ mod tests {
                     ui.cursor().min,
                     egui::vec2(width, 220.0),
                 ));
-                curve_editor(ui, &mut curve, &mut drag, &mut selected, None, None);
+                curve_editor(ui, &mut curve, &mut drag, &mut selected, None, None, None);
             });
         };
 

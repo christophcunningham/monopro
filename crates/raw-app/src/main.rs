@@ -2766,6 +2766,77 @@ fn update_readout(updates: Option<&updater::Updates>, refused: Option<&str>) -> 
     }
 }
 
+/// Where a sampled pixel enters the selected Curve pass. See [`sampler_input`].
+struct SamplerInput {
+    /// The selected pass.
+    active: usize,
+    /// The curve's normalized input: where a point for this pixel goes.
+    x: f32,
+    /// The pixel on the negative, normalized, for reading a tone range there.
+    nx: f32,
+    ny: f32,
+    /// The zone basis, when one was needed to find `x`.
+    basis: Option<std::sync::Arc<raw_core::Basis>>,
+}
+
+/// Where the pixel at `(sx, sy)` on the negative enters the selected Curve pass.
+///
+/// **Where it was clicked, not only what tone.** A pass above the selected one may
+/// be masked, and what enters this pass at this pixel depends on whether that mask
+/// reached it. `apply_before_at` is the shader's own composition, so the point lands
+/// where the picture's tone actually is; a tone range above is weighed by the prepared
+/// mask's own value here, which is what the shader looked up.
+///
+/// The click and the hover dot both come here, so the dot is where the point will go.
+/// `wait` is the click's: it may block on the zone worker for the right answer. The
+/// hover may not, and gets `None` until the basis it needs is ready.
+fn sampler_input(
+    tab: &mut Tab,
+    sx: f32,
+    sy: f32,
+    sample: settings::SampleArea,
+    wait: bool,
+) -> Option<SamplerInput> {
+    let luma = tab.luma.as_ref()?;
+    let raw = sample_luma(luma, sx, sy, sample)?;
+    let (lw, lh) = (luma.output_dims.w as f32, luma.output_dims.h as f32);
+    let active = tab
+        .curve_active
+        .min(tab.params.curve.instances.len().saturating_sub(1));
+    let scene = (raw - tab.params.exposure.black) * tab.params.exposure.ev.exp2();
+    let (nx, ny, aspect) = (sx / lw, sy / lh, lh / lw);
+    // Whether a pass above the selected one is limited to a tone range: only then
+    // does what enters this pass depend on the picture around the pixel.
+    let tone_above = tab.params.curve.instances.iter().take(active).any(|pass| {
+        pass.live_mask()
+            .is_some_and(|mask| mask.live_tone().is_some())
+    });
+    let basis = if tone_above {
+        let effective = tab.params.effective();
+        let viewport = &mut tab.render.as_mut()?.viewport;
+        Some(if wait {
+            viewport.zone_basis(&effective)
+        } else {
+            viewport.zone_basis_ready(&effective)?
+        })
+    } else {
+        None
+    };
+    let entering = tab
+        .params
+        .curve
+        .apply_before_at(active, scene, nx, ny, aspect, &|tone| {
+            basis.as_ref().map_or(1.0, |b| b.weight_at(tone, nx, ny))
+        });
+    Some(SamplerInput {
+        active,
+        x: raw_core::Curve::to_normalized(entering),
+        nx,
+        ny,
+        basis,
+    })
+}
+
 fn exposure_line(m: &raw_core::sensor::Metadata) -> String {
     // **Present is not the same as meaningful.** A Fuji file in the corpus records
     // `aperture: Some(NaN)` and `focal_len: Some(0.0)` — an adapted manual lens the
@@ -7455,6 +7526,9 @@ impl App {
                 ui.add_space(4.0);
 
                 if let Some(instance) = tab.params.curve.instances.get_mut(tab.curve_active) {
+                    // The sampler's dot only while the sampler is armed: the value is
+                    // written by its tool and nothing else clears it.
+                    let hover = tab.mode.is_curve_point().then_some(tab.curve_hover).flatten();
                     widgets::curve_editor(
                         ui,
                         &mut instance.curve,
@@ -7462,6 +7536,7 @@ impl App {
                         &mut tab.curve_point,
                         Some(&curve_ghost.bins),
                         curve_ghost.span,
+                        hover,
                     );
                     if let Some((point_i, point)) = tab
                         .curve_point
@@ -10481,11 +10556,26 @@ impl App {
         frame: &raw_core::Frame,
         sample: settings::SampleArea,
     ) {
-        if let Some(p) = ctx
+        let hover = ctx
             .input(|i| i.pointer.latest_pos())
-            .filter(|p| rect.contains(*p))
-        {
+            .filter(|p| rect.contains(*p));
+        if let Some(p) = hover {
             Self::sampler_cursor(ui, ctx, &self.icons, rect, p, false);
+        }
+
+        // **The dot on the graph, before the click**: where the point would land for
+        // the pixel under the pointer, found exactly as the click finds it. Never
+        // waits for the zone worker — a tone range above that is not prepared yet
+        // shows no dot for a frame rather than stalling one.
+        let to_source = |at: egui::Pos2| {
+            let f = view_off + (at - rect.min) * ppp / view_scale;
+            frame.to_source(f.x, f.y)
+        };
+        if let Some(tab) = self.tabs.active_mut() {
+            tab.curve_hover = hover.and_then(|at| {
+                let (sx, sy) = to_source(at);
+                sampler_input(tab, sx, sy, sample, false).map(|s| s.x)
+            });
         }
 
         let Some(at) = ctx
@@ -10498,55 +10588,36 @@ impl App {
         let Some(tab) = self.tabs.active_mut() else {
             return;
         };
-        let Some(luma) = tab.luma.as_ref() else {
+        let (sx, sy) = to_source(at);
+        let Some(SamplerInput {
+            active,
+            x,
+            nx,
+            ny,
+            basis,
+        }) = sampler_input(tab, sx, sy, sample, true)
+        else {
             return;
         };
-        let f = view_off + (at - rect.min) * ppp / view_scale;
-        let (sx, sy) = frame.to_source(f.x, f.y);
-        let Some(raw) = sample_luma(luma, sx, sy, sample) else {
-            return;
-        };
-        let (lw, lh) = (luma.output_dims.w as f32, luma.output_dims.h as f32);
-
-        let active = tab
-            .curve_active
-            .min(tab.params.curve.instances.len().saturating_sub(1));
-        let scene = (raw - tab.params.exposure.black) * tab.params.exposure.ev.exp2();
-        let (nx, ny, aspect) = (sx / lw, sy / lh, lh / lw);
         let limit = tab.curve_limit_tone;
-        // Whether a pass above the selected one is limited to a tone range: only then
-        // does what enters this pass depend on the picture around the pixel.
-        let tone_above = tab.params.curve.instances.iter().take(active).any(|pass| {
-            pass.live_mask()
-                .is_some_and(|mask| mask.live_tone().is_some())
-        });
-        let basis = if limit || tone_above {
-            let Some(render) = tab.render.as_mut() else {
-                return;
-            };
-            Some(render.viewport.zone_basis(&tab.params.effective()))
-        } else {
-            None
+        // "Limit to tone" reads the basis too, whether or not finding `x` needed it.
+        let basis = match basis {
+            Some(basis) => Some(basis),
+            None if limit => {
+                let effective = tab.params.effective();
+                tab.render
+                    .as_mut()
+                    .map(|render| render.viewport.zone_basis(&effective))
+            }
+            None => None,
         };
-        // **Where it was clicked, not only what tone.** A pass above the selected one may
-        // be masked, and what enters this pass at this pixel depends on whether that mask
-        // reached it. `apply_before_at` is the shader's own composition, so the point
-        // lands where the picture's tone actually is; a tone range above is weighed by
-        // the prepared mask's own value here, which is what the shader looked up.
-        let entering = tab
-            .params
-            .curve
-            .apply_before_at(active, scene, nx, ny, aspect, &|tone| {
-                basis.as_ref().map_or(1.0, |b| b.weight_at(tone, nx, ny))
-            });
-        let x = raw_core::Curve::to_normalized(entering);
         tab.params.curve.enabled = true;
         let Some(instance) = tab.params.curve.instances.get_mut(active) else {
             return;
         };
         // Put the point on the selected pass's current shape at the sampled input.
         // It is committed immediately (and can therefore reshape neighbouring
-        // spline segments); there is no preview-only marker to confirm later.
+        // spline segments); the hover dot was the preview, and this is where it was.
         let y = instance.curve.eval(x);
         instance.curve.enabled = true;
         tab.curve_point = Some(instance.curve.add(x, y));

@@ -1321,6 +1321,16 @@ impl Viewport {
         Arc::clone(&prepared.basis)
     }
 
+    /// [`Self::zone_basis`] without the wait: the basis if the worker already has it
+    /// for these parameters, and `None` (with the work started) if not. For something
+    /// drawn every frame, like the point sampler's dot, which may be a frame late but
+    /// must not stall one.
+    pub fn zone_basis_ready(&mut self, params: &Params) -> Option<Arc<raw_core::Basis>> {
+        self.zones
+            .request(&self.proxy, params, true, None, false)
+            .map(|prepared| Arc::clone(&prepared.basis))
+    }
+
     pub fn zones_ready(&mut self, params: &Params) -> bool {
         let view = self.view_tone();
         !self.needs_zones(params)

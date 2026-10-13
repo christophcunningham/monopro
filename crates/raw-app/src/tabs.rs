@@ -1261,6 +1261,10 @@ pub struct Tab {
     /// The selected control point in that instance, for arrow-key movement and EV
     /// readouts. Also view state.
     pub curve_point: Option<usize>,
+    /// Where the point sampler would put a point for the pixel under the pointer, as
+    /// the curve's normalized input — the dot the graph draws before the click. View
+    /// state, written by the sampler's tool each frame.
+    pub curve_hover: Option<f32>,
     /// The point sampler's "limit to tone" option: a click that places a point also sets
     /// the instance's tone range around the tone clicked, so dragging the point moves
     /// only those tones. View state, like which tool is armed: it changes nothing until
@@ -1435,6 +1439,7 @@ impl Tab {
             curve_drag: None,
             curve_active: 0,
             curve_point: None,
+            curve_hover: None,
             curve_limit_tone: false,
             curve_mask_reveal: None,
             mask_pin: None,

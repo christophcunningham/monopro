@@ -123,6 +123,9 @@ New
   Down open the folder above or below, Right expands a folder or steps into it, and
   Left folds it or steps out to its parent. Clicking a tile gives the arrows back to
   the grid. Whichever has them draws its selection in ruby and the other in gray.
+- With the Curve's point sampler armed, the graph shows where a point would land: a
+  hollow ring on the curve, with a faint line down to its input, follows the tone
+  under the pointer on the picture until you click.
 - Each row in the start page's Recent Folders and Recent Images shows an x under the
   pointer. Click it to take that row off the list; the folder or file itself is not
   touched.
