@@ -353,9 +353,8 @@ fn draw(
     // the app is running without allowing yesterday's working arrangement to
     // override the requested startup stack.
     let id = ui.make_persistent_id(("module", name));
-    let mut open = ui
-        .data_mut(|d| d.get_temp::<bool>(id))
-        .unwrap_or(open_on_start);
+    let was_open = ui.data_mut(|d| d.get_temp::<bool>(id));
+    let mut open = was_open.unwrap_or(open_on_start);
     if let Some(forced) = force {
         open = forced;
     }
@@ -367,6 +366,7 @@ fn draw(
         bypass: false,
         reset: false,
     };
+    let top = ui.cursor().top();
     card(ui, |ui| {
         ui.horizontal(|ui| {
             match enabled {
@@ -413,6 +413,20 @@ fn draw(
         }
     });
 
+    // **Opened, so brought into view.** A module that opens near the bottom of the panel
+    // used to unfold below the fold, out of sight of the click that opened it. On the
+    // frame it goes from closed to open — a click on its name, or a tool revealing it —
+    // the panel glides just far enough to show its bottom edge, and never so far that
+    // its name leaves the top: egui's unaligned scroll is exactly that rule. Not on a
+    // module's first frame, which is the panel being built rather than anything opening.
+    if was_open == Some(false) && open {
+        let rect = Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+        ui.scroll_to_rect_animation(
+            rect,
+            None,
+            egui::style::ScrollAnimation::new(1600.0, egui::Rangef::new(0.12, 0.25)),
+        );
+    }
     ui.data_mut(|d| d.insert_temp(id, open));
     ui.add_space(7.0);
     out
@@ -512,6 +526,22 @@ pub struct Row<'a> {
     decimals: usize,
     suffix: &'a str,
     tip: &'a str,
+    /// The track's response, for a range symmetric about zero: the value is
+    /// `reach · u · |u|^(p-1)` for a handle at `u` in `-1..=1`. See [`Row::shape`].
+    shape: Option<f32>,
+    readout: Option<Readout<'a>>,
+}
+
+/// A number field that shows and takes the value in other units than it is stored in —
+/// Black corr.'s L\* for a value kept in linear light.
+///
+/// `show` and `take` are each other's inverse. Typed and dragged numbers are clamped to
+/// `range` in the shown units; **the stored value is never clamped by being drawn**, so
+/// a sidecar value beyond today's range survives until it is edited.
+pub struct Readout<'a> {
+    pub show: Box<dyn Fn(f32) -> f32 + 'a>,
+    pub take: Box<dyn Fn(f32) -> f32 + 'a>,
+    pub range: std::ops::RangeInclusive<f32>,
 }
 
 impl<'a> Row<'a> {
@@ -571,6 +601,50 @@ impl<'a> Row<'a> {
             decimals: 2,
             suffix: "",
             tip: "",
+            shape: None,
+            readout: None,
+        }
+    }
+
+    /// Give the track a curved response, fine near zero and coarse at the ends: `2.0`
+    /// puts a quarter of the reach at the halfway mark. For a range symmetric about
+    /// zero, where the useful settings crowd the middle — Black corr.
+    pub fn shape(mut self, power: f32) -> Self {
+        debug_assert!(
+            (*self.range.start() + *self.range.end()).abs() < 1e-6,
+            "a shaped track needs a range symmetric about zero"
+        );
+        self.shape = Some(power);
+        self
+    }
+
+    /// Show and take the number in other units. See [`Readout`].
+    pub fn readout(mut self, readout: Readout<'a>) -> Self {
+        self.readout = Some(readout);
+        self
+    }
+
+    /// Where on the track, `0..=1`, a value sits.
+    fn track_of(&self, v: f32) -> f32 {
+        let (lo, hi) = (*self.range.start(), *self.range.end());
+        match self.shape {
+            None => ((v - lo) / (hi - lo).max(1e-9)).clamp(0.0, 1.0),
+            Some(p) => {
+                let u = (v / hi.max(1e-9)).clamp(-1.0, 1.0);
+                (u.signum() * u.abs().powf(1.0 / p) + 1.0) * 0.5
+            }
+        }
+    }
+
+    /// The value at a place on the track, `0..=1`.
+    fn value_at(&self, t: f32) -> f32 {
+        let (lo, hi) = (*self.range.start(), *self.range.end());
+        match self.shape {
+            None => lo + t * (hi - lo),
+            Some(p) => {
+                let u = t * 2.0 - 1.0;
+                u.signum() * u.abs().powf(p) * hi
+            }
         }
     }
 
@@ -638,10 +712,29 @@ impl<'a> Row<'a> {
                     egui::FontId::new(theme::size::SLIDER, egui::FontFamily::Proportional),
                 );
                 ui.style_mut().drag_value_text_style = egui::TextStyle::Button;
-                ui.add_sized(
-                    [Self::VALUE_W, h],
-                    slider_number(self.value, lo..=hi, self.decimals).suffix(self.suffix),
-                );
+                match &self.readout {
+                    None => {
+                        ui.add_sized(
+                            [Self::VALUE_W, h],
+                            slider_number(self.value, lo..=hi, self.decimals)
+                                .suffix(self.suffix),
+                        );
+                    }
+                    Some(readout) => {
+                        let (rlo, rhi) = (*readout.range.start(), *readout.range.end());
+                        let value = &mut *self.value;
+                        let field = egui::DragValue::from_get_set(|new| {
+                            if let Some(new) = new {
+                                *value = (readout.take)((new as f32).clamp(rlo, rhi));
+                            }
+                            f64::from((readout.show)(*value))
+                        })
+                        .speed(f64::from(rhi - rlo) / 300.0)
+                        .fixed_decimals(self.decimals)
+                        .suffix(self.suffix);
+                        ui.add_sized([Self::VALUE_W, h], field);
+                    }
+                }
             });
 
             // Whatever is left, capped. Both columns before it are exact now, so every
@@ -652,7 +745,7 @@ impl<'a> Row<'a> {
             // the zone mask.
             let w = ui.available_width().clamp(24.0, Self::TRACK_W);
             let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click_and_drag());
-            let t = ((*self.value - lo) / (hi - lo).max(1e-9)).clamp(0.0, 1.0);
+            let t = self.track_of(*self.value);
             // Half the handle at each end, so its edge never leaves the track.
             let (x0, x1) = (rect.left() + HANDLE_W * 0.5, rect.right() - HANDLE_W * 0.5);
             let y = rect.center().y;
@@ -661,7 +754,7 @@ impl<'a> Row<'a> {
                 && let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos())
             {
                 let u = ((p.x - x0) / (x1 - x0).max(1e-9)).clamp(0.0, 1.0);
-                *self.value = lo + u * (hi - lo);
+                *self.value = self.value_at(u);
             }
             if resp.double_clicked() {
                 *self.value = self.default;
@@ -1042,6 +1135,24 @@ impl<'a> Slider<'a> {
 
     pub fn suffix(mut self, s: &'a str) -> Self {
         self.0 = self.0.suffix(s);
+        self
+    }
+
+    /// See [`Row::shape`].
+    pub fn shape(mut self, power: f32) -> Self {
+        self.0 = self.0.shape(power);
+        self
+    }
+
+    /// See [`Readout`].
+    pub fn readout(mut self, readout: Readout<'a>) -> Self {
+        self.0 = self.0.readout(readout);
+        self
+    }
+
+    /// See [`Row::tip`].
+    pub fn tip(mut self, s: &'a str) -> Self {
+        self.0 = self.0.tip(s);
         self
     }
 

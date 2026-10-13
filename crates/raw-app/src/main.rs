@@ -7057,22 +7057,41 @@ impl App {
                 widgets::Slider::new(&mut tab.params.exposure.ev, 0.0, -6.0..=6.0, "Exposure")
                     .suffix(" EV")
                     .show(ui);
-                // ±0.150, not ±0.050: the small range could trim sensor-noise offset
-                // but not crush shadows, and crushing the black end is a print
-                // decision, not a calibration one. Scene values run to ~2.0, so 0.15
-                // is a real bite.
+                // **Read in L\*, moved on a curve.** The value is linear light taken off
+                // before exposure, and in those units the useful settings — a print's
+                // black point, L\* 0 to 15 — were the first eighth of the old ±0.15 track
+                // and four decimals of a number that said nothing about what went black.
+                // So the readout is the lightness that goes to black (negative: the one
+                // black is lifted to) as the picture shows it, the track is square-law so
+                // that range has room, and the reach stops at L\* 29. The stored value and
+                // the arithmetic are unchanged, so every sidecar renders as it did. See
+                // `ExposureParams::BLACK_REACH` and `black_lstar`.
                 // **`Black Corr.`, not `Black correction`.** the maintainer's abbreviation, and
                 // it buys track: the label column is sized to the longest label in the
                 // app, so the two longest ones were costing every slider in every module
                 // several points of length. See `widgets::Row::LABEL_W`.
-                widgets::Slider::new(
-                    &mut tab.params.exposure.black,
-                    0.0,
-                    -0.15..=0.15,
-                    "Black corr.",
-                )
-                .decimals(4)
-                .show(ui);
+                let reach = ExposureParams::BLACK_REACH;
+                let at_ev = ExposureParams {
+                    black: reach,
+                    ..tab.params.exposure
+                };
+                let most = at_ev.black_lstar();
+                let shown = at_ev;
+                widgets::Slider::new(&mut tab.params.exposure.black, 0.0, -reach..=reach, "Black corr.")
+                    .shape(2.0)
+                    .readout(widgets::Readout {
+                        show: Box::new(move |black| ExposureParams { black, ..shown }.black_lstar()),
+                        take: Box::new(move |lstar| shown.black_for_lstar(lstar)),
+                        range: -most..=most,
+                    })
+                    .decimals(1)
+                    .suffix(" L*")
+                    .tip(
+                        "The lightness below which tones go to black, as L*. Negative lifts \
+                         black to that lightness instead. Measured after Exposure, so the \
+                         same setting reaches further at a higher exposure.",
+                    )
+                    .show(ui);
             });
         tab.params.exposure.enabled ^= exposure.bypass;
         if exposure.reset {

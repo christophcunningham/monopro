@@ -123,6 +123,8 @@ New
   Down open the folder above or below, Right expands a folder or steps into it, and
   Left folds it or steps out to its parent. Clicking a tile gives the arrows back to
   the grid. Whichever has them draws its selection in ruby and the other in gray.
+- Opening a module near the bottom of the Develop panel scrolls the panel smoothly, just
+  far enough to show the whole module, without pushing its name off the top.
 - With the Curve's point sampler armed, the graph shows where a point would land: a
   hollow ring on the curve, with a faint line down to its input, follows the tone
   under the pointer on the picture until you click.
@@ -164,6 +166,10 @@ Changed
   gradient through its tone mask, where it used to show the tone mask alone. A
   brushed layer still shows its tone mask. It also works on a layer with no strokes
   yet, which it did not before.
+- Black corr. reads in L*: the lightness below which tones go to black, or, negative,
+  the lightness black is lifted to, as the picture shows it at the current exposure.
+  The slider is finer near zero, where a print's black point sits, and reaches L* 29
+  either way instead of almost middle gray. Edits made before look exactly as they did.
 - A new dodge or burn instance is now Command-Shift-D or Command-Shift-X while the
   brush is open, and Command-D duplicates the tab even then.
 - The keyboard shortcuts reference lists Shift-S and Shift-M under Navigation, with
