@@ -929,6 +929,9 @@ pub struct Lightbox {
     manual: Vec<String>,
     /// The tile being dragged, and where it would land — `None` when nothing is.
     drag: Option<(u32, usize)>,
+    /// The tile a press selected, until that press ends — so its click, arriving at
+    /// the release, is not acted on a second time. See `tile_ui`.
+    pressed_tile: Option<u32>,
     /// The multi-selection, as entry indices.
     ///
     /// **Separate from `selected`, which stays the anchor.** The two are different
@@ -976,6 +979,24 @@ pub struct Lightbox {
     /// same cost the Date sort pays, for one file rather than a folder. Re-read only
     /// when the selection moves.
     exif: Option<(PathBuf, Vec<Facts>)>,
+    /// **The read happens on a worker**, because it can take a third of a second:
+    /// rawler's DNG decoder ignores its "dimensions only" flag and decodes the whole
+    /// frame to report a size. On the UI thread that was a frozen grid — the new
+    /// selection's ring could not draw until the panel beside it had finished
+    /// reading — every time a tile was picked with METADATA showing.
+    ///
+    /// One key, so a quick run of clicks leaves at most one read running and the
+    /// latest one waiting; the results carry `exif_generation` so a read begun before
+    /// an IPTC save cannot land after it.
+    exif_queue: decode::Queue<u8, (u64, PathBuf, Vec<Facts>)>,
+    /// Bumped wherever `exif` is dropped as stale, retiring reads still in flight.
+    exif_generation: u64,
+    /// Facts read since the folder opened, oldest first, so going back to a frame
+    /// shows it at once. Bounded by [`EXIF_REMEMBERED`].
+    exif_remembered: Vec<(PathBuf, Vec<Facts>)>,
+    /// The file the last read was asked for, so a frame drawn while it runs does not
+    /// ask again.
+    exif_asked: Option<PathBuf>,
     /// A contextual filesystem action failed; the Lightbox footer carries the error.
     action_note: Option<String>,
     /// Develop settings copied from one tile, kept across folder changes for the
@@ -1127,6 +1148,11 @@ impl Lightbox {
             preview_failed: std::collections::HashSet::new(),
             preview_focus: None,
             exif: None,
+            exif_queue: decode::Queue::new(1),
+            exif_generation: 0,
+            exif_remembered: Vec::new(),
+            exif_asked: None,
+            pressed_tile: None,
             action_note: template_note,
             copied_develop: None,
             rename_dialog: None,
@@ -2562,7 +2588,7 @@ impl Lightbox {
         self.preview = None;
         self.preview_textures.clear();
         self.preview_focus = None;
-        self.exif = None;
+        self.forget_exif();
         self.iptc = None;
         self.reindex();
         self.search.reindex();
@@ -2766,7 +2792,7 @@ impl Lightbox {
         self.generation = self.generation.wrapping_add(1);
         self.tiles.clear();
         self.clear_selection();
-        self.exif = None;
+        self.forget_exif();
         self.drag = None;
         self.enter = None;
         self.manual.clear();
@@ -3207,6 +3233,7 @@ impl Lightbox {
     /// Accept only the current folder generation and keep failures out of busy state.
     pub fn collect(&mut self, ctx: &egui::Context) {
         self.poll_relist(ctx);
+        self.collect_exif(ctx);
         self.preview_failed
             .retain(|key| key.generation == self.generation);
         if self.queue.in_flight() > 0 || self.preview_queue.in_flight() > 0 {
@@ -3933,6 +3960,10 @@ fn captured_at(path: &Path, cache: Option<&Path>) -> Option<std::time::SystemTim
     }
     when
 }
+
+/// How many frames' facts the Metadata pane remembers. A screenful of stepping back
+/// and forth, at a few hundred bytes each.
+const EXIF_REMEMBERED: usize = 32;
 
 /// What the camera recorded, as rows for the shared EXIF `key / value` grid.
 /// Goes through `raw_core::sensor::Metadata` rather than reaching for rawler here,
@@ -5786,7 +5817,7 @@ impl Lightbox {
                 draft.saved[i] = draft.values[i].clone();
             }
         }
-        self.exif = None;
+        self.forget_exif();
         if !errors.is_empty() {
             self.action_note = Some(format!("IPTC was not saved — {}", errors.join("; ")));
         }
@@ -5838,7 +5869,7 @@ impl Lightbox {
         self.search.update_iptc(&saved, &updates);
 
         self.iptc = Some(IptcDraft::load(paths));
-        self.exif = None;
+        self.forget_exif();
         self.action_note = if errors.is_empty() {
             Some(format!("Applied metadata template “{}”", template.name))
         } else {
@@ -6177,6 +6208,65 @@ impl Lightbox {
 
     /// Camera and file facts remain read-only; IPTC beneath them is an authored
     /// sidecar overlay. A multi-selection edits only the field that was touched.
+    /// Drop the shown facts and everything remembered, and retire any read in flight.
+    /// For when what a file says may have changed: an IPTC save, another folder.
+    fn forget_exif(&mut self) {
+        self.exif = None;
+        self.exif_remembered.clear();
+        self.exif_generation = self.exif_generation.wrapping_add(1);
+        self.exif_queue.cancel(0);
+    }
+
+    /// Show `path`'s facts if they are known, or ask a worker for them.
+    fn want_exif(&mut self, path: &Path) {
+        if self.exif.as_ref().is_some_and(|(p, _)| p == path) {
+            return;
+        }
+        if let Some((_, facts)) = self.exif_remembered.iter().find(|(p, _)| p == path) {
+            self.exif = Some((path.to_path_buf(), facts.clone()));
+            return;
+        }
+        if self.exif_asked.as_deref() == Some(path) && self.exif_queue.is_busy(0) {
+            return;
+        }
+        let generation = self.exif_generation;
+        let path = path.to_path_buf();
+        self.exif_asked = Some(path.clone());
+        self.exif_queue.submit(0, decode::FOREGROUND, move || {
+            let facts = read_exif(&path);
+            (generation, path, facts)
+        });
+    }
+
+    /// Take a finished read: remember it, and show it if it is still the selection's.
+    fn collect_exif(&mut self, ctx: &egui::Context) {
+        while let Some((_, got)) = self.exif_queue.poll() {
+            let Ok((generation, path, facts)) = got else {
+                continue;
+            };
+            if generation != self.exif_generation {
+                continue;
+            }
+            self.exif_remembered.retain(|(p, _)| *p != path);
+            self.exif_remembered.push((path.clone(), facts.clone()));
+            if self.exif_remembered.len() > EXIF_REMEMBERED {
+                self.exif_remembered.remove(0);
+            }
+            let selected = self
+                .selected
+                .and_then(|i| self.entries.get(i as usize))
+                .is_some_and(|e| e.path == path);
+            if selected {
+                self.exif = Some((path, facts));
+            }
+        }
+        // Nothing wakes the frame when a worker finishes, so look again soon while a
+        // read is out. Only then: an idle Lightbox stays idle.
+        if self.exif_queue.in_flight() > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
     pub fn exif_ui(&mut self, ui: &mut egui::Ui, icons: &crate::icons::Icons) {
         let Some(path) = self
             .selected
@@ -6187,9 +6277,10 @@ impl Lightbox {
             return;
         };
 
-        if self.exif.as_ref().is_none_or(|(p, _)| *p != path) {
-            self.exif = Some((path.clone(), read_exif(&path)));
-        }
+        self.want_exif(&path);
+        // Until it lands, the last frame's rows stay up, faded: the panel keeps its
+        // shape rather than collapsing and refilling under the pointer on every click.
+        let reading = self.exif.as_ref().is_none_or(|(p, _)| *p != path);
 
         let paths = self.iptc_paths();
         if self
@@ -6250,7 +6341,12 @@ impl Lightbox {
                 if sections.is_empty() {
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
-                        ui.label(theme::caption("this file records nothing").color(theme::DIM));
+                        let say = if reading {
+                            "reading…"
+                        } else {
+                            "this file records nothing"
+                        };
+                        ui.label(theme::caption(say).color(theme::DIM));
                     });
                 }
                 ui.add_space(6.0);
@@ -6260,6 +6356,9 @@ impl Lightbox {
                 });
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
+                    if reading {
+                        ui.multiply_opacity(0.4);
+                    }
                     egui::Grid::new("lightbox-exif-rows")
                         .num_columns(2)
                         .spacing([10.0, 3.0])
@@ -7152,7 +7251,18 @@ impl Lightbox {
             egui::Sense::click_and_drag(),
         );
 
-        if r.clicked() {
+        // **On the press, not the release**, as Finder selects. egui reports a click
+        // when the button comes back up, so the ring used to arrive a beat after the
+        // tile was pressed — the lag the maintainer saw stepping tile to tile. The click
+        // is still honored when press and release land in one frame, which is the one
+        // time egui reports no press; `pressed_tile` stops a slower click acting twice,
+        // which for `⌘` would add the tile and take it straight back out.
+        let pressed = r.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
+        let unpressed_click = r.clicked() && self.pressed_tile.take() != Some(idx);
+        if pressed {
+            self.pressed_tile = Some(idx);
+        }
+        if pressed || unpressed_click {
             // **`⌘` adds one, `⇧` takes a run, a plain click starts again** — the
             // gestures every file browser has. The anchor is what a run is measured
             // from, which is why it is kept apart from the batch.
@@ -7216,6 +7326,10 @@ impl Lightbox {
                 [egui::pos2(x, card.min.y), egui::pos2(x, card.max.y)],
                 egui::Stroke::new(2.0, theme::RUBY),
             );
+        }
+        if r.drag_stopped() {
+            // A drag ends without a click, so the press it began with is settled here.
+            self.pressed_tile = None;
         }
         if r.drag_stopped()
             && let Some((dragged, before)) = self.drag.take()
@@ -9303,6 +9417,46 @@ mod tests {
         let e = &later.entries[0];
         assert_eq!(e.rating, 4);
         assert_eq!(e.label.as_deref(), Some("green"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metadata_is_read_off_the_frame_and_a_stale_read_never_lands() {
+        // The pane used to read on the UI thread, which froze the grid for a third of
+        // a second per DNG. Asking returns at once; the facts arrive on a later frame.
+        let (dir, raw) = scratch("exif-worker");
+        let mut lb = Lightbox::new();
+        lb.open_folder(&dir);
+        lb.selected = Some(0);
+        let ctx = egui::Context::default();
+        let wait = |lb: &mut Lightbox| {
+            let start = std::time::Instant::now();
+            while lb.exif_queue.in_flight() > 0 && start.elapsed().as_secs() < 10 {
+                lb.collect_exif(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            lb.collect_exif(&ctx);
+        };
+
+        lb.want_exif(&raw);
+        assert!(lb.exif.is_none(), "the read happened on the spot");
+        wait(&mut lb);
+        assert!(lb.exif.as_ref().is_some_and(|(p, _)| *p == raw));
+
+        // Remembered: going back to a frame needs no second read.
+        lb.exif = None;
+        lb.want_exif(&raw);
+        assert!(lb.exif.is_some(), "a frame already read was read again");
+        assert_eq!(lb.exif_queue.in_flight(), 0);
+
+        // A read begun before the facts were declared stale is not shown after.
+        lb.forget_exif();
+        lb.want_exif(&raw);
+        let begun = lb.exif_generation;
+        lb.exif_generation = lb.exif_generation.wrapping_add(1);
+        wait(&mut lb);
+        assert!(lb.exif.is_none(), "generation {begun}'s read landed after it was retired");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

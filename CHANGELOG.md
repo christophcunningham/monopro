@@ -121,6 +121,11 @@ New
 Faster
 - Dragging a point or an opacity in the Curve is several times faster, most of all
   with many instances.
+- Clicking from tile to tile in Lightbox is immediate. A tile is selected as you press
+  it rather than when you let go, and with the METADATA panel showing, the grid no
+  longer stops while the panel reads the file: a DNG took about a third of a second.
+  The panel shows the last picture's rows faded until the new ones arrive, and a
+  picture already looked at shows at once.
 
 Changed
 - The brush's Feather now means how much of the brush fades, as in Lightroom. A dab is
