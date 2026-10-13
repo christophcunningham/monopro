@@ -111,14 +111,16 @@ New
 - Shift-F brings the Lightbox FOLDERS panel forward, from Develop as well.
 - Scrolling can pan the picture instead of zooming it: Settings, Controls, Scrolling,
   Pans. Two fingers on a trackpad then move the picture around, in Develop and in the
-  compare grid, and a pinch or Command-scroll zooms.
+  compare grid, and a pinch or Command-scroll zooms. A pan stops at the edge of the
+  picture, so a flick cannot send it off the canvas, and a picture that fits the
+  window stays centered.
 - A pinch on a trackpad zooms the picture in Develop and the compare grid, whatever
   scrolling is set to.
 - Lightbox panels can be closed and popped out, as Develop's can. A panel's bar, or
   the tab strip for the panel that is showing, has a pop-out button and an x at its
   right end. A closed panel comes back from the Window menu, its key, or Tab twice; a
   popped-out panel goes back with the button on its window or by closing the window.
-  The grid itself stays put.
+  Resetting the panel positions brings every panel back. The grid itself stays put.
 - The arrow keys move through the folder tree once a folder has been clicked. Up and
   Down open the folder above or below, Right expands a folder or steps into it, and
   Left folds it or steps out to its parent. Clicking a tile gives the arrows back to
@@ -175,6 +177,8 @@ Changed
   made untouched areas look painted. Now the picture shows only as darker and lighter
   red, and a lighter, pinker film means the mask is partly there. This is the same
   overlay for Dodge & Burn and for a Curve mask.
+- Dragging the picture in Develop stops at its edge, with the margin around it, rather
+  than letting it slide off the canvas.
 - A new dodge or burn instance is now Command-Shift-D or Command-Shift-X while the
   brush is open, and Command-D duplicates the tab even then.
 - The keyboard shortcuts reference lists Shift-S and Shift-M under Navigation, with

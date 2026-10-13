@@ -1027,6 +1027,33 @@ impl View {
         self.scale = new_scale;
         self.off = source_under_anchor - anchor / new_scale;
     }
+
+    /// Hold a pan to the picture: after a drag or a scroll, the picture may not leave
+    /// the viewport.
+    ///
+    /// Per axis, in output pixels. Where the picture and `margin` around it fit in the
+    /// view, it stays centred, as at fit; where it is larger, its edges may come no
+    /// further in than `margin`, so a pan can reach the edge of the picture and the
+    /// mount around it but no further. `viewport` and `margin` are in screen pixels;
+    /// `picture` is where the picture sits on the grid the view pans over, mount
+    /// excluded.
+    ///
+    /// **Why it exists:** a trackpad's two-finger scroll carries momentum, and with
+    /// Scrolling set to pan a flick sent the picture off the canvas with nothing left
+    /// on screen to drag back — and the slightest scroll at fit shoved it off-centre.
+    pub fn keep_in_view(&mut self, viewport: egui::Vec2, picture: egui::Rect, margin: f32) {
+        let scale = self.scale.max(1e-6);
+        let margin = margin / scale;
+        for axis in 0..2 {
+            let visible = viewport[axis] / scale;
+            let (lo, len) = (picture.min[axis] - margin, picture.size()[axis] + margin * 2.0);
+            self.off[axis] = if len <= visible {
+                lo - (visible - len) * 0.5
+            } else {
+                self.off[axis].clamp(lo, lo + len - visible)
+            };
+        }
+    }
 }
 
 impl Default for View {
@@ -2325,6 +2352,36 @@ pub fn stem_of(path: &Path) -> &str {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn a_pan_cannot_take_the_picture_off_the_canvas() {
+        // A 1000 x 500 picture at 100% in an 800 x 600 view, with no margin.
+        let picture = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 500.0));
+        let viewport = egui::vec2(800.0, 600.0);
+        let mut view = View {
+            scale: 1.0,
+            off: egui::vec2(-5000.0, 900.0),
+            fit: false,
+        };
+        view.keep_in_view(viewport, picture, 0.0);
+        // Wider than the view: the left edge stops at the view's left edge.
+        assert_eq!(view.off.x, 0.0);
+        // Shorter than the view: centred, whatever the pan asked for.
+        assert_eq!(view.off.y, -50.0);
+        view.off.x = 5000.0;
+        view.keep_in_view(viewport, picture, 0.0);
+        assert_eq!(view.off.x, 200.0, "the right edge stops at the view's right edge");
+
+        // A margin, in screen pixels, lets the pan reach past the edge by that much.
+        view.off.x = -5000.0;
+        view.keep_in_view(viewport, picture, 40.0);
+        assert_eq!(view.off.x, -40.0);
+        // At 50% the same screen margin is twice as many output pixels.
+        view.scale = 0.5;
+        view.off.x = -5000.0;
+        view.keep_in_view(egui::vec2(400.0, 600.0), picture, 40.0);
+        assert_eq!(view.off.x, -80.0);
+    }
 
     #[test]
     fn showing_the_loupe_takes_the_mode_and_centres_it() {

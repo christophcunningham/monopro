@@ -10149,10 +10149,12 @@ impl App {
         // Pan, unless a mode has claimed the drag. Dodge/Burn deliberately lends the
         // drag back while Space is held: a temporary hand tool, not a mode change, so
         // the selected layer and brush remain armed when Space comes up.
+        let mut panned = false;
         if response.dragged() && mode.pans_with_drag(brush_pan) {
             let d = response.drag_delta() * ppp / view.scale;
             view.off -= d;
             view.fit = false;
+            panned = true;
         }
         // Inverted before it is used, not at the call site, so anything that reads
         // the wheel later reads it the way the user set it.
@@ -10174,6 +10176,7 @@ impl App {
                 settings::Scroll::Pan if scroll != egui::Vec2::ZERO => {
                     view.off -= scroll * ppp / view.scale;
                     view.fit = false;
+                    panned = true;
                 }
                 _ => {}
             }
@@ -10185,6 +10188,19 @@ impl App {
                 view.zoom_about(anchor_for(to), to);
                 view.fit = false;
             }
+        }
+
+        // **A pan keeps the picture on the canvas**, a drag's as much as a scroll's: the
+        // picture and the fit's margin and mount around it, centred where they fit and
+        // held at their edges where they do not. Only on a frame that panned, so a
+        // zoom or a tool that moves the view is left where it put it.
+        if panned && !view.fit {
+            let margin = VIEW_FIT_MARGIN * ppp + surround.width.max(0.0);
+            let picture = egui::Rect::from_min_size(
+                fit_origin.to_pos2(),
+                egui::vec2(fit_w, fit_h),
+            );
+            view.keep_in_view(egui::vec2(out_w as f32, out_h as f32), picture, margin);
         }
 
         // Fit last, so it wins for this frame when requested and always recomputes

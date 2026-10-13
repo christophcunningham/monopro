@@ -1317,6 +1317,12 @@ impl Lightbox {
         self.panel_sizes.clear();
         self.tree_restructured = false;
         self.tuck = Default::default();
+        // **Every panel back, docked.** A reset that left a closed panel closed or a
+        // floating one floating would be the half-reset Develop's own reset is tested
+        // against: the arrangement you asked for, minus the panel you were missing.
+        self.closed.clear();
+        self.out.clear();
+        self.raise = None;
     }
 
     pub fn save(&self, storage: &mut dyn eframe::Storage) {
@@ -9937,6 +9943,20 @@ mod tests {
         for pane in [Pane::Folders, Pane::Search, Pane::Exif] {
             assert!(visible(&lb, pane), "{pane:?} stayed closed through tab");
         }
+    }
+
+    #[test]
+    fn resetting_the_layout_brings_back_closed_and_floating_panels() {
+        let mut lb = Lightbox::new();
+        lb.close_pane(Pane::Search);
+        lb.float_pane(Pane::Favorites);
+        lb.reset_tree();
+        lb.settle_visibility();
+        for pane in [Pane::Search, Pane::Favorites] {
+            let id = lb.tree.tiles.find_pane(&pane).expect("in the default tree");
+            assert!(lb.tree.is_visible(id), "{pane:?} was left out by a reset");
+        }
+        assert!(lb.closed.is_empty() && lb.out.is_empty());
     }
 
     #[test]
