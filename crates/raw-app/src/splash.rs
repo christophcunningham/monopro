@@ -38,7 +38,8 @@
 //! it, so it lives in eframe's storage beside `open.last_dir` rather than in
 //! `settings.toml`; see `App::save`. A path that has gone by the next launch is
 //! dropped when the list is read back, so the page never offers a row that cannot
-//! open.
+//! open. A row's `×`, shown under the pointer, takes it off the list; it never
+//! touches the file or folder.
 
 use std::path::{Path, PathBuf};
 
@@ -152,6 +153,23 @@ impl Recent {
     pub fn image(&mut self, path: &Path) {
         self.dirty |= touch(&mut self.images, path);
     }
+
+    /// Take a folder off the list. Only the list: the folder stays where it is.
+    pub fn forget_folder(&mut self, dir: &Path) {
+        self.dirty |= forget(&mut self.folders, dir);
+    }
+
+    /// Take an image off the list. Only the list: the file stays where it is.
+    pub fn forget_image(&mut self, path: &Path) {
+        self.dirty |= forget(&mut self.images, path);
+    }
+}
+
+/// Drop `path` from `list`. Whether it was there.
+fn forget(list: &mut Vec<PathBuf>, path: &Path) -> bool {
+    let before = list.len();
+    list.retain(|p| p != path);
+    list.len() != before
 }
 
 fn keep(list: Vec<PathBuf>, exists: fn(&Path) -> bool) -> Vec<PathBuf> {
@@ -192,8 +210,10 @@ pub enum Go {
     Folder(PathBuf),
     /// Open this image in Develop, or bring its tab forward.
     Image(PathBuf),
-    /// Bring the folder tree forward.
-    Browse,
+    /// Take this folder off Recent Folders, and nothing more.
+    ForgetFolder(PathBuf),
+    /// Take this image off Recent Images, and nothing more.
+    ForgetImage(PathBuf),
     /// The open dialog.
     Open,
     Lightbox,
@@ -278,17 +298,9 @@ fn height_of(page: &Page<'_>) -> f32 {
 fn lightbox_page(ui: &mut egui::Ui, icons: &Icons, folders: &[PathBuf]) -> Option<Go> {
     let mut go = None;
     title(ui, "START");
-    if row(
-        ui,
-        icons,
-        "tree-view",
-        "Use the folder tree to start",
-        Meta::None,
-    )
-    .clicked()
-    {
-        go = Some(Go::Browse);
-    }
+    // **Words, not a button.** The tree is already on screen to the left, and a row
+    // that lit up and pointed only at it read as a link to somewhere else.
+    note(ui, icons, "tree-view", "Use the folder tree to start");
     ui.add_space(GAP);
     title(ui, "RECENT FOLDERS");
     if folders.is_empty() {
@@ -300,8 +312,10 @@ fn lightbox_page(ui: &mut egui::Ui, icons: &Icons, folders: &[PathBuf]) -> Optio
             |n| n.to_string_lossy().into_owned(),
         );
         let place = dir.parent().map(tilde).unwrap_or_default();
-        if row(ui, icons, "folder", &name, Meta::Text(&place)).clicked() {
-            go = Some(Go::Folder(dir.clone()));
+        match row(ui, icons, "folder", &name, Meta::Text(&place), true) {
+            Pick::Open => go = Some(Go::Folder(dir.clone())),
+            Pick::Forget => go = Some(Go::ForgetFolder(dir.clone())),
+            Pick::None => {}
         }
     }
     ui.add_space(GAP);
@@ -324,7 +338,7 @@ fn develop_page(ui: &mut egui::Ui, icons: &Icons, images: &[PathBuf]) -> Option<
     let mut go = None;
     title(ui, "START");
     let open = chord(hotkeys::Action::OpenFile);
-    if row(ui, icons, "camera-plus", "Open Image", Meta::Key(&open)).clicked() {
+    if row(ui, icons, "camera-plus", "Open Image", Meta::Key(&open), false) == Pick::Open {
         go = Some(Go::Open);
     }
     caption(ui, "or drop a raw file on the window");
@@ -343,8 +357,10 @@ fn develop_page(ui: &mut egui::Ui, icons: &Icons, images: &[PathBuf]) -> Option<
             .and_then(Path::file_name)
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if row(ui, icons, "file-image", &name, Meta::Text(&folder)).clicked() {
-            go = Some(Go::Image(path.clone()));
+        match row(ui, icons, "file-image", &name, Meta::Text(&folder), true) {
+            Pick::Open => go = Some(Go::Image(path.clone())),
+            Pick::Forget => go = Some(Go::ForgetImage(path.clone())),
+            Pick::None => {}
         }
     }
     ui.add_space(GAP);
@@ -428,25 +444,72 @@ fn caption(ui: &mut egui::Ui, text: &str) {
     );
 }
 
+/// A row's icon and words, laid out as a row but not one: no hover, no click. For a
+/// line that tells you what to do somewhere else on screen.
+fn note(ui: &mut egui::Ui, icons: &Icons, icon: &str, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+    let glyph = Rect::from_center_size(
+        pos2(rect.left() + INSET + 7.0, rect.center().y),
+        Vec2::splat(14.0),
+    );
+    icons::paint_at(ui, icons, icon, "·", glyph, theme::DIM, 13.0);
+    ui.painter().text(
+        pos2(rect.left() + LABEL_X, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(theme::size::BODY),
+        theme::NAME,
+    );
+}
+
 /// What sits at the right end of a row.
 enum Meta<'a> {
-    None,
     /// Where the thing is, in the dim gray.
     Text(&'a str),
     /// The key that does the same thing.
     Key(&'a str),
 }
 
+/// What a click on a row asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    None,
+    /// The row itself.
+    Open,
+    /// Its `×`.
+    Forget,
+}
+
 /// A full-width row: icon, name, and a place or a key at the right.
+///
+/// `forget` gives it an `×` at the right end, drawn while the pointer is on the row,
+/// that takes it off its list. Its slot is kept whether or not it shows, so the
+/// place beside it does not jump sideways as the pointer crosses the rows.
 fn row(
     ui: &mut egui::Ui,
     icons: &Icons,
     icon: &str,
     label: &str,
     meta: Meta<'_>,
-) -> egui::Response {
+    forget: bool,
+) -> Pick {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-    let hot = resp.hovered();
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    // After the row's own `interact`, so the later widget wins the click and the `×`
+    // forgets rather than opens — the pane tab's close button does the same.
+    let cross = forget.then(|| {
+        let at = Rect::from_center_size(
+            pos2(rect.right() - INSET - icons::BOX * 0.5, rect.center().y),
+            Vec2::splat(icons::BOX),
+        );
+        let hit = ui
+            .interact(at, resp.id.with("forget"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(theme::tip("remove from this list — the file stays where it is"));
+        (at, hit)
+    });
+    // Lit while the pointer is anywhere on it, the `×` included.
+    let hot = resp.hovered() || cross.as_ref().is_some_and(|(_, hit)| hit.hovered());
     let painter = ui.painter();
     if hot {
         painter.rect_filled(rect, 2.0, theme::CHROME_DEEP);
@@ -466,8 +529,21 @@ fn row(
     );
 
     let mut right = rect.right() - INSET;
+    if let Some((at, hit)) = &cross {
+        if hot {
+            if hit.hovered() {
+                painter.rect_filled(*at, 2.0, Color32::from_gray(64));
+            }
+            let tint = if hit.hovered() {
+                Color32::from_gray(245)
+            } else {
+                theme::DIM
+            };
+            icons::paint(ui, icons, "close", "×", *at, tint);
+        }
+        right = at.left() - 6.0;
+    }
     match meta {
-        Meta::None => {}
         Meta::Text(text) => {
             let font = FontId::proportional(theme::size::FOOTER);
             let fitted = crate::lightbox::elide(ui, text, &font, rect.width() * 0.45);
@@ -498,7 +574,13 @@ fn row(
         galley,
         ink,
     );
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    if cross.is_some_and(|(_, hit)| hit.clicked()) {
+        Pick::Forget
+    } else if resp.clicked() {
+        Pick::Open
+    } else {
+        Pick::None
+    }
 }
 
 /// The bottom row: a rule, then each link with its key, separated by dots.
@@ -736,6 +818,23 @@ mod tests {
         recent.folder(Path::new("/b"));
         assert!(recent.dirty);
         assert_eq!(recent.folders, paths(&["/b", "/a"]));
+    }
+
+    #[test]
+    fn forgetting_takes_one_row_off_and_says_so() {
+        let mut recent = Recent {
+            images: paths(&["/a.dng", "/b.dng", "/c.dng"]),
+            ..Recent::default()
+        };
+        recent.forget_image(Path::new("/b.dng"));
+        assert_eq!(recent.images, paths(&["/a.dng", "/c.dng"]));
+        assert!(recent.dirty, "a shorter list has to be written");
+
+        // A row already gone changes nothing, so nothing is written.
+        recent.dirty = false;
+        recent.forget_image(Path::new("/b.dng"));
+        recent.forget_folder(Path::new("/b.dng"));
+        assert!(!recent.dirty);
     }
 
     #[test]

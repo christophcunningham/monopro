@@ -109,6 +109,9 @@ New
   Shift-5 rate and label the open picture, and the same key again takes it off. The
   title strip shows the stars and the label's dot after the exposure.
 - Shift-F brings the Lightbox FOLDERS panel forward, from Develop as well.
+- Each row in the start page's Recent Folders and Recent Images shows an x under the
+  pointer. Click it to take that row off the list; the folder or file itself is not
+  touched.
 
 Faster
 - Dragging a point or an opacity in the Curve is several times faster, most of all
@@ -143,6 +146,8 @@ Changed
   brush is open, and Command-D duplicates the tab even then.
 - The keyboard shortcuts reference lists Shift-S and Shift-M under Navigation, with
   the new Shift-F.
+- "Use the folder tree to start" on the Lightbox start page is plain text now rather
+  than a row that lit up like a link.
 
 Fixed
 - A tool open on the picture no longer blinks out, or misses a press, in the moment

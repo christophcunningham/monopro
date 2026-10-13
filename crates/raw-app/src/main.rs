@@ -1826,7 +1826,8 @@ impl App {
     fn follow(&mut self, go: splash::Go, ctx: &egui::Context, rs: &egui_wgpu::RenderState) {
         match go {
             splash::Go::Folder(dir) => self.lightbox.open_folder(&dir),
-            splash::Go::Browse => self.lightbox.reveal_pane(lightbox::Pane::Folders),
+            splash::Go::ForgetFolder(dir) => self.recent.forget_folder(&dir),
+            splash::Go::ForgetImage(path) => self.recent.forget_image(&path),
             splash::Go::Image(path) => {
                 self.home = false;
                 // An image that already has a tab is brought forward rather than
