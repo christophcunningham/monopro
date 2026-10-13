@@ -114,6 +114,15 @@ New
   compare grid, and a pinch or Command-scroll zooms.
 - A pinch on a trackpad zooms the picture in Develop and the compare grid, whatever
   scrolling is set to.
+- Lightbox panels can be closed and popped out, as Develop's can. A panel's bar, or
+  the tab strip for the panel that is showing, has a pop-out button and an x at its
+  right end. A closed panel comes back from the Window menu, its key, or Tab twice; a
+  popped-out panel goes back with the button on its window or by closing the window.
+  The grid itself stays put.
+- The arrow keys move through the folder tree once a folder has been clicked. Up and
+  Down open the folder above or below, Right expands a folder or steps into it, and
+  Left folds it or steps out to its parent. Clicking a tile gives the arrows back to
+  the grid. Whichever has them draws its selection in ruby and the other in gray.
 - Each row in the start page's Recent Folders and Recent Images shows an x under the
   pointer. Click it to take that row off the list; the folder or file itself is not
   touched.

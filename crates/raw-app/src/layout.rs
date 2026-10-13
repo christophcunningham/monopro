@@ -1292,7 +1292,9 @@ impl Layout {
 
 /// A container is visible when any of its children are. Depth first, because the
 /// answer for a container depends on the answer for everything under it.
-fn settle_container(tree: &mut egui_tiles::Tree<Pane>, id: TileId) -> bool {
+///
+/// Generic over the pane, because Lightbox's tree asks the same question of its own.
+pub(crate) fn settle_container<P>(tree: &mut egui_tiles::Tree<P>, id: TileId) -> bool {
     let children = match tree.tiles.get(id) {
         Some(Tile::Container(container)) => container.children_vec(),
         _ => return tree.is_visible(id),
@@ -1449,6 +1451,87 @@ pub fn panel_head(
     });
     ui.add_space(6.0);
     out
+}
+
+/// A panel's `×`: the close icon in the dim gray, lit on a gray square under the
+/// pointer. True on the frame it is clicked.
+///
+/// **Interact it after whatever it sits on** — a tab, a title that senses drags — so
+/// the later widget wins the click and the `×` closes rather than starting a drag of
+/// the thing under it. One function for Develop's tabs and Lightbox's, so the two
+/// cannot drift into two looks for one control.
+pub(crate) fn close_button(
+    ui: &mut egui::Ui,
+    icons: &icons::Icons,
+    id: egui::Id,
+    rect: egui::Rect,
+    tip: &str,
+) -> bool {
+    let close = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(theme::tip(tip));
+    let hot = close.hovered();
+    if hot {
+        ui.painter()
+            .rect_filled(rect, 2.0, egui::Color32::from_gray(64));
+    }
+    let tint = if hot {
+        egui::Color32::from_gray(245)
+    } else {
+        theme::DIM
+    };
+    icons::paint(ui, icons, "close", "×", rect, tint);
+    close.clicked()
+}
+
+/// The strip at the top of a floating panel: the app's own title bar, for Develop's
+/// panels and Lightbox's alike.
+///
+/// On macOS the OS decorations are off: a document-style titlebar eats a chunk of
+/// a tool palette that is mostly controls, so the strip supplies drag and dock.
+/// Windows and Linux retain their native titlebar and controls; this remains the
+/// pane header and way to dock it, but the OS owns window movement.
+///
+/// **The drag region stops short of the button, and that is not tidiness.** It
+/// covered the whole strip, registered *after* the button, and a later widget at
+/// the same position wins egui's hit-test — so the dock button never saw a click
+/// and pressing it dragged the window instead. With the decorations off there is
+/// no OS close button either, so that one control was the only route back into the
+/// frame and the pop-out was effectively one-way.
+pub fn floating_bar(icons: &icons::Icons, ui: &mut egui::Ui, name: &str, docked: &mut bool) {
+    let mut button = egui::Rect::NOTHING;
+    let bar = egui::Frame::new()
+        .fill(theme::CHROME_DEEP)
+        .inner_margin(egui::Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                theme::header_label(ui, name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let dock = icons::button(ui, icons, "dock", "↙", true)
+                        .on_hover_text(theme::tip("put it back in the frame"));
+                    button = dock.rect;
+                    if dock.clicked() {
+                        *docked = true;
+                    }
+                });
+            });
+        });
+
+    let mut drag_rect = bar.response.rect;
+    drag_rect.max.x = drag_rect.max.x.min(button.left() - 4.0);
+    if crate::platform::draws_custom_window_chrome()
+        && drag_rect.width() > 0.0
+        && ui
+            .interact(
+                drag_rect,
+                ui.id().with(("drag", name)),
+                egui::Sense::click_and_drag(),
+            )
+            .is_pointer_button_down_on()
+    {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1636,26 +1719,16 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                 egui::pos2(rect.right() - pad - icons::BOX * 0.5, rect.center().y),
                 egui::Vec2::splat(icons::BOX),
             );
-            // After the tab's own `interact`, so the later widget wins the click and
-            // the × closes rather than starting a drag of the tab under it.
-            let close = ui
-                // Keyed off the tab's own id rather than the `Ui`'s running auto-id,
-                // so it is the same button frame to frame however the bar is scrolled.
-                .interact(close_rect, id.with("close"), egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(theme::tip("close panel — tab brings them back"));
-            let hot = close.hovered();
-            if hot {
-                ui.painter()
-                    .rect_filled(close_rect, 2.0, egui::Color32::from_gray(64));
-            }
-            let tint = if hot {
-                egui::Color32::from_gray(245)
-            } else {
-                theme::DIM
-            };
-            icons::paint(ui, &self.app.icons, "close", "×", close_rect, tint);
-            if close.clicked() && self.on_tab_close(tiles, tile_id) {
+            // Keyed off the tab's own id rather than the `Ui`'s running auto-id, so it
+            // is the same button frame to frame however the bar is scrolled.
+            if close_button(
+                ui,
+                &self.app.icons,
+                id.with("close"),
+                close_rect,
+                "close panel — tab brings them back",
+            ) && self.on_tab_close(tiles, tile_id)
+            {
                 tiles.remove(tile_id);
             }
         }

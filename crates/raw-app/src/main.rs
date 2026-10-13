@@ -2202,7 +2202,7 @@ fn steal_bare_keys(events: &mut Vec<egui::Event>, steal_space: bool) -> (bool, b
     (tab, space)
 }
 
-fn take_bare_tab(ctx: &egui::Context) -> bool {
+pub(crate) fn take_bare_tab(ctx: &egui::Context) -> bool {
     if ctx.text_edit_focused() {
         return false;
     }
@@ -3852,6 +3852,23 @@ impl eframe::App for App {
                     i.modifiers.shift,
                 )
             });
+            // **The folder tree takes them when it was clicked last** — see
+            // `lightbox::Focus`. Quick Look keeps them whatever was clicked: with a
+            // picture up full-frame, the arrows step pictures.
+            let tree = self.lightbox.tree_has_keys() && !self.lightbox.previewing();
+            if tree {
+                for (pressed, key) in [
+                    (up, egui::Key::ArrowUp),
+                    (down, egui::Key::ArrowDown),
+                    (left, egui::Key::ArrowLeft),
+                    (right, egui::Key::ArrowRight),
+                ] {
+                    if pressed {
+                        self.lightbox.tree_key(key);
+                    }
+                }
+            }
+            let (left, right, up, down) = (left && !tree, right && !tree, up && !tree, down && !tree);
             // **`⇧` extends rather than moves**, which is the keyboard half of the
             // gesture `⇧`+click already performs. Read as a modifier on the arrow rather
             // than as four more keys, because it is one rule over all four directions.
@@ -4556,57 +4573,6 @@ impl App {
             });
         });
         action
-    }
-
-    /// The strip at the top of a floating panel: the app's own title bar.
-    ///
-    /// On macOS the OS decorations are off: a document-style titlebar eats a chunk of
-    /// a tool palette that is mostly controls, so the strip supplies drag and dock.
-    /// Windows and Linux retain their native titlebar and controls; this remains the
-    /// pane header and way to dock it, but the OS owns window movement.
-    ///
-    /// **The drag region stops short of the button, and that is not tidiness.** It
-    /// covered the whole strip, registered *after* the button, and a later widget at
-    /// the same position wins egui's hit-test — so the dock button never saw a click
-    /// and pressing it dragged the window instead. With the decorations off there is
-    /// no OS close button either, so that one control was the only route back into the
-    /// frame and the pop-out was effectively one-way. The comment that used to sit
-    /// here claimed the buttons kept their clicks; they did not.
-    fn floating_bar(icons: &icons::Icons, ui: &mut egui::Ui, name: &str, docked: &mut bool) {
-        let mut button = egui::Rect::NOTHING;
-        let bar = egui::Frame::new()
-            .fill(theme::CHROME_DEEP)
-            .inner_margin(egui::Margin::symmetric(8, 5))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    theme::header_label(ui, name);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let dock = icons::button(ui, icons, "dock", "↙", true)
-                            .on_hover_text(theme::tip("put it back in the frame"));
-                        button = dock.rect;
-                        if dock.clicked() {
-                            *docked = true;
-                        }
-                    });
-                });
-            });
-
-        // Everything left of the button. Drag it to move the window, the way the title
-        // bar we removed would have.
-        let mut drag_rect = bar.response.rect;
-        drag_rect.max.x = drag_rect.max.x.min(button.left() - 4.0);
-        if platform::draws_custom_window_chrome()
-            && drag_rect.width() > 0.0
-            && ui
-                .interact(
-                    drag_rect,
-                    ui.id().with(("drag", name)),
-                    egui::Sense::click_and_drag(),
-                )
-                .is_pointer_button_down_on()
-        {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
     }
 
     /// The whole develop column: the pinned head, then the scrolling modules.
@@ -6541,7 +6507,7 @@ impl App {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ui, |ui| {
-                        Self::floating_bar(&self.icons, ui, "DEVELOP", &mut docked);
+                        layout::floating_bar(&self.icons, ui, "DEVELOP", &mut docked);
                         let _ = self.develop_column(ui, Head::FLOATING);
                     });
             },
@@ -6577,7 +6543,7 @@ impl App {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ui, |ui| {
-                        Self::floating_bar(&self.icons, ui, "DODGE / BURN", &mut docked);
+                        layout::floating_bar(&self.icons, ui, "DODGE / BURN", &mut docked);
                         ui.add_space(4.0);
                         if self.tabs.active().is_none_or(|t| !t.has_image()) {
                             layout::empty_state(ui, "no image open");
@@ -6610,7 +6576,7 @@ impl App {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ui, |ui| {
-                        Self::floating_bar(&self.icons, ui, "INFO", &mut docked);
+                        layout::floating_bar(&self.icons, ui, "INFO", &mut docked);
                         ui.add_space(4.0);
                         let icons = &self.icons;
                         match self.tabs.active_mut() {
@@ -6650,7 +6616,7 @@ impl App {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ui, |ui| {
-                        Self::floating_bar(&self.icons, ui, "SNAPSHOTS", &mut docked);
+                        layout::floating_bar(&self.icons, ui, "SNAPSHOTS", &mut docked);
                         ui.add_space(4.0);
                         if self.tabs.active().is_none_or(|t| !t.has_image()) {
                             layout::empty_state(ui, "no image open");
@@ -6695,7 +6661,7 @@ impl App {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ui, |ui| {
-                        Self::floating_bar(&self.icons, ui, "HISTORY", &mut docked);
+                        layout::floating_bar(&self.icons, ui, "HISTORY", &mut docked);
                         ui.add_space(4.0);
                         if self.tabs.active().is_none_or(|t| !t.has_image()) {
                             layout::empty_state(ui, "no image open");

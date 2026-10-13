@@ -93,6 +93,11 @@ Letter shortcuts are suppressed while typing into text fields.
 Ratings and color labels act on the selection in Lightbox, and on the open picture
 in Develop, where the title strip shows them after the exposure.
 
+The arrow keys move through whichever list was clicked last: the grid's tiles, or
+the folder tree once a folder has been clicked. In the tree, Up and Down open the
+folder above or below, Right expands a folder or steps into it, and Left folds it or
+steps out to its parent. The list that has the keys draws its selection in ruby.
+
 | Key | Action |
 |---|---|
 | `Space` | Quick Look selected image |
