@@ -5531,11 +5531,21 @@ fn viewed(
     Some((px, vp.basis_rebuilds()))
 }
 
-/// What the film does to a display pixel where the mask weighs `m`.
+/// What the film does to a display pixel where the mask weighs `m`: toward the solid
+/// red `MaskLook::film` gives for the picture's own lightness there.
 fn filmed(under: [u8; 3], m: f32) -> [f32; 3] {
-    let k = MaskLook::FILM * (1.0 - m);
+    let k = 1.0 - m;
+    let lum = (0.2126 * f32::from(under[0])
+        + 0.7152 * f32::from(under[1])
+        + 0.0722 * f32::from(under[2]))
+        / 255.0;
+    let film = MaskLook::film(lum);
     let mix = |v: u8, film: f32| f32::from(v) * (1.0 - k) + film * 255.0 * k;
-    [mix(under[0], 1.0), mix(under[1], 0.0), mix(under[2], 0.0)]
+    [
+        mix(under[0], film[0]),
+        mix(under[1], film[1]),
+        mix(under[2], film[2]),
+    ]
 }
 
 #[test]
@@ -5583,9 +5593,12 @@ fn the_overlay_films_what_a_mask_protects_and_leaves_what_it_selects_clear() {
         }
     }
     assert!(soft > w / 4, "the grad had no soft middle to check");
-    // Fully protected, the picture is a quarter of itself under three quarters of red.
+    // Fully protected, the film is solid: none of the picture's green or blue is left
+    // to turn the red pink, and the red is darker than full so a bright picture under
+    // it cannot be mistaken for a clear one.
     let (under, got) = (rgb(&plain, w, w - 2, 16), rgb(&film, w, w - 2, 16));
-    assert!(got[0] > 200 && got[1] < under[1] / 3 + 2, "{got:?}");
+    assert!(got[1] <= 8 && got[2] <= 8, "picture showing through the film: {got:?}");
+    assert!(got[0] < 200 && got[0] > under[0] / 2, "{got:?} over {under:?}");
 }
 
 #[test]

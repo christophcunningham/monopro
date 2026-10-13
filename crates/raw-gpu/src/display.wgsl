@@ -455,11 +455,14 @@ fn main(
     // the view is opened to judge, survives.
     //
     // 128 lays red film over what the mask PROTECTS and leaves what it selects clear:
-    // Photoshop's layer-mask overlay, and the darkroom's rubylith. Pure red at 75% where
-    // the mask is zero (`MaskLook::FILM`), thinning as the mask rises, so a soft edge
-    // reads as a soft edge. Interpolated toward the film rather than multiplied by it:
-    // a multiply cannot redden a black shadow, and a protected shadow has to read as
-    // protected.
+    // Photoshop's layer-mask overlay, and the darkroom's rubylith. **Solid red** where
+    // the mask is zero, its value following the picture's from 0.40 over black to 0.70
+    // over white with almost no green or blue (`MaskLook::film`), thinning as the mask
+    // rises, so a soft edge reads as a soft edge. Solid, because the 25% of picture that
+    // used to show through turned the film pink over anything bright, and pink is how a
+    // partly masked edge looks — bright, untouched picture read as painted. Interpolated
+    // toward the film rather than multiplied by it: a multiply cannot redden a black
+    // shadow, and a protected shadow has to read as protected.
     if ((p.overlays & 192u) != 0u) {
         let at = source_coord(gid.xy);
         let sw = f32(p.src_w);
@@ -468,7 +471,8 @@ fn main(
         if ((p.overlays & 64u) != 0u) {
             rgb = vec3<f32>(m, m, m) * vec3<f32>(1.0, 0.886, 0.157);
         } else {
-            rgb = mix(rgb, vec3<f32>(1.0, 0.0, 0.0), 0.75 * (1.0 - m));
+            let film = vec3<f32>(0.40 + 0.30 * clamp(o, 0.0, 1.0), 0.02, 0.02);
+            rgb = mix(rgb, film, 1.0 - m);
         }
     }
 

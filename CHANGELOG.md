@@ -170,6 +170,11 @@ Changed
   the lightness black is lifted to, as the picture shows it at the current exposure.
   The slider is finer near zero, where a print's black point sits, and reaches L* 29
   either way instead of almost middle gray. Edits made before look exactly as they did.
+- The mask overlay is solid red over what the mask protects. Before, a quarter of the
+  picture showed through, which turned the red pink over a bright sky or a pale wall and
+  made untouched areas look painted. Now the picture shows only as darker and lighter
+  red, and a lighter, pinker film means the mask is partly there. This is the same
+  overlay for Dodge & Burn and for a Curve mask.
 - A new dodge or burn instance is now Command-Shift-D or Command-Shift-X while the
   brush is open, and Command-D duplicates the tab even then.
 - The keyboard shortcuts reference lists Shift-S and Shift-M under Navigation, with

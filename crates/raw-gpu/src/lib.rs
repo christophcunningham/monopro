@@ -542,16 +542,33 @@ pub enum MaskLook {
     Mask,
     /// The picture, with red film over what the mask protects: Photoshop's layer-mask
     /// overlay and the darkroom's rubylith. Where the pass applies in full the picture is
-    /// clear, and where it does not apply at all the film is [`MaskLook::FILM`] deep.
-    /// For seeing the mask against the subject it was made for.
+    /// clear, and where it does not apply at all the film is solid — see
+    /// [`MaskLook::film`]. For seeing the mask against the subject it was made for.
     Overlay,
 }
 
 impl MaskLook {
-    /// How much of the film shows where a mask protects completely. The maintainer's
-    /// figure, from Photoshop's overlay set to 75%: deep enough to read at a glance as
-    /// "not here", with the picture still legible under it.
-    pub const FILM: f32 = 0.75;
+    /// The film's red where the mask protects completely, over black picture and over
+    /// white: [`Self::FILM_DARK`] to [`Self::FILM_LIGHT`], with [`Self::FILM_REST`] of
+    /// green and blue.
+    ///
+    /// **Solid red, its value following the picture's.** The film used to be 75% red
+    /// over 25% of the picture, and that quarter of a bright sky or a pale cliff turned
+    /// the red pink — which is also how the film looks where it thins over a partly
+    /// masked edge, so bright, untouched picture read as painted. The maintainer saw it in
+    /// Dodge & Burn. Now the picture shows under the film only as darker and lighter red,
+    /// and pink means one thing: the mask is partial there.
+    pub fn film(picture: f32) -> [f32; 3] {
+        let red = Self::FILM_DARK + (Self::FILM_LIGHT - Self::FILM_DARK) * picture.clamp(0.0, 1.0);
+        [red, Self::FILM_REST, Self::FILM_REST]
+    }
+
+    /// The film's red over black picture. See [`Self::film`].
+    pub const FILM_DARK: f32 = 0.40;
+    /// The film's red over white picture. See [`Self::film`].
+    pub const FILM_LIGHT: f32 = 0.70;
+    /// The film's green and blue: nearly none, so it never reads as pink.
+    pub const FILM_REST: f32 = 0.02;
 }
 
 impl Overlays {
