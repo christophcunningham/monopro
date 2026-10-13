@@ -162,6 +162,11 @@ Changed
 Fixed
 - A tool open on the picture no longer blinks out, or misses a press, in the moment
   tone masks are being prepared after a change.
+- The print loupe shows toning. It was always gray; it now shows the toned print in
+  color, Before and After both, matching the picture around it.
+- Developed thumbnails in Lightbox keep their toning when GRAY is on. GRAY now grays
+  only the camera's own color thumbnails. The contact sheet's Developed preview keeps a
+  developed picture's toning the same way.
 
 ## 0.2.1 — 2026-09-26
 

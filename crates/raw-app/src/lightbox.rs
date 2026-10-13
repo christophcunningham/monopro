@@ -832,7 +832,7 @@ pub struct Lightbox {
     entries: Vec<Entry>,
     generation: u32,
     tiles: HashMap<u32, Tile>,
-    queue: decode::Queue<Key, Option<raw_core::preview::Rgb8>>,
+    queue: decode::Queue<Key, Option<Thumb>>,
     /// Quick Look cannot wait behind a screenful of thumbnail jobs. One dedicated
     /// worker also bounds its peak memory: full previews are much larger than tiles.
     preview_queue: decode::Queue<Key, Option<raw_core::preview::Rgb8>>,
@@ -911,7 +911,8 @@ pub struct Lightbox {
     /// Files the grid cannot draw. Mirrors `Settings::lightbox_other_files`. Private
     /// for the same reason as `show_folders`.
     show_other_files: bool,
-    /// Draw the thumbnails as gray. Mirrors `Settings::lightbox_gray`; mutation goes
+    /// Draw the camera's thumbnails as gray, and leave developed ones as rendered — see
+    /// [`Thumb`]. Mirrors `Settings::lightbox_gray`; mutation goes
     /// through [`Lightbox::set_grey`] because changing it invalidates every thumbnail
     /// texture already in hand.
     grey: bool,
@@ -3258,8 +3259,12 @@ impl Lightbox {
                 }
             };
             match got {
-                Some(img) => {
-                    let colour = if self.grey {
+                Some(Thumb { img, developed }) => {
+                    // **GRAY is for the camera's picture, not for yours.** A developed
+                    // tile is already monochrome by construction, and any color it has
+                    // is the toning you put there — graying it took away the one
+                    // thing it had to say.
+                    let colour = if self.grey && !developed {
                         grey_image(&img)
                     } else {
                         egui::ColorImage::from_rgb([img.w, img.h], &img.data)
@@ -3551,6 +3556,17 @@ pub fn store_edited_tile(
         && stamp.matches(image)
 }
 
+/// A tile's pixels, and whether they are a developed render of the frame rather than
+/// the camera's or the file's own picture.
+///
+/// The difference matters to anything that grays a tile: the camera's picture is in
+/// color and graying it is a preview of the frame as monochrome, while a developed
+/// render is monochrome already and its only color is chemical toning.
+pub(crate) struct Thumb {
+    pub img: raw_core::preview::Rgb8,
+    pub developed: bool,
+}
+
 /// One thumbnail: the disk cache if it has one, the raw's embedded JPEG otherwise.
 ///
 /// Runs on a queue worker, so it takes owned data and touches nothing shared.
@@ -3559,7 +3575,7 @@ fn thumbnail(
     cache: Option<&Path>,
     prefer_edited: bool,
     upright_as: Option<raw_core::Orientation>,
-) -> Option<raw_core::preview::Rgb8> {
+) -> Option<Thumb> {
     // **The edited tile first, when it is wanted and there is one.** This is the
     // prototype's second pass, except the render happened in Develop rather than
     // here — see [`store_edited_tile`]. A file nobody has opened since the feature
@@ -3570,7 +3586,10 @@ fn thumbnail(
         && let Ok(bytes) = std::fs::read(&file)
         && let Some(img) = decode_jpeg(&bytes)
     {
-        return Some(img);
+        return Some(Thumb {
+            img,
+            developed: true,
+        });
     }
 
     let cached = cache
@@ -3581,7 +3600,10 @@ fn thumbnail(
         && let Ok(bytes) = std::fs::read(file)
         && let Some(img) = decode_jpeg(&bytes)
     {
-        return Some(img);
+        return Some(Thumb {
+            img,
+            developed: false,
+        });
     }
 
     // A raw hands over its embedded JPEG; an ordinary picture is simply decoded and
@@ -3616,7 +3638,10 @@ fn thumbnail(
         }
     }
 
-    Some(img)
+    Some(Thumb {
+        img,
+        developed: false,
+    })
 }
 
 /// Contact sheets share Lightbox's edited-tile contract but may ask for more pixels
@@ -3629,23 +3654,30 @@ pub(crate) fn contact_thumbnail(
     prefer_edited: bool,
     edge: u32,
     upright_as: Option<raw_core::Orientation>,
-) -> Option<raw_core::preview::Rgb8> {
+) -> Option<Thumb> {
     if prefer_edited
         && let Some(dir) = cache
         && let Some(file) = edited_cache_name(path, dir)
         && let Ok(bytes) = std::fs::read(file)
         && let Some(image) = decode_jpeg(&bytes)
     {
-        return Some(image);
+        return Some(Thumb {
+            img: image,
+            developed: true,
+        });
     }
     if edge <= raw_core::preview::TILE_EDGE {
         return thumbnail(path, cache, false, upright_as);
     }
-    if is_raw(path) {
+    let img = if is_raw(path) {
         raw_core::preview::screen(path, edge, upright_as)
     } else {
         image_screen(path, edge)
-    }
+    }?;
+    Some(Thumb {
+        img,
+        developed: false,
+    })
 }
 
 /// Every raw in a folder, and optionally in everything below it.
@@ -6883,7 +6915,9 @@ impl Lightbox {
                 // and `theme::label_colour` are spelt the way they are two lines from
                 // a button that is not.
                 if theme::bracket(ui, if self.grey { "GRAY" } else { "COLOR" }, self.grey, 8.0)
-                    .on_hover_text(theme::tip("Show the thumbnails as gray"))
+                    .on_hover_text(theme::tip(
+                        "Show the camera's thumbnails as gray — developed ones keep their toning",
+                    ))
                     .clicked()
                 {
                     act.grey = Some(!self.grey);
@@ -8661,7 +8695,9 @@ mod tests {
 
         let t = std::time::Instant::now();
         let cold =
-            thumbnail(&raw, Some(&cache), false, None).expect("a tile from a raw that has one");
+            thumbnail(&raw, Some(&cache), false, None)
+                .expect("a tile from a raw that has one")
+                .img;
         let cold_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let files: Vec<_> = std::fs::read_dir(&cache).unwrap().flatten().collect();
@@ -8672,7 +8708,9 @@ mod tests {
         );
 
         let t = std::time::Instant::now();
-        let warm = thumbnail(&raw, Some(&cache), false, None).expect("the cached tile");
+        let warm = thumbnail(&raw, Some(&cache), false, None)
+            .expect("the cached tile")
+            .img;
         let warm_ms = t.elapsed().as_secs_f64() * 1e3;
 
         assert_eq!(
@@ -10225,7 +10263,12 @@ mod tests {
         })
         .unwrap();
 
-        let got = thumbnail(&raw, Some(&cache), true, None).expect("the edited tile");
+        let Thumb {
+            img: got,
+            developed,
+        } = thumbnail(&raw, Some(&cache), true, None).expect("the edited tile");
+        // Said so, because GRAY leaves a developed tile's toning alone.
+        assert!(developed, "an edited tile has to say it is one");
         assert_eq!(
             (got.w, got.h),
             (w as usize, h as usize),

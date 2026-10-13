@@ -299,7 +299,9 @@ pub struct Settings {
     /// setting because Contact Sheet has its own Developed choice. No render at browse
     /// time, no device per worker; this setting controls only what the Lightbox grid shows.
     pub lightbox_xmp_thumbnails: bool,
-    /// Show Lightbox thumbnails in gray. **Live**, and also a footer toggle.
+    /// Show Lightbox thumbnails in gray. **Live**, and also a footer toggle. Only the
+    /// camera's own thumbnails: a developed one is monochrome already, and its color is
+    /// toning.
     ///
     /// On by default because this is a monochrome editor: the contact sheet should
     /// open in the same visual language as Develop. Turning it off is remembered,
