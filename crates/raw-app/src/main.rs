@@ -413,9 +413,14 @@ struct App {
     /// the earliest point at which the AppKit pieces it drive exist. `None`
     /// until then, and inert off macOS and outside a bundle; see `updater`.
     updates: Option<updater::Updates>,
-    /// The update sheet (badge click, menu route, About button). View state, not
-    /// a preference — nothing here is written to `settings.toml`.
+    /// The update sheet (badge click, the menu's Check for Updates, and About's Show
+    /// Update). View state, not a preference — nothing here is written to
+    /// `settings.toml`.
     update_sheet_open: bool,
+    /// Why About's Check for Updates could not start — not in this build, or an
+    /// export still writing — shown beside the button that was pressed. Cleared by
+    /// the next press.
+    update_check_refused: Option<String>,
     /// The update badge the user dismissed with its `×`. It stays hidden while
     /// the badge would say the same thing, and returns when that changes.
     update_badge_dismissed: Option<(String, bool)>,
@@ -463,6 +468,7 @@ impl App {
             menus_installed: false,
             updates: None,
             update_sheet_open: false,
+            update_check_refused: None,
             update_badge_dismissed: None,
             tabs: Tabs::new(),
             lightbox: lightbox::Lightbox::new(),
@@ -2721,6 +2727,45 @@ fn frame_visual_center(tab: &Tab) -> Option<[f32; 2]> {
 /// that should be glanced at. A field the file did not record is dropped rather than
 /// shown as a dash — an em-dash in a row of exposure values reads as "this was zero",
 /// which is a different claim from "unknown".
+/// What Settings › About says under Check for Updates. See [`update_readout`].
+#[derive(Debug, PartialEq)]
+struct UpdateReadout {
+    /// The version you have, and the one on offer when there is one.
+    version: String,
+    /// The updater's one line, and whether it is a failure.
+    status: Option<(String, bool)>,
+    /// An update is on offer, so the sheet has choices to show.
+    offer: bool,
+}
+
+/// About's update readout, from the updater's state.
+///
+/// The running version comes from the build rather than the bundle, so a development
+/// build says which version it is too; `./package` stamps the bundle from the same
+/// workspace version. A refused check speaks for itself, and otherwise the updater's
+/// own status line — "checking…", "up to date", a download's progress or why it
+/// failed — is shown as it would be in the sheet.
+fn update_readout(updates: Option<&updater::Updates>, refused: Option<&str>) -> UpdateReadout {
+    let current = env!("CARGO_PKG_VERSION");
+    let offer = updates.is_some_and(updater::Updates::has_offer);
+    let version = match updates.filter(|_| offer) {
+        Some(u) => u.sheet_version_line(),
+        None => format!("You have monopro {current}"),
+    };
+    let status = match refused {
+        Some(why) => Some((why.to_owned(), true)),
+        None => updates.and_then(|u| {
+            u.sheet_status()
+                .map(|line| (line.to_owned(), u.badge().is_some_and(|b| b.failed)))
+        }),
+    };
+    UpdateReadout {
+        version,
+        status,
+        offer,
+    }
+}
+
 fn exposure_line(m: &raw_core::sensor::Metadata) -> String {
     // **Present is not the same as meaningful.** A Fuji file in the corpus records
     // `aperture: Some(NaN)` and `focal_len: Some(0.0)` — an adapted manual lens the
@@ -9789,9 +9834,29 @@ impl App {
             pan_to.0 -= d.x / (cw * zoom).max(1.0);
             pan_to.1 -= d.y / (ch * zoom).max(1.0);
         }
-        let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
-        if scroll.abs() > 0.0 && ui.rect_contains_pointer(area) {
-            zoom_to = (zoom * (1.0 + scroll * 0.004)).clamp(1.0, tabs::Compare::MAX_ZOOM);
+        // The viewport's rule: scrolling does what Settings says, and a pinch or
+        // `⌘`-scroll zooms whichever that is.
+        let (scroll, pinch) = ui.ctx().input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
+        let scroll = scroll
+            * if self.settings.invert_scroll {
+                -1.0
+            } else {
+                1.0
+            };
+        if ui.rect_contains_pointer(area) {
+            match self.settings.scroll() {
+                settings::Scroll::Zoom if scroll.y != 0.0 => {
+                    zoom_to = (zoom * (1.0 + scroll.y * 0.004)).clamp(1.0, tabs::Compare::MAX_ZOOM);
+                }
+                settings::Scroll::Pan => {
+                    pan_to.0 -= scroll.x / (cw * zoom).max(1.0);
+                    pan_to.1 -= scroll.y / (ch * zoom).max(1.0);
+                }
+                _ => {}
+            }
+            if pinch != 1.0 {
+                zoom_to = (zoom_to * pinch).clamp(1.0, tabs::Compare::MAX_ZOOM);
+            }
         }
         // Never past the edges: at fit there is nowhere to go, and the room to pan
         // grows as the zoom does. Clamped in the same normalised units the pan is in.
@@ -10031,16 +10096,35 @@ impl App {
         }
         // Inverted before it is used, not at the call site, so anything that reads
         // the wheel later reads it the way the user set it.
-        let scroll = ctx.input(|i| i.smooth_scroll_delta.y)
+        let (scroll, pinch) = ctx.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
+        let scroll = scroll
             * if self.settings.invert_scroll {
                 -1.0
             } else {
                 1.0
             };
-        if self.settings.scroll_zoom && scroll != 0.0 && response.hovered() {
-            let to = view.scale * (1.0 + scroll * 0.002);
-            view.zoom_about(anchor_for(to), to);
-            view.fit = false;
+        if response.hovered() {
+            match self.settings.scroll() {
+                settings::Scroll::Zoom if scroll.y != 0.0 => {
+                    let to = view.scale * (1.0 + scroll.y * 0.002);
+                    view.zoom_about(anchor_for(to), to);
+                    view.fit = false;
+                }
+                // Both axes, the way a drag pans: the picture follows the fingers.
+                settings::Scroll::Pan if scroll != egui::Vec2::ZERO => {
+                    view.off -= scroll * ppp / view.scale;
+                    view.fit = false;
+                }
+                _ => {}
+            }
+            // **A pinch zooms whatever scrolling does**, and so does `⌘` with the
+            // wheel, which egui reports the same way. With scrolling set to pan, these
+            // are how you zoom by hand.
+            if pinch != 1.0 {
+                let to = view.scale * pinch;
+                view.zoom_about(anchor_for(to), to);
+                view.fit = false;
+            }
         }
 
         // Fit last, so it wins for this frame when requested and always recomputes
@@ -14139,6 +14223,7 @@ impl App {
         let mut reset_all = false;
         let mut reveal_data = false;
         let mut check_updates_now = false;
+        let mut show_update_sheet = false;
         let mut stop_skipping = false;
 
         ctx.show_viewport_immediate(
@@ -14933,12 +15018,33 @@ impl App {
                     }),
                     );
                 }
-                if sheet.shows(ui, settings::Section::Controls, "INPUT scroll wheel invert zoom keyboard shortcuts hotkeys keys tooltips hover") {
+                if sheet.shows(ui, settings::Section::Controls, "INPUT scroll scrolling wheel trackpad two finger pan pinch invert zoom keyboard shortcuts hotkeys keys tooltips hover") {
                     settings::heading(ui, "INPUT");
                     settings::rule(ui);
                     settings::check(ui, &mut s.invert_scroll, d.invert_scroll, "Invert scroll direction");
                     settings::rule(ui);
-                    settings::check(ui, &mut s.scroll_zoom, d.scroll_zoom, "Zoom with the scroll wheel");
+                    // One choice where there was a zoom switch: scrolling can't both zoom
+                    // and pan, and "Does nothing" is what the switch's off was.
+                    let mut scroll = s.scroll();
+                    let reset_scroll = settings::combo_width(
+                        ui,
+                        scroll != d.scroll(),
+                        "Scrolling",
+                        scroll.label(),
+                        140.0,
+                        |ui| {
+                            for choice in settings::Scroll::ALL {
+                                ui.selectable_value(&mut scroll, choice, choice.label());
+                            }
+                        },
+                    );
+                    if reset_scroll {
+                        scroll = d.scroll();
+                    }
+                    if scroll != s.scroll() {
+                        s.set_scroll(scroll);
+                    }
+                    settings::note(ui, "Two fingers on a trackpad, or the wheel. Pinch or ⌘-scroll to zoom whichever this is.");
                     settings::rule(ui);
                     settings::check(ui, &mut s.tooltips, d.tooltips, "Show hover tooltips");
                     settings::rule(ui);
@@ -15027,13 +15133,37 @@ impl App {
                                 .to_owned(),
                         });
                         ui.horizontal(|ui| {
-                            if ui.button("Check for Updates…").clicked() {
+                            // No ellipsis: the answer comes back here, not in a sheet.
+                            if ui.button("Check for Updates").clicked() {
                                 check_updates_now = true;
                             }
                             if skipped.is_some() && ui.button("Stop skipping").clicked() {
                                 stop_skipping = true;
                             }
                         });
+                        // **The answer, where the question was asked**: the version you
+                        // have, and what the feed said. Only an update on offer sends
+                        // you to the sheet, because only then is there a choice to make.
+                        let readout = update_readout(
+                            self.updates.as_ref(),
+                            self.update_check_refused.as_deref(),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(readout.version)
+                                .size(theme::size::BODY)
+                                .color(theme::BRIGHT),
+                        );
+                        if let Some((line, failed)) = readout.status {
+                            ui.label(
+                                egui::RichText::new(line)
+                                    .size(theme::size::CAPTION)
+                                    .color(if failed { theme::RUBY } else { theme::NAME }),
+                            );
+                        }
+                        if readout.offer && ui.button("Show Update…").clicked() {
+                            show_update_sheet = true;
+                        }
                         settings::rule(ui);
                     }
                     settings::heading(ui, "ACKNOWLEDGMENTS");
@@ -15084,13 +15214,15 @@ impl App {
         // The manual check and the un-skip, acted on out here for the same reason
         // `reveal_data` is: the panel body holds the settings borrow, and both
         // routes write through the updater (which persists its own skip copy).
-        // The sheet opens with the check so its result has somewhere to land.
+        // The result lands in About beside the button, not in the sheet; the sheet
+        // opens only when asked to show an update that is on offer.
         if check_updates_now {
-            if let Some(updates) = &mut self.updates
-                && let Some(why) = updates.check_now(&mut self.settings)
-            {
-                self.pending_note = Some(why);
-            }
+            self.update_check_refused = match &mut self.updates {
+                Some(updates) => updates.check_now(&mut self.settings),
+                None => Some("updates are not available in this build".to_owned()),
+            };
+        }
+        if show_update_sheet {
             self.update_sheet_open = true;
         }
         if stop_skipping && let Some(updates) = &mut self.updates {
@@ -15171,6 +15303,26 @@ const ACKNOWLEDGMENTS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn about_says_which_version_you_have_and_why_a_check_did_not_start() {
+        // With no updater — a test, or a build outside a bundle — the version still
+        // shows, and pressing the button says why nothing happened, beside it.
+        let quiet = update_readout(None, None);
+        assert_eq!(
+            quiet.version,
+            format!("You have monopro {}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(quiet.status, None);
+        assert!(!quiet.offer);
+
+        let refused = update_readout(None, Some("updates are not available in this build"));
+        assert_eq!(
+            refused.status,
+            Some(("updates are not available in this build".to_owned(), true))
+        );
+        assert!(!refused.offer);
+    }
 
     fn pipeline_for(p: &Params, unit: Unit) -> [Stanza; 3] {
         let dims = raw_core::Dims { w: 7864, h: 5200 };

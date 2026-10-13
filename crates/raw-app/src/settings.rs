@@ -398,7 +398,17 @@ pub struct Settings {
     /// statement about the wheel rather than about zooming.
     pub invert_scroll: bool,
     /// Whether the wheel zooms at all. Off leaves the keys, which are exact.
+    /// Superseded by `scroll_pans` when that is on; read both through
+    /// [`Settings::scroll`].
     pub scroll_zoom: bool,
+    /// Scrolling — two fingers on a trackpad, or the wheel — **pans** the picture
+    /// instead of zooming it, and a pinch or `⌘`-scroll zooms. The maintainer's ask:
+    /// on a trackpad, scrolling is how a picture is moved around everywhere else.
+    ///
+    /// A key of its own rather than a new value for `scroll_zoom`, so a file written
+    /// before it existed means what it always meant, and one written after it still
+    /// zooms in a build that does not know the key.
+    pub scroll_pans: bool,
     /// The whole hotkey table, on or off.
     ///
     /// **`,` is exempt and cannot be disabled.** Turning every key off from a window
@@ -624,6 +634,7 @@ impl Default for Settings {
             start_in_develop: false,
             invert_scroll: false,
             scroll_zoom: true,
+            scroll_pans: false,
             hotkeys_enabled: true,
             tooltips: true,
             warn_unsaved_duplicates: true,
@@ -704,6 +715,50 @@ impl Settings {
 
     pub fn reference_values(&self) -> ReferenceValues {
         ReferenceValues::from_key(&self.reference_values).unwrap_or_default()
+    }
+
+    /// What scrolling does to a picture that can be zoomed. Panning wins over the
+    /// older zoom switch, which it supersedes.
+    pub fn scroll(&self) -> Scroll {
+        if self.scroll_pans {
+            Scroll::Pan
+        } else if self.scroll_zoom {
+            Scroll::Zoom
+        } else {
+            Scroll::Nothing
+        }
+    }
+
+    /// Set what scrolling does. Panning leaves `scroll_zoom` on, so a build that
+    /// predates `scroll_pans` zooms rather than doing nothing.
+    pub fn set_scroll(&mut self, to: Scroll) {
+        (self.scroll_zoom, self.scroll_pans) = match to {
+            Scroll::Zoom => (true, false),
+            Scroll::Pan => (true, true),
+            Scroll::Nothing => (false, false),
+        };
+    }
+}
+
+/// What scrolling does to the picture in Develop and in the compare grid. A pinch,
+/// and `⌘` with the wheel, zoom whichever this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scroll {
+    Zoom,
+    Pan,
+    /// The keys only, which are exact.
+    Nothing,
+}
+
+impl Scroll {
+    pub const ALL: [Self; 3] = [Self::Zoom, Self::Pan, Self::Nothing];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Zoom => "Zooms",
+            Self::Pan => "Pans",
+            Self::Nothing => "Does nothing",
+        }
     }
 }
 
@@ -1766,6 +1821,7 @@ mod tests {
             start_in_develop: true,
             invert_scroll: true,
             scroll_zoom: false,
+            scroll_pans: true,
             hotkeys_enabled: false,
             tooltips: false,
             warn_unsaved_duplicates: false,
@@ -1779,6 +1835,25 @@ mod tests {
             proof_depth: "8".into(),
         };
         assert_eq!(roundtrip(&s), s);
+    }
+
+    #[test]
+    fn scrolling_reads_the_old_switch_until_panning_is_chosen() {
+        // A file from before `scroll_pans` means what it always meant.
+        let old: Settings = toml::from_str("scroll_zoom = false").unwrap();
+        assert_eq!(old.scroll(), Scroll::Nothing);
+        assert_eq!(Settings::default().scroll(), Scroll::Zoom);
+
+        // Every choice survives being written, and panning keeps the old switch on so
+        // a build that does not know the new key still zooms.
+        for choice in Scroll::ALL {
+            let mut s = Settings::default();
+            s.set_scroll(choice);
+            assert_eq!(roundtrip(&s).scroll(), choice);
+        }
+        let mut s = Settings::default();
+        s.set_scroll(Scroll::Pan);
+        assert!(s.scroll_zoom);
     }
 
     #[test]

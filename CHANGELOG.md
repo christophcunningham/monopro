@@ -109,6 +109,11 @@ New
   Shift-5 rate and label the open picture, and the same key again takes it off. The
   title strip shows the stars and the label's dot after the exposure.
 - Shift-F brings the Lightbox FOLDERS panel forward, from Develop as well.
+- Scrolling can pan the picture instead of zooming it: Settings, Controls, Scrolling,
+  Pans. Two fingers on a trackpad then move the picture around, in Develop and in the
+  compare grid, and a pinch or Command-scroll zooms.
+- A pinch on a trackpad zooms the picture in Develop and the compare grid, whatever
+  scrolling is set to.
 - Each row in the start page's Recent Folders and Recent Images shows an x under the
   pointer. Click it to take that row off the list; the folder or file itself is not
   touched.
@@ -148,6 +153,11 @@ Changed
   the new Shift-F.
 - "Use the folder tree to start" on the Lightbox start page is plain text now rather
   than a row that lit up like a link.
+- Check for Updates in Settings, About answers right there: the version you have,
+  then "checking", "up to date", or the version on offer with a Show Update button.
+  It no longer opens the update sheet unless there is an update to show. The
+  "Zoom with the scroll wheel" switch is now the Scrolling menu's Zooms and Does
+  nothing.
 
 Fixed
 - A tool open on the picture no longer blinks out, or misses a press, in the moment
