@@ -4789,7 +4789,7 @@ impl App {
                 ..Default::default()
             })
             .show(ui, |ui| {
-                clicks = layout::panel_head(ui, &self.icons, head, "TONING", |_| {});
+                clicks = layout::panel_head(ui, &self.icons, head, "TONING");
                 if self.tabs.active().is_none_or(|t| !t.has_image()) {
                     layout::empty_state(ui, "no image open");
                     return;
@@ -4874,7 +4874,7 @@ impl App {
                 ..Default::default()
             })
             .show(ui, |ui| {
-                clicks = layout::panel_head(ui, &self.icons, head, "DODGE / BURN", |_| {});
+                clicks = layout::panel_head(ui, &self.icons, head, "DODGE / BURN");
                 if self.tabs.active().is_none_or(|t| !t.has_image()) {
                     layout::empty_state(ui, "no image open");
                     return;
@@ -6059,7 +6059,7 @@ impl App {
                 ..Default::default()
             })
             .show(ui, |ui| {
-                clicks = layout::panel_head(ui, &self.icons, head, "HISTORY", |_| {});
+                clicks = layout::panel_head(ui, &self.icons, head, "HISTORY");
             });
         if self.tabs.active().is_none_or(|t| !t.has_image()) {
             layout::empty_state(ui, "no image open");
@@ -6263,7 +6263,7 @@ impl App {
                 ..Default::default()
             })
             .show(ui, |ui| {
-                clicks = layout::panel_head(ui, &self.icons, head, "SNAPSHOTS", |_| {});
+                clicks = layout::panel_head(ui, &self.icons, head, "SNAPSHOTS");
                 if self.tabs.active().is_none_or(|t| !t.has_image()) {
                     layout::empty_state(ui, "no image open");
                     return;
@@ -6538,7 +6538,7 @@ impl App {
                 ..Default::default()
             })
             .show(ui, |ui| {
-                clicks = layout::panel_head(ui, &self.icons, head, "INFO", |_| {});
+                clicks = layout::panel_head(ui, &self.icons, head, "INFO");
                 // Bound out of `self` so the closure captures the field rather than
                 // the whole struct — `tabs` is taken mutably two lines down.
                 let icons = &self.icons;
@@ -6569,7 +6569,7 @@ impl App {
         let mut docked = false;
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("monopro-develop"),
-            platform::panel_viewport("develop", [360.0, 820.0]),
+            platform::panel_viewport("develop", [360.0, 820.0], platform::app_is_active(ctx)),
             |ui, _class| {
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
                     docked = true;
@@ -6605,7 +6605,7 @@ impl App {
         );
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("monopro-dodgeburn"),
-            platform::panel_viewport("dodge / burn", [340.0, 620.0]),
+            platform::panel_viewport("dodge / burn", [340.0, 620.0], platform::app_is_active(ctx)),
             |ui, _class| {
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
                     docked = true;
@@ -6638,7 +6638,7 @@ impl App {
         let scroll_id = ("info-scroll", self.scroll_session, self.tabs.active_id());
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("monopro-info"),
-            platform::panel_viewport("info", [340.0, 620.0]),
+            platform::panel_viewport("info", [340.0, 620.0], platform::app_is_active(ctx)),
             |ui, _class| {
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
                     docked = true;
@@ -6678,7 +6678,7 @@ impl App {
         );
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("monopro-snapshots"),
-            platform::panel_viewport("snapshots", [340.0, 620.0]),
+            platform::panel_viewport("snapshots", [340.0, 620.0], platform::app_is_active(ctx)),
             |ui, _class| {
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
                     docked = true;
@@ -6723,7 +6723,7 @@ impl App {
         let scroll_id = ("history-scroll", self.scroll_session, self.tabs.active_id());
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("monopro-history"),
-            platform::panel_viewport("history", [340.0, 620.0]),
+            platform::panel_viewport("history", [340.0, 620.0], platform::app_is_active(ctx)),
             |ui, _class| {
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
                     docked = true;
@@ -6763,30 +6763,23 @@ impl App {
         // The reset is offered only when there is something to reset, the same rule
         // a module's own reset follows: a control that looks live and does nothing is
         // worse than no control.
-        let mut reset = false;
-        let has_image = self.tabs.active().is_some();
-        let clicks = layout::panel_head(ui, &self.icons, head, "DEVELOP", |ui| {
-            if has_image {
-                reset = theme::reset_button(
-                    ui,
-                    "reset all",
-                    "reset every Develop setting, including Decode and Luminance",
-                )
-                .clicked();
-            }
-        });
+        let clicks = layout::panel_head(ui, &self.icons, head, "DEVELOP");
 
         let Some(tab) = self.tabs.active_mut() else {
             return clicks;
         };
-        if reset {
-            tab.params = Params::default();
-        }
 
         refresh_tab_mapping(tab);
-        widgets::Plain::new("TONAL DISTRIBUTION")
+        // **"reset all" on the histogram's own header**, at its right end — the maintainer's
+        // place for it, now that the row above the histogram is gone. It is still the
+        // whole panel's reset, offered only with a picture open, as before.
+        let reset = widgets::Plain::new("TONAL DISTRIBUTION")
             .open_on_start(true)
-            .show(ui, |ui| {
+            .action(
+                "reset all",
+                "reset every Develop setting, including Decode and Luminance",
+            )
+            .show_action(ui, |ui| {
                 if tab.luma.is_some() {
                     if tab.histogram.mode == histogram::Mode::Rgb {
                         let shown = tab.render_params();
@@ -6822,6 +6815,9 @@ impl App {
                     ui.label(theme::caption("—"));
                 }
             });
+        if reset {
+            tab.params = Params::default();
+        }
         clicks
     }
 

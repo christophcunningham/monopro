@@ -115,7 +115,12 @@ pub struct Plain<'a> {
     open_on_start: bool,
     /// Open (`Some(true)`) or fold (`Some(false)`) the section on this frame only.
     force: Option<bool>,
+    /// A button at the header's right end, as `(label, tip)`. See [`Plain::action`].
+    action: Option<(&'a str, &'a str)>,
 }
+
+/// The space between two module cards, and between a tab strip and the first card.
+pub const MODULE_GAP: f32 = 7.0;
 
 /// A module whose dot is a switch, reached only through [`Module::switch`].
 #[must_use = "the clicks are reported by `show`; drop them and the header is dead"]
@@ -220,7 +225,7 @@ impl<'a> Module<'a> {
             self.name,
             Some(self.modified),
             None,
-            self.resettable.unwrap_or(self.modified),
+            self.resettable.unwrap_or(self.modified).then_some(MODULE_RESET),
             self.open_on_start,
             None,
             ui,
@@ -235,7 +240,16 @@ impl<'a> Plain<'a> {
             name,
             open_on_start: true,
             force: None,
+            action: None,
         }
+    }
+
+    /// Put a button at the right end of the header, where a module's own reset sits,
+    /// for an action that belongs to the whole panel — Develop's "reset all" on
+    /// TONAL DISTRIBUTION. Read the click from [`Self::show_action`].
+    pub fn action(mut self, label: &'a str, tip: &'a str) -> Self {
+        self.action = Some((label, tip));
+        self
     }
 
     pub fn open_on_start(mut self, yes: bool) -> Self {
@@ -265,12 +279,28 @@ impl<'a> Plain<'a> {
             self.name,
             None,
             None,
-            false,
+            None,
             self.open_on_start,
             self.force,
             ui,
             body,
         );
+    }
+
+    /// [`Self::show`], reporting whether the header's [`Self::action`] was clicked.
+    #[must_use = "the action's click is reported here; drop it and the button is dead"]
+    pub fn show_action(self, ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) -> bool {
+        draw(
+            self.name,
+            None,
+            None,
+            self.action,
+            self.open_on_start,
+            self.force,
+            ui,
+            body,
+        )
+        .reset
     }
 }
 
@@ -280,7 +310,10 @@ impl<'a> Switchable<'a> {
             self.module.name,
             Some(self.module.modified),
             Some(self.enabled),
-            self.module.resettable.unwrap_or(self.module.modified),
+            self.module
+                .resettable
+                .unwrap_or(self.module.modified)
+                .then_some(MODULE_RESET),
             self.module.open_on_start,
             None,
             ui,
@@ -329,8 +362,13 @@ fn opened_for_a_test(_: &str) -> bool {
     false
 }
 
+/// A module's own reset button, as `(label, tip)`.
+const MODULE_RESET: (&str, &str) = ("reset", "back to default");
+
 /// All three `show`s. `modified` is `None` for a plain section — no dot and no
-/// reset — and `enabled` is `None` for a module without a switch.
+/// reset — and `enabled` is `None` for a module without a switch. `reset` is the
+/// header's right-end button, as `(label, tip)`: a module's own reset, or a panel's
+/// action on a [`Plain`] section. Its click comes back as `Clicked::reset`.
 #[expect(
     clippy::too_many_arguments,
     reason = "the one drawing routine behind all three module `show`s; each flag is one of their differences"
@@ -339,7 +377,7 @@ fn draw(
     name: &str,
     modified: Option<bool>,
     enabled: Option<bool>,
-    resettable: bool,
+    reset: Option<(&str, &str)>,
     open_on_start: bool,
     force: Option<bool>,
     ui: &mut egui::Ui,
@@ -401,9 +439,9 @@ fn draw(
             if title.clicked() {
                 open = !open;
             }
-            if resettable {
+            if let Some((label, tip)) = reset {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    out.reset = theme::reset_button(ui, "reset", "back to default").clicked();
+                    out.reset = theme::reset_button(ui, label, tip).clicked();
                 });
             }
         });
@@ -428,7 +466,7 @@ fn draw(
         );
     }
     ui.data_mut(|d| d.insert_temp(id, open));
-    ui.add_space(7.0);
+    ui.add_space(MODULE_GAP);
     out
 }
 

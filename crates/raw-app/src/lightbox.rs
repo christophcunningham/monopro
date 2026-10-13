@@ -1551,6 +1551,7 @@ impl Lightbox {
     ) -> PaneAsk {
         let mut asked = PaneAsk::default();
         let raise = self.raise.take();
+        let app_active = crate::platform::app_is_active(ctx);
         for pane in self.out.clone() {
             let id = egui::ViewportId::from_hash_of(("monopro-lightbox", pane.label()));
             if raise == Some(pane) {
@@ -1561,7 +1562,7 @@ impl Lightbox {
             let title = pane.label().to_lowercase();
             ctx.show_viewport_immediate(
                 id,
-                crate::platform::panel_viewport(&title, [320.0, 600.0]),
+                crate::platform::panel_viewport(&title, [320.0, 600.0], app_active),
                 |ui, _class| {
                     if ui.ctx().input(|i| i.viewport().close_requested()) {
                         docked = true;
@@ -5116,70 +5117,14 @@ impl Panes<'_> {
             // that never appears and a drop that never lands, which is what "the panel
             // disappears if I dock it right" was.
             let handle = tile_id.egui_id(self.tree_id);
-            let bar_h = theme::size::HEADER + 12.0;
-            let bar = egui::Rect::from_min_size(
-                ui.max_rect().min,
-                egui::vec2(ui.max_rect().width(), bar_h),
-            );
-            ui.painter().rect_filled(bar, 0.0, theme::CHROME_DEEP);
-            // Every panel begins with the same top rule. Favorites used to be the
-            // only pane with one, which made stacked Folders and Search look joined.
-            ui.painter().line_segment(
-                [
-                    egui::pos2(bar.min.x, bar.min.y + 0.5),
-                    egui::pos2(bar.max.x, bar.min.y + 0.5),
-                ],
-                crate::layout::panel_rule(),
-            );
-            ui.painter().line_segment(
-                [
-                    egui::pos2(bar.min.x, bar.max.y - 0.5),
-                    egui::pos2(bar.max.x, bar.max.y - 0.5),
-                ],
-                crate::layout::panel_rule(),
-            );
-            let text = ui.painter().layout_no_wrap(
-                pane.label().to_owned(),
-                egui::FontId::proportional(theme::size::HEADER),
-                theme::RUBY,
-            );
-            let at = egui::pos2(bar.min.x + 10.0, bar.center().y);
-            ui.painter().galley(
-                egui::pos2(at.x, at.y - text.rect.height() * 0.5),
-                text.clone(),
-                theme::RUBY,
-            );
-            let hit_rect = egui::Rect::from_min_size(
-                egui::pos2(at.x, at.y - text.rect.height() * 0.5),
-                text.rect.size(),
-            );
-            let hit = ui.interact(hit_rect, handle, egui::Sense::drag());
-            // **Started, not "is being dragged".** `egui_tiles` begins the drag when
-            // it sees this once; saying it again on every frame of the drag restarts
-            // it, and a drag that keeps restarting never reaches a drop.
-            dragged = hit.drag_started();
-            hit.on_hover_cursor(egui::CursorIcon::Grab);
-            // **The tab bar's controls, at the bar's right end**: the `×` outermost
-            // as on a tab, and the pop-out beside it as at the end of a tab strip.
-            let pad = 8.0;
-            let close_rect = egui::Rect::from_center_size(
-                egui::pos2(bar.max.x - pad - crate::icons::BOX * 0.5, bar.center().y),
-                egui::Vec2::splat(crate::icons::BOX),
-            );
-            if crate::layout::close_button(
-                ui,
-                self.icons,
-                handle.with("close"),
-                close_rect,
-                CLOSE_TIP,
-            ) {
+            let clicks = crate::layout::lone_bar(ui, self.icons, handle, pane.label(), CLOSE_TIP);
+            dragged = clicks.dragged;
+            if clicks.close {
                 self.close_pane = Some(*pane);
             }
-            let float_rect = close_rect.translate(egui::vec2(-(crate::icons::BOX + pad), 0.0));
-            if float_button(ui, self.icons, handle.with("float"), float_rect) {
+            if clicks.float {
                 self.float = Some(*pane);
             }
-            ui.advance_cursor_after_rect(bar);
         }
 
         let ask = self.lb.pane_contents(ui, self.icons, self.recent, *pane);
@@ -5193,26 +5138,6 @@ impl Panes<'_> {
 /// What a closed Lightbox panel's `×` says about getting it back.
 const CLOSE_TIP: &str = "close panel — the Window menu or tab brings it back";
 
-/// The pop-out button, drawn as Develop's panel head draws it: the float icon,
-/// lit under the pointer. True on the frame it is clicked.
-fn float_button(
-    ui: &mut egui::Ui,
-    icons: &crate::icons::Icons,
-    id: egui::Id,
-    rect: egui::Rect,
-) -> bool {
-    let hit = ui
-        .interact(rect, id, egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(theme::tip("open in its own window"));
-    let tint = if hit.hovered() {
-        egui::Color32::from_gray(245)
-    } else {
-        theme::DIM
-    };
-    crate::icons::paint(ui, icons, "float", "↗", rect, tint);
-    hit.clicked()
-}
 
 impl egui_tiles::Behavior<Pane> for Panes<'_> {
     fn pane_ui(
@@ -5346,6 +5271,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         // at the sidebar's width, and a tab you cannot see is worse than a control
         // that acts on the one you can. Drawn first: the bar is laid out right to
         // left, so these take their place before the tabs measure what is left.
+        crate::layout::paint_strip_top_rule(ui);
         let pad = self.tab_title_spacing(ui.visuals());
         if let Some(active) = tabs.active.and_then(|id| tiles.get_pane(&id).copied())
             && active.closable()
@@ -5358,7 +5284,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
             }
             ui.add_space(pad);
             let (_, float) = ui.allocate_space(egui::Vec2::splat(crate::icons::BOX));
-            if float_button(ui, self.icons, id.with("float"), float) {
+            if crate::layout::float_button(ui, self.icons, id.with("float"), float) {
                 self.float = Some(active);
             }
         }

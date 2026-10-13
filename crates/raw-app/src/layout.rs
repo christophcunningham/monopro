@@ -312,6 +312,25 @@ pub(crate) fn panel_rule() -> egui::Stroke {
 
 /// Finish a tab bar like a browser strip: one rule over the whole panel and a short
 /// vertical rule before every tab after the first.
+/// The tab strip's top rule across the **whole** strip, for `top_bar_right_ui`, whose
+/// `Ui` spans it.
+///
+/// Each tab draws the same rule over the row the tabs scroll in ([`paint_tab_rules`]),
+/// and that row used to be the strip. Since the showing panel's pop-out and `×` sit at
+/// the strip's right end, the row stops short of them, and the rule stopped with it — a
+/// step in the line where the tabs end. Drawing it once full-width keeps it unbroken;
+/// over the tabs it lands on the same pixels as theirs.
+pub(crate) fn paint_strip_top_rule(ui: &egui::Ui) {
+    let bar = ui.max_rect();
+    ui.painter().line_segment(
+        [
+            egui::pos2(bar.left(), bar.top() + 0.5),
+            egui::pos2(bar.right(), bar.top() + 0.5),
+        ],
+        panel_rule(),
+    );
+}
+
 pub(crate) fn paint_tab_rules(ui: &egui::Ui, tab: egui::Rect) {
     let bar = ui.max_rect();
     let painter = ui.painter();
@@ -1322,17 +1341,12 @@ pub struct Head {
     /// same id `egui_tiles` senses its tabs under, because that is the id
     /// `is_being_dragged` looks for. See [`panel_head`].
     pub handle: Option<egui::Id>,
-    /// Offer the pop-out button.
-    pub float: bool,
 }
 
 impl Head {
     /// A floating window: `floating_bar` above it has already named it, it is as
     /// popped out as it can get, and there is no tile to drag.
-    pub const FLOATING: Self = Self {
-        handle: None,
-        float: false,
-    };
+    pub const FLOATING: Self = Self { handle: None };
 }
 
 /// What a panel header reported this frame.
@@ -1342,6 +1356,8 @@ pub struct HeadClicks {
     pub dragged: bool,
     /// The pop-out button was clicked.
     pub float: bool,
+    /// The `×` was clicked.
+    pub close: bool,
 }
 
 /// The title row every docked panel carries: its name, and the controls that act on
@@ -1397,60 +1413,103 @@ pub fn empty_state(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-pub fn panel_head(
+pub fn panel_head(ui: &mut egui::Ui, icons: &icons::Icons, head: Head, name: &str) -> HeadClicks {
+    // **No row at all where something else already names the pane** — a tab strip,
+    // whose right end carries the showing pane's pop-out and `×`, or a floating
+    // window's own bar. The modules start one module gap down, so the space under a
+    // tab strip is the space between two modules. The maintainer's layout: the row
+    // this used to draw held only a pop-out button and Develop's reset, and pushed the
+    // histogram down by a row of nothing.
+    let clicks = match head.handle {
+        Some(handle) => lone_bar(ui, icons, handle, name, CLOSE_TIP),
+        None => HeadClicks::default(),
+    };
+    ui.add_space(crate::widgets::MODULE_GAP);
+    clicks
+}
+
+/// What a closed Develop panel's `×` says about getting it back.
+const CLOSE_TIP: &str = "close panel — tab or the Window menu brings it back";
+
+/// The bar a panel wears when no tab strip is naming it, **the same in Develop and
+/// Lightbox**: the tab bar's ground and hairlines, the name in ruby as a tab's would
+/// be, and at the right end the pop-out and then the `×`, as at the end of a tab
+/// strip. One function so the two modes cannot grow two looks for one thing.
+///
+/// # The handle senses under the tile's own egui id
+///
+/// `handle` must be `TileId::egui_id(tree_id)`. `set_dragged_id`, which `egui_tiles`
+/// calls when a pane answers `DragStarted`, writes into egui's interaction state, and
+/// egui recomputes that from its own hit-testing every pass — so a title with an id of
+/// its own has egui naming *the title* as the dragged widget from the second frame,
+/// `is_being_dragged(tile_id)` goes false, and the drag evaporates. Sensing under the
+/// tile's id makes egui's own answer the one `egui_tiles` asks for.
+/// `the_panel_handle_senses_under_the_tile_id` pins it.
+pub(crate) fn lone_bar(
     ui: &mut egui::Ui,
     icons: &icons::Icons,
-    head: Head,
+    handle: egui::Id,
     name: &str,
-    right: impl FnOnce(&mut egui::Ui),
+    close_tip: &str,
 ) -> HeadClicks {
-    let mut out = HeadClicks::default();
-    // A lone docked pane has no tab bar to frame it. Tabbed panes get this rule from
-    // `paint_tab_rules`; floating panes already sit inside a native window frame.
-    if head.handle.is_some() {
-        let rect = ui.available_rect_before_wrap();
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.left(), rect.top() + 0.5),
-                egui::pos2(rect.right(), rect.top() + 0.5),
-            ],
-            panel_rule(),
-        );
+    let bar_h = theme::size::HEADER + 12.0;
+    let bar = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(ui.max_rect().width(), bar_h));
+    ui.painter().rect_filled(bar, 0.0, theme::CHROME_DEEP);
+    for y in [bar.min.y + 0.5, bar.max.y - 0.5] {
+        ui.painter()
+            .line_segment([egui::pos2(bar.min.x, y), egui::pos2(bar.max.x, y)], panel_rule());
     }
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        // **A left margin on the title.** the maintainer: the panel names sit too close to the
-        // edge. They did — the horizontal starts at the panel's own inner edge, and a
-        // heading welded to it reads as though it has fallen off rather than as
-        // though it labels what is below. The panel's other content is inset by its
-        // module frames; only the head was flush.
-        ui.add_space(TITLE_INSET);
-        if let Some(handle) = head.handle {
-            // Painted first, then interacted under the tile's id. Not
-            // `Label::sense`, which would register the label's own id instead.
-            let title = ui.add(egui::Label::new(egui::RichText::new(name).heading()));
-            let drag = ui
-                .interact(title.rect, handle, egui::Sense::click_and_drag())
-                .on_hover_cursor(egui::CursorIcon::Grab)
-                .on_hover_text(theme::tip(
-                    "drag to move — either side of the image, above or below another \
-                     panel, or onto one to stack them as tabs",
-                ));
-            out.dragged = drag.drag_started();
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if head.float
-                && icons::button(ui, icons, "float", "↗", true)
-                    .on_hover_text(theme::tip("open in its own window"))
-                    .clicked()
-            {
-                out.float = true;
-            }
-            right(ui);
-        });
-    });
-    ui.add_space(6.0);
-    out
+    let title = theme::header_size(ui.painter(), name);
+    let text_rect = egui::Rect::from_min_size(
+        egui::pos2(bar.min.x + 10.0, bar.min.y),
+        egui::vec2(title.x, bar.height()),
+    );
+    theme::paint_header(&ui.painter_at(bar), text_rect, name, theme::RUBY);
+    // **Started, not "is being dragged".** `egui_tiles` begins the drag when it sees
+    // this once; saying it again every frame restarts it, and a drag that keeps
+    // restarting never reaches a drop.
+    let drag = ui
+        .interact(text_rect, handle, egui::Sense::click_and_drag())
+        .on_hover_cursor(egui::CursorIcon::Grab)
+        .on_hover_text(theme::tip(
+            "drag to move — either side, above or below another panel, or onto one to \
+             stack them as tabs",
+        ));
+    let pad = 8.0;
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(bar.max.x - pad - icons::BOX * 0.5, bar.center().y),
+        egui::Vec2::splat(icons::BOX),
+    );
+    let close = close_button(ui, icons, handle.with("close"), close_rect, close_tip);
+    let float_rect = close_rect.translate(egui::vec2(-(icons::BOX + pad), 0.0));
+    let float = float_button(ui, icons, handle.with("float"), float_rect);
+    ui.advance_cursor_after_rect(bar);
+    HeadClicks {
+        dragged: drag.drag_started(),
+        float,
+        close,
+    }
+}
+
+/// The pop-out button: the float icon, lit under the pointer. True on the frame it
+/// is clicked. Shared by both modes' tab strips and lone bars.
+pub(crate) fn float_button(
+    ui: &mut egui::Ui,
+    icons: &icons::Icons,
+    id: egui::Id,
+    rect: egui::Rect,
+) -> bool {
+    let hit = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(theme::tip("open in its own window"));
+    let tint = if hit.hovered() {
+        egui::Color32::from_gray(245)
+    } else {
+        theme::DIM
+    };
+    icons::paint(ui, icons, "float", "↗", rect, tint);
+    hit.clicked()
 }
 
 /// A panel's `×`: the close icon in the dim gray, lit on a gray square under the
@@ -1578,7 +1637,6 @@ struct Panes<'a> {
 fn head_for(tree_id: egui::Id, tabbed: &[TileId], tile_id: TileId) -> Head {
     Head {
         handle: (!tabbed.contains(&tile_id)).then(|| tile_id.egui_id(tree_id)),
-        float: true,
     }
 }
 
@@ -1602,6 +1660,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                 self.drew_develop = true;
                 let clicks = self.app.develop_column(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::Develop));
+                self.close = self.close.or(clicks.close.then_some(Pane::Develop));
                 drag(clicks.dragged)
             }
             Pane::DodgeBurn => {
@@ -1609,30 +1668,35 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                 self.drew_dodgeburn = true;
                 let clicks = self.app.dodgeburn_panel(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::DodgeBurn));
+                self.close = self.close.or(clicks.close.then_some(Pane::DodgeBurn));
                 drag(clicks.dragged)
             }
             Pane::Toning => {
                 ui.painter().rect_filled(ui.max_rect(), 0.0, panel);
                 let clicks = self.app.toning_panel(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::Toning));
+                self.close = self.close.or(clicks.close.then_some(Pane::Toning));
                 drag(clicks.dragged)
             }
             Pane::Info => {
                 ui.painter().rect_filled(ui.max_rect(), 0.0, panel);
                 let clicks = self.app.info_panel(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::Info));
+                self.close = self.close.or(clicks.close.then_some(Pane::Info));
                 drag(clicks.dragged)
             }
             Pane::Snapshots => {
                 ui.painter().rect_filled(ui.max_rect(), 0.0, panel);
                 let clicks = self.app.snapshot_panel(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::Snapshots));
+                self.close = self.close.or(clicks.close.then_some(Pane::Snapshots));
                 drag(clicks.dragged)
             }
             Pane::History => {
                 ui.painter().rect_filled(ui.max_rect(), 0.0, panel);
                 let clicks = self.app.history_panel(ui, head);
                 self.float = self.float.or(clicks.float.then_some(Pane::History));
+                self.close = self.close.or(clicks.close.then_some(Pane::History));
                 drag(clicks.dragged)
             }
         }
@@ -1640,18 +1704,6 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
 
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
         pane.label().into()
-    }
-
-    fn is_tab_closable(&self, tiles: &egui_tiles::Tiles<Pane>, tile_id: TileId) -> bool {
-        tiles.get_pane(&tile_id).copied().is_some_and(closable)
-    }
-
-    /// Closing a panel **hides** it rather than removing it from the tree, so it
-    /// keeps its place and `tab` can bring it back. Returning false is what aborts
-    /// the removal `egui_tiles` would otherwise do.
-    fn on_tab_close(&mut self, tiles: &mut egui_tiles::Tiles<Pane>, tile_id: TileId) -> bool {
-        self.close = tiles.get_pane(&tile_id).copied();
-        false
     }
 
     /// A tab title is a field marker, letter-spaced through `theme::paint_header`,
@@ -1675,15 +1727,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         let name = tiles.get_pane(&tile_id).map_or("—", |p| p.label());
         let title = theme::header_size(ui.painter(), name);
         let pad = self.tab_title_spacing(ui.visuals());
-        let close_w = if state.closable {
-            icons::BOX + pad
-        } else {
-            0.0
-        };
-        let (_, rect) = ui.allocate_space(egui::vec2(
-            title.x + 2.0 * pad + close_w,
-            ui.available_height(),
-        ));
+        let (_, rect) = ui.allocate_space(egui::vec2(title.x + 2.0 * pad, ui.available_height()));
 
         let draggable = self.is_tile_draggable(tiles, tile_id);
         let sense = if draggable {
@@ -1714,24 +1758,6 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         );
         theme::paint_header(&ui.painter_at(rect), text_rect, name, colour);
 
-        if state.closable {
-            let close_rect = egui::Rect::from_center_size(
-                egui::pos2(rect.right() - pad - icons::BOX * 0.5, rect.center().y),
-                egui::Vec2::splat(icons::BOX),
-            );
-            // Keyed off the tab's own id rather than the `Ui`'s running auto-id, so it
-            // is the same button frame to frame however the bar is scrolled.
-            if close_button(
-                ui,
-                &self.app.icons,
-                id.with("close"),
-                close_rect,
-                "close panel — tab brings them back",
-            ) && self.on_tab_close(tiles, tile_id)
-            {
-                tiles.remove(tile_id);
-            }
-        }
         tab
     }
 
@@ -1747,21 +1773,34 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         tabs: &egui_tiles::Tabs,
         scroll_offset: &mut f32,
     ) {
+        // **The showing panel's pop-out and `×`, at the strip's right end** — Lightbox's
+        // arrangement, which the maintainer asked for here too, in place of a `×` on every tab
+        // and a row under the strip holding the pop-out. Drawn first: the bar is laid
+        // out right to left, so these take their place before the tabs measure what
+        // is left.
+        paint_strip_top_rule(ui);
         let pad = self.tab_title_spacing(ui.visuals());
+        if let Some(active) = tabs.active.and_then(|id| tiles.get_pane(&id).copied())
+            && closable(active)
+        {
+            let id = ui.id().with(active.label());
+            ui.add_space(pad);
+            let (_, close) = ui.allocate_space(egui::Vec2::splat(icons::BOX));
+            if close_button(ui, &self.app.icons, id.with("close"), close, CLOSE_TIP) {
+                self.close = Some(active);
+            }
+            ui.add_space(pad);
+            let (_, float) = ui.allocate_space(egui::Vec2::splat(icons::BOX));
+            if float_button(ui, &self.app.icons, id.with("float"), float) {
+                self.float = Some(active);
+            }
+        }
         let required: f32 = tabs
             .children
             .iter()
             .filter(|id| tiles.is_visible(**id))
             .filter_map(|id| tiles.get_pane(id))
-            .map(|pane| {
-                theme::header_size(ui.painter(), pane.label()).x
-                    + 2.0 * pad
-                    + if closable(*pane) {
-                        icons::BOX + pad
-                    } else {
-                        0.0
-                    }
-            })
+            .map(|pane| theme::header_size(ui.painter(), pane.label()).x + 2.0 * pad)
             .sum();
         if ui.available_width() >= required {
             *scroll_offset = 0.0;
@@ -2075,7 +2114,7 @@ mod tests {
             // Anything less and the drag contract would be tested against a copy of
             // itself.
             let head = head_for(self.tree_id, &self.tabbed, tile_id);
-            let clicks = panel_head(ui, &self.icons, head, pane.label(), |_| {});
+            let clicks = panel_head(ui, &self.icons, head, pane.label());
             // Enough content to be measured, and in the develop pane the same module
             // frame the real one draws — see `the_tree_does_not_run_away`.
             if *pane == Pane::Develop {

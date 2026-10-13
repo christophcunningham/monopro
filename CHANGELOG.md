@@ -179,6 +179,11 @@ Changed
   overlay for Dodge & Burn and for a Curve mask.
 - Dragging the picture in Develop stops at its edge, with the margin around it, rather
   than letting it slide off the canvas.
+- Develop's panels carry their pop-out button and x at the right end of the tab strip,
+  for the panel that is showing, as Lightbox's do, in place of an x on every tab and a
+  row under the strip holding the pop-out. TONAL DISTRIBUTION moves up to sit one
+  module gap under the tabs, and Reset All is on its header. A panel on its own wears
+  the same bar in both modes: its name, then the pop-out and the x.
 - A new dodge or burn instance is now Command-Shift-D or Command-Shift-X while the
   brush is open, and Command-D duplicates the tab even then.
 - The keyboard shortcuts reference lists Shift-S and Shift-M under Navigation, with
@@ -194,6 +199,9 @@ Changed
 Fixed
 - A tool open on the picture no longer blinks out, or misses a press, in the moment
   tone masks are being prepared after a change.
+- A popped-out panel stays above the main window while monopro is in front, instead
+  of disappearing behind it when the main window is clicked. Switching to another
+  application lets it go behind that application's windows as usual.
 - The print loupe shows toning. It was always gray; it now shows the toned print in
   color, Before and After both, matching the picture around it.
 - Developed thumbnails in Lightbox keep their toning when GRAY is on. GRAY now grays
