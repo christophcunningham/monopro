@@ -172,6 +172,50 @@ pub enum Mode {
         grab: Option<PaintGrab>,
         entered: Box<raw_core::DodgeBurnParams>,
     },
+    /// A Curve pass's mask is open on the picture. For a gradient its handles are up,
+    /// and a drag lays the shape again or moves a handle; for a painted mask the brush
+    /// is up, and a drag paints. Dodge & Burn's gestures, unchanged, for a mask instead
+    /// of a layer.
+    ///
+    /// `entered` is the **whole curve stack** as it stood when the tool opened, so `Esc`
+    /// puts back everything, including removing a mask that opening the tool just made.
+    /// Inside the variant for the reason `Paint`'s is: the snapshot cannot outlive the
+    /// mode that needs it. `instance` is the pass the mask belongs to; the tool leaves
+    /// itself if that pass or its mask stops existing, which is what an undo across a
+    /// deletion produces.
+    CurveMask {
+        instance: usize,
+        /// The handle a drag has hold of, or the stroke in flight; spans frames, as
+        /// `Paint`'s does.
+        grab: Option<PaintGrab>,
+        /// The mask is painted, so the tool is the brush: its bracket keys are live and
+        /// the footer says how to paint. Set when the tool opens on a painted shape.
+        brush: bool,
+        entered: Box<raw_core::CurveStack>,
+    },
+    /// The eyedropper on a tone range is armed: a click on the picture sets the range
+    /// around the tone clicked, a dragged box spans the box's tones, and `⇧` widens the
+    /// range instead of replacing it.
+    ///
+    /// **It stays armed**, unlike [`CurvePoint`](Self::CurvePoint): a range is found by
+    /// clicking, looking, and clicking again or adding to it, and a tool that had to be
+    /// re-armed between a click and the `⇧`-click that follows would make extending two
+    /// trips to the panel. `Return` keeps what it did and `Esc` puts back `entered`, as
+    /// with every tool that edits `Params`.
+    ///
+    /// `anchor` is where a press landed, in screen points, kept until the release says
+    /// whether it was a click or a box. `resume` is the tool this one was opened over,
+    /// the brush or a mask's handles, which leaving returns to: the eyedropper is reached
+    /// from inside a layer you are painting, and it should not cost you the brush.
+    ToneSample {
+        target: ToneTarget,
+        anchor: Option<egui::Pos2>,
+        /// The range is an island, so a click also places a seed. Kept here by the tool,
+        /// from the range, so the footer can say what a click does.
+        island: bool,
+        entered: Box<ToneEntered>,
+        resume: Option<Box<Mode>>,
+    },
     /// The Inspector is placing value pins.
     ///
     /// **No snapshot, for the same reason `Loupe` has none**: it edits nothing in
@@ -191,6 +235,32 @@ pub enum Mode {
     /// the loupe changes which pixels are being looked at and no pixel of the
     /// picture, so there is nothing for `Esc` to restore — it simply closes.
     Loupe,
+}
+
+/// Whose mask a look is pinned on: the selected Curve instance's, or the selected Dodge
+/// & Burn layer's. The picture shows one mask at a time, so one pin says both which
+/// module asked and how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskOwner {
+    Curve,
+    Layer,
+}
+
+/// Which tone range the eyedropper sets: a Curve instance's mask's, or a Dodge & Burn
+/// layer's. The two modules share the range and its controls, and so the tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToneTarget {
+    Curve(usize),
+    Layer(usize),
+}
+
+/// What the tone eyedropper puts back on `Esc`: the module its range belongs to, whole,
+/// as it stood when the tool was armed. The same snapshots the mask tool and the brush
+/// take, for the same reason.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToneEntered {
+    Curve(raw_core::CurveStack),
+    Layers(raw_core::DodgeBurnParams),
 }
 
 /// What a paint-mode drag has hold of.
@@ -297,6 +367,126 @@ impl Mode {
         matches!(self, Self::Paint { .. })
     }
 
+    /// Open a Curve pass's mask on the picture, remembering the stack so `Esc` can put
+    /// it back.
+    pub fn curve_mask(instance: usize, entered: raw_core::CurveStack) -> Self {
+        Self::CurveMask {
+            instance,
+            grab: None,
+            brush: false,
+            entered: Box::new(entered),
+        }
+    }
+
+    /// [`curve_mask`](Self::curve_mask), with the brush up when the mask is painted.
+    pub fn with_brush(mut self, painted: bool) -> Self {
+        if let Self::CurveMask { brush, .. } = &mut self {
+            *brush = painted;
+        }
+        self
+    }
+
+    /// Whether the brush is the tool in hand, painting a layer or a mask: what makes
+    /// the bracket keys the brush's.
+    pub fn brush_open(&self) -> bool {
+        matches!(self, Self::Paint { .. } | Self::CurveMask { brush: true, .. })
+    }
+
+    pub fn is_curve_mask(&self) -> bool {
+        matches!(self, Self::CurveMask { .. })
+    }
+
+    /// Which pass's mask is open on the picture.
+    pub fn curve_mask_instance(&self) -> Option<usize> {
+        match self {
+            Self::CurveMask { instance, .. } => Some(*instance),
+            _ => None,
+        }
+    }
+
+    /// What a drag on the mask has hold of: a gradient's handle, or a stroke in flight.
+    pub fn curve_mask_grab(&self) -> Option<PaintGrab> {
+        match self {
+            Self::CurveMask { grab, .. } => *grab,
+            _ => None,
+        }
+    }
+
+    /// What to put back if the mask tool, or the eyedropper on a curve's tone range, is
+    /// **cancelled**. See [`Mode::cancelled`].
+    pub fn cancelled_curves(&self) -> Option<&raw_core::CurveStack> {
+        match self {
+            Self::CurveMask { entered, .. } => Some(entered),
+            Self::ToneSample { entered, .. } => match &**entered {
+                ToneEntered::Curve(stack) => Some(stack),
+                ToneEntered::Layers(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Arm the eyedropper on `target`'s tone range, over whatever `self` is.
+    ///
+    /// The snapshot is of the module the range belongs to, taken from `params` now. A
+    /// tool with a session of its own, the brush or a mask's handles, is kept to return
+    /// to; the eyedropper armed again on the same range keeps the snapshot and the tool
+    /// it already had, or re-arming would quietly redefine what `Esc` discards.
+    pub fn tone_sample(&self, target: ToneTarget, params: &raw_core::Params) -> Self {
+        if let Self::ToneSample {
+            target: open,
+            island,
+            entered,
+            resume,
+            ..
+        } = self
+            && *open == target
+        {
+            return Self::ToneSample {
+                target,
+                anchor: None,
+                island: *island,
+                entered: entered.clone(),
+                resume: resume.clone(),
+            };
+        }
+        let resume = match self {
+            Self::Paint { .. } | Self::CurveMask { .. } => Some(Box::new(self.clone())),
+            // Armed on another range: what that one was opened over still stands.
+            Self::ToneSample { resume, .. } => resume.clone(),
+            _ => None,
+        };
+        Self::ToneSample {
+            target,
+            anchor: None,
+            island: false,
+            entered: Box::new(match target {
+                ToneTarget::Curve(_) => ToneEntered::Curve(params.curve.clone()),
+                ToneTarget::Layer(_) => ToneEntered::Layers(params.dodgeburn.clone()),
+            }),
+            resume,
+        }
+    }
+
+    /// Which tone range the eyedropper is armed on.
+    pub fn tone_target(&self) -> Option<ToneTarget> {
+        match self {
+            Self::ToneSample { target, .. } => Some(*target),
+            _ => None,
+        }
+    }
+
+    /// The mode this one gives way to when it is left, by `Return`, by `Esc` or by its
+    /// own button: pan, except that the tone eyedropper hands back the tool it was
+    /// opened over.
+    pub fn left(&self) -> Self {
+        match self {
+            Self::ToneSample {
+                resume: Some(back), ..
+            } => (**back).clone(),
+            _ => Self::View,
+        }
+    }
+
     pub fn is_loupe(&self) -> bool {
         matches!(self, Self::Loupe)
     }
@@ -316,13 +506,25 @@ impl Mode {
 
     /// Whether the viewport should pan for this drag.
     ///
-    /// Space is a temporary hand for Dodge/Burn and perspective guide placement. It
-    /// deliberately does not make crop, pin, curve sampling, or the loupe surrender
-    /// their gestures, and it does not replace the active tool with `View` —
-    /// releasing it leaves that tool armed.
+    /// Space is a temporary hand for Dodge/Burn, a curve mask, the tone eyedropper and
+    /// perspective guide placement: the tools that stay open across many gestures. It
+    /// deliberately does not make crop, pin, curve sampling, or the loupe surrender their
+    /// gestures, and it does not replace the active tool with `View` — releasing it
+    /// leaves that tool armed.
     pub fn pans_with_drag(&self, temporary_hand: bool) -> bool {
-        !self.claims_drag()
-            || (temporary_hand && matches!(self, Self::Paint { .. } | Self::Keystone { .. }))
+        !self.claims_drag() || (temporary_hand && self.lends_space_to_pan())
+    }
+
+    /// Whether holding Space turns this tool's drag into a pan. One list, read by the
+    /// drag handler above and by the key hook that has to steal Space for it.
+    pub fn lends_space_to_pan(&self) -> bool {
+        matches!(
+            self,
+            Self::Paint { .. }
+                | Self::CurveMask { .. }
+                | Self::ToneSample { .. }
+                | Self::Keystone { .. }
+        )
     }
 
     /// Which way the brush is working, while it is open.
@@ -349,10 +551,15 @@ impl Mode {
         }
     }
 
-    /// What to put back if paint mode is **cancelled**. See [`Mode::cancelled`].
+    /// What to put back if paint mode, or the eyedropper on a layer's tone mask, is
+    /// **cancelled**. See [`Mode::cancelled`].
     pub fn cancelled_strokes(&self) -> Option<&raw_core::DodgeBurnParams> {
         match self {
             Self::Paint { entered, .. } => Some(entered),
+            Self::ToneSample { entered, .. } => match &**entered {
+                ToneEntered::Layers(layers) => Some(layers),
+                ToneEntered::Curve(_) => None,
+            },
             _ => None,
         }
     }
@@ -440,6 +647,33 @@ impl Mode {
             Self::CurvePoint => {
                 Some("CURVE SAMPLER · click the picture to add a point · Esc to cancel")
             }
+            // Three gestures and none of them is suggested by an eyedropper, so all three
+            // are named, with both ways out because they do different things.
+            // An island's clicks place seeds as well, and a seed is taken away by a
+            // gesture nothing on screen suggests.
+            Self::ToneSample { island: true, .. } => Some(
+                "TONE ISLAND · click to select what is connected to that tone · ⇧ click \
+                 to add a seed · ⌥ click a seed to remove it · Space to pan · \
+                 Return to keep · Esc to discard",
+            ),
+            Self::ToneSample { .. } => Some(
+                "TONE SAMPLER · click a tone to set the range · drag a box to span its \
+                 tones · ⇧ to add to the range · Space to pan · Return to keep · \
+                 Esc to discard",
+            ),
+            // The gradient line's own words, said for a mask: nothing about a dashed
+            // ellipse suggests that the drag which made it can be done again to move it,
+            // and Space is the one key the tool has.
+            // The brush's line, for a mask: the eraser and the straight pass are the
+            // gestures nothing on screen suggests.
+            Self::CurveMask { brush: true, .. } => Some(
+                "CURVE MASK · drag to paint · ⌥ drag to erase · ⇧ click for a straight \
+                 pass · [ ] radius · Space to pan · Return to keep · Esc to discard",
+            ),
+            Self::CurveMask { .. } => Some(
+                "CURVE MASK · drag to lay the shape · drag a handle to move it · \
+                 Space to pan · Return to keep · Esc to discard",
+            ),
             Self::Paint {
                 tool: crate::paint::Tool::Linear,
                 ..
@@ -1027,6 +1261,26 @@ pub struct Tab {
     /// The selected control point in that instance, for arrow-key movement and EV
     /// readouts. Also view state.
     pub curve_point: Option<usize>,
+    /// The point sampler's "limit to tone" option: a click that places a point also sets
+    /// the instance's tone range around the tone clicked, so dragging the point moves
+    /// only those tones. View state, like which tool is armed: it changes nothing until
+    /// the sampler is used.
+    pub curve_limit_tone: bool,
+    /// The instance whose MASK section should open on the next frame it is drawn: set
+    /// when the point sampler has just made that instance's tone range, taken by the
+    /// panel. A request and not a state, so the section can be closed again afterwards.
+    pub curve_mask_reveal: Option<usize>,
+    /// The mask kept on the picture, and how: as red film over what it protects, or
+    /// alone in the picture's place. Set from the `overlay` and `view mask` switches in
+    /// the Curve's MASK header and in Dodge & Burn's TONE MASK heading, which are one
+    /// choice across both modules, since the picture shows one mask at a time. View
+    /// state: it draws over the picture and changes no pixel of it.
+    pub mask_pin: Option<(MaskOwner, raw_gpu::MaskLook)>,
+    /// What a drag on the Curve's tone ruler has hold of. **Its own, not `zone_drag`**:
+    /// Dodge & Burn's ruler and this one can both be on screen, each clears a drag that
+    /// is not its own, and sharing one slot let either cancel the other's. It is also
+    /// how the mask view knows this ruler is the one being dragged.
+    pub curve_zone_drag: Option<crate::widgets::ZoneGrab>,
     /// Rename editor for a Curve instance; committed text alone enters `Params`.
     pub curve_rename: Option<(usize, String)>,
     pub view: View,
@@ -1054,12 +1308,6 @@ pub struct Tab {
     /// and the only way to be sure of that is for `Params` never to see it until it
     /// is committed.
     pub db_rename: Option<(usize, String)>,
-    /// Showing the selected layer's zone mask instead of the picture.
-    ///
-    /// View state, per tab, and **not** an `Overlays` field on the tab: it names a
-    /// layer, and which layer is selected is view state too. It is resolved into
-    /// `Overlays::zone_mask` at render time.
-    pub db_view_mask: bool,
     /// Which guide is drawn inside the crop.
     ///
     /// View state, and per tab rather than per app: it draws nothing into the
@@ -1187,12 +1435,15 @@ impl Tab {
             curve_drag: None,
             curve_active: 0,
             curve_point: None,
+            curve_limit_tone: false,
+            curve_mask_reveal: None,
+            mask_pin: None,
+            curve_zone_drag: None,
             curve_rename: None,
             db_active: None,
             placement_drag: None,
             zone_drag: None,
             db_rename: None,
-            db_view_mask: false,
             loupe: crate::loupe::Loupe::default(),
             view: View::default(),
             mode: Mode::default(),
@@ -1287,7 +1538,11 @@ impl Tab {
     pub fn show_loupe(&mut self) {
         if matches!(
             self.mode,
-            Mode::Crop { .. } | Mode::Keystone { .. } | Mode::Paint { .. }
+            Mode::Crop { .. }
+                | Mode::Keystone { .. }
+                | Mode::Paint { .. }
+                | Mode::CurveMask { .. }
+                | Mode::ToneSample { .. }
         ) {
             return;
         }
@@ -1480,6 +1735,203 @@ impl Tab {
     pub fn rotate(&mut self, clockwise: bool) {
         let exif = self.exif_orientation();
         self.params.composition.turn(clockwise, exif);
+    }
+
+    /// End the curve mask tool if it no longer has a pass to edit.
+    ///
+    /// **The tool belongs to one pass.** It leaves when that stops being the selected
+    /// one, or when its mask goes: selecting another curve, adding one, deleting one,
+    /// loading a preset and Remove all end up here. It keeps what was done, as `Return`
+    /// does; only `Esc` takes it back. Also what makes an undo across a deletion safe,
+    /// since the pass the tool names may no longer exist.
+    pub fn end_stale_curve_mask(&mut self) {
+        let Some(open) = self.mode.curve_mask_instance() else {
+            return;
+        };
+        let has_mask = self
+            .params
+            .curve
+            .instances
+            .get(open)
+            .is_some_and(|i| i.mask.is_some());
+        if open != self.curve_active || !has_mask {
+            self.mode = Mode::View;
+        }
+    }
+
+    /// The mask the picture is showing this frame, and how.
+    ///
+    /// One mask, from whichever module has a claim on the picture: the selected Curve
+    /// instance's, or the selected Dodge & Burn layer's as
+    /// [`CurveMask::of_layer`](raw_core::curve::CurveMask::of_layer) gives it. Each is
+    /// shown when its look is pinned or one of its handles is being dragged;
+    /// [`crate::curve_mask::shown`] says which look a drag gets. **A drag outranks a pin
+    /// in the other module**: what is being shaped is what you are looking at.
+    ///
+    /// A copy, because a layer's mask is made for the occasion and the caller hands it
+    /// to the renderer while the tab is borrowed for other things.
+    pub fn shown_mask(&self) -> Option<(raw_core::curve::CurveMask, raw_gpu::MaskLook)> {
+        let pinned = |owner: MaskOwner| {
+            self.mask_pin
+                .filter(|(whose, _)| *whose == owner)
+                .map(|(_, look)| look)
+        };
+        // A gradient's handle, in the brush's mode; a brush stroke is not a handle.
+        let layer_shape = matches!(self.mode.grab(), Some(PaintGrab::Handle(_)));
+        let layer_tone = self.zone_drag.is_some();
+        let curve = || {
+            let mask = self
+                .params
+                .curve
+                .instances
+                .get(self.curve_active)?
+                .mask
+                .as_ref()
+                .filter(|mask| crate::curve_mask::viewable(mask))?;
+            // A handle, and not a stroke: painting does not put the mask up, for the
+            // reason it does not on a layer. The picture is what a stroke is judged by.
+            let look = crate::curve_mask::shown(
+                pinned(MaskOwner::Curve),
+                matches!(self.mode.curve_mask_grab(), Some(PaintGrab::Handle(_))),
+                self.curve_zone_drag.is_some(),
+            )?;
+            Some((mask.clone(), look))
+        };
+        let layer = || {
+            let layer = self.params.dodgeburn.instances.get(self.db_active?)?;
+            let look = crate::curve_mask::shown(pinned(MaskOwner::Layer), layer_shape, layer_tone)?;
+            Some((raw_core::curve::CurveMask::of_layer(layer), look))
+        };
+        if layer_shape || layer_tone {
+            layer().or_else(curve)
+        } else {
+            curve().or_else(layer)
+        }
+    }
+
+    /// Whose mask a look pinned now would be on: the module whose tool is open on the
+    /// picture, then the one already pinned, then the selected Curve instance, then the
+    /// selected Dodge & Burn layer, whichever first has a mask to show. `None` when
+    /// neither module has one.
+    ///
+    /// The tool first because what you are working on is what you want to see, and the
+    /// pin next so that the key which put a look up takes the same one down.
+    pub fn mask_in_hand(&self) -> Option<MaskOwner> {
+        let has = |owner: MaskOwner| match owner {
+            MaskOwner::Curve => self
+                .params
+                .curve
+                .instances
+                .get(self.curve_active)
+                .and_then(|instance| instance.mask.as_ref())
+                .is_some_and(crate::curve_mask::viewable),
+            MaskOwner::Layer => self
+                .db_active
+                .is_some_and(|i| i < self.params.dodgeburn.instances.len()),
+        };
+        let tool = match &self.mode {
+            Mode::CurveMask { .. }
+            | Mode::ToneSample {
+                target: ToneTarget::Curve(_),
+                ..
+            } => Some(MaskOwner::Curve),
+            Mode::Paint { .. }
+            | Mode::ToneSample {
+                target: ToneTarget::Layer(_),
+                ..
+            } => Some(MaskOwner::Layer),
+            _ => None,
+        };
+        tool.into_iter()
+            .chain(self.mask_pin.map(|(owner, _)| owner))
+            .chain([MaskOwner::Curve, MaskOwner::Layer])
+            .find(|&owner| has(owner))
+    }
+
+    /// `/`: lay the red film over the mask in hand, or take it off. From `view mask` it
+    /// changes to the film, as a click on the `overlay` chip does. `false`, and nothing
+    /// changed, when there is no mask to show.
+    pub fn toggle_mask_overlay(&mut self) -> bool {
+        let Some(owner) = self.mask_in_hand() else {
+            return false;
+        };
+        let film = Some((owner, raw_gpu::MaskLook::Overlay));
+        self.mask_pin = if self.mask_pin == film { None } else { film };
+        true
+    }
+
+    /// The tone range `target` names: a Curve instance's mask's tone part, or a Dodge &
+    /// Burn layer's tone mask. `None` when the instance, its mask's tone part or the
+    /// layer is not there.
+    pub fn tone_range(&self, target: ToneTarget) -> Option<&raw_core::ZoneMask> {
+        match target {
+            ToneTarget::Curve(i) => self.params.curve.instances.get(i)?.mask.as_ref()?.tone.as_ref(),
+            ToneTarget::Layer(i) => self.params.dodgeburn.instances.get(i).map(|l| &l.mask),
+        }
+    }
+
+    /// [`tone_range`](Self::tone_range), to change.
+    pub fn tone_range_mut(&mut self, target: ToneTarget) -> Option<&mut raw_core::ZoneMask> {
+        match target {
+            ToneTarget::Curve(i) => self
+                .params
+                .curve
+                .instances
+                .get_mut(i)?
+                .mask
+                .as_mut()?
+                .tone
+                .as_mut(),
+            ToneTarget::Layer(i) => self
+                .params
+                .dodgeburn
+                .instances
+                .get_mut(i)
+                .map(|l| &mut l.mask),
+        }
+    }
+
+    /// Do what a tone range's controls asked of the eyedropper on `target`'s range.
+    ///
+    /// Its own button toggles: armed on this range it is put away, keeping what was
+    /// sampled, and otherwise it is armed. Switching an island on with no seed arms it
+    /// and never puts it away, since the island is waiting for a click on the picture.
+    pub fn ask_tone_sampler(&mut self, target: ToneTarget, ask: crate::widgets::SamplerAsk) {
+        let armed = self.mode.tone_target() == Some(target);
+        self.mode = match (ask, armed) {
+            (crate::widgets::SamplerAsk::Toggle, true) => self.mode.left(),
+            (crate::widgets::SamplerAsk::Arm, true) => return,
+            (_, false) => self.mode.tone_sample(target, &self.params),
+        };
+    }
+
+    /// End the tone eyedropper if the range it sets is no longer the one on screen.
+    ///
+    /// **The tool belongs to one range**: the selected Curve instance's, or the selected
+    /// layer's. It leaves when another row is selected, when the instance or layer goes,
+    /// or when a curve's mask loses its tone part, and it keeps what was sampled, as
+    /// `Return` does. What it was opened over comes back, and is then held to its own
+    /// rule by [`end_stale_curve_mask`](Self::end_stale_curve_mask), so call this first.
+    pub fn end_stale_tone_sample(&mut self) {
+        let live = match self.mode.tone_target() {
+            None => return,
+            Some(ToneTarget::Curve(i)) => {
+                i == self.curve_active
+                    && self
+                        .params
+                        .curve
+                        .instances
+                        .get(i)
+                        .and_then(|instance| instance.mask.as_ref())
+                        .is_some_and(|mask| mask.tone.is_some())
+            }
+            Some(ToneTarget::Layer(i)) => {
+                self.db_active == Some(i) && i < self.params.dodgeburn.instances.len()
+            }
+        };
+        if !live {
+            self.mode = self.mode.left();
+        }
     }
 
     /// Pull the crop back onto real pixels after the angle moved under it.
@@ -1905,6 +2357,8 @@ mod tests {
                 crate::paint::Tool::default(),
                 raw_core::DodgeBurnParams::default(),
             ),
+            Mode::curve_mask(0, raw_core::CurveStack::default()),
+            Mode::View.tone_sample(ToneTarget::Curve(0), &raw_core::Params::default()),
         ] {
             let mut t = Tab::placeholder();
             t.mode = mode;
@@ -1912,6 +2366,396 @@ mod tests {
             assert!(!t.loupe.open, "the loupe opened over a tool");
             assert!(!t.mode.is_loupe(), "the loupe took a tool's mode");
         }
+    }
+
+    /// A tab whose second Curve pass has a shape mask, with the mask tool open on it.
+    fn masking_tab() -> Tab {
+        use raw_core::curve::CurveMask;
+        use raw_core::dodgeburn::{Linear, Shape};
+        let mut t = Tab::placeholder();
+        let second = t.params.curve.add_instance().expect("room");
+        t.params.curve.instances[second].mask =
+            Some(CurveMask::of_shape(Shape::Linear(Linear {
+                x0: 0.5,
+                y0: 0.0,
+                x1: 0.5,
+                y1: 0.5,
+                feather: 1.0,
+                ev: 0.0,
+            })));
+        t.curve_active = second;
+        t.mode = Mode::curve_mask(second, t.params.curve.clone());
+        t
+    }
+
+    #[test]
+    fn escape_in_the_mask_tool_restores_the_stack_as_it_was_when_the_tool_opened() {
+        // Picking a shape makes the mask and opens the tool in one step, so the snapshot
+        // has to be taken first or Esc could never take the mask back.
+        let mut t = Tab::placeholder();
+        let before = t.params.curve.clone();
+        t.mode = Mode::curve_mask(0, before.clone());
+        t.params.curve.instances[0].mask = Some(raw_core::curve::CurveMask::of_shape(
+            raw_core::dodgeburn::Shape::Linear(raw_core::dodgeburn::Linear {
+                x0: 0.5,
+                y0: 0.0,
+                x1: 0.5,
+                y1: 0.5,
+                feather: 1.0,
+                ev: 0.0,
+            }),
+        ));
+        assert_ne!(t.params.curve, before);
+        assert_eq!(t.mode.cancelled_curves(), Some(&before));
+        // The brush's snapshot and the crop's are other modes' and say nothing here.
+        assert!(t.mode.cancelled_strokes().is_none() && t.mode.cancelled().is_none());
+        assert!(Mode::View.cancelled_curves().is_none());
+    }
+
+    #[test]
+    fn the_mask_tool_claims_the_drag_and_lends_it_to_space() {
+        let t = masking_tab();
+        assert!(t.mode.claims_drag());
+        assert!(!t.mode.pans_with_drag(false), "a drag must place the shape");
+        assert!(t.mode.pans_with_drag(true), "Space is the one key the tool has");
+        assert!(t.mode.hint().is_some_and(|h| h.contains("Esc") && h.contains("Return")));
+        assert_eq!(t.mode.curve_mask_instance(), Some(1));
+        assert!(t.mode.curve_mask_grab().is_none());
+    }
+
+    #[test]
+    fn the_mask_tool_stays_while_its_pass_is_selected_and_has_a_mask() {
+        let mut t = masking_tab();
+        t.end_stale_curve_mask();
+        assert!(t.mode.is_curve_mask(), "nothing had changed");
+    }
+
+    #[test]
+    fn selecting_another_curve_leaves_the_mask_tool_and_keeps_the_work() {
+        let mut t = masking_tab();
+        let masked = t.params.curve.clone();
+        t.curve_active = 0;
+        t.end_stale_curve_mask();
+        assert_eq!(t.mode, Mode::View);
+        assert_eq!(t.params.curve, masked, "leaving is Return, not Esc");
+    }
+
+    #[test]
+    fn removing_the_mask_or_its_pass_leaves_the_mask_tool() {
+        let mut t = masking_tab();
+        t.params.curve.instances[1].mask = None;
+        t.end_stale_curve_mask();
+        assert_eq!(t.mode, Mode::View, "Remove");
+
+        // An undo across a deletion can leave the tool naming a pass that is gone.
+        let mut t = masking_tab();
+        t.params.curve.instances.truncate(1);
+        t.end_stale_curve_mask();
+        assert_eq!(t.mode, Mode::View, "a pass that no longer exists");
+
+        // Other modes are not this method's business.
+        let mut t = Tab::placeholder();
+        t.mode = Mode::Pin;
+        t.end_stale_curve_mask();
+        assert_eq!(t.mode, Mode::Pin);
+    }
+
+    /// `masking_tab`, with a Linear burn as its one Dodge & Burn layer, selected.
+    fn two_masks_tab() -> Tab {
+        use raw_core::dodgeburn::{Instance, Linear, Shape};
+        let mut t = masking_tab();
+        t.mode = Mode::View;
+        let mut sky = Instance::of(
+            raw_core::Sign::Burn,
+            "Sky".into(),
+            Shape::Linear(Linear {
+                x0: 0.5,
+                y0: 0.0,
+                x1: 0.5,
+                y1: 0.4,
+                feather: 1.0,
+                ev: -0.5,
+            }),
+        );
+        sky.mask.enabled = true;
+        sky.mask.lo = 1.0;
+        t.params.dodgeburn.instances.push(sky);
+        t.db_active = Some(0);
+        t
+    }
+
+    #[test]
+    fn the_picture_shows_one_mask_pinned_from_either_module() {
+        use raw_core::curve::CurveMask;
+        use raw_gpu::MaskLook;
+        let mut t = two_masks_tab();
+        assert!(t.shown_mask().is_none(), "nothing pinned, nothing dragged");
+        let curves = t.params.curve.instances[1].mask.clone().expect("a mask");
+        let layers = CurveMask::of_layer(&t.params.dodgeburn.instances[0]);
+        assert_ne!(curves, layers);
+
+        t.mask_pin = Some((MaskOwner::Curve, MaskLook::Overlay));
+        assert_eq!(t.shown_mask(), Some((curves.clone(), MaskLook::Overlay)));
+        // One pin: the layer's takes the curve's place, it does not sit beside it.
+        t.mask_pin = Some((MaskOwner::Layer, MaskLook::Mask));
+        assert_eq!(t.shown_mask(), Some((layers.clone(), MaskLook::Mask)));
+
+        // A pin on a module with nothing selected to show draws nothing.
+        t.db_active = None;
+        assert!(t.shown_mask().is_none());
+        t.db_active = Some(0);
+        t.mask_pin = Some((MaskOwner::Curve, MaskLook::Mask));
+        t.params.curve.instances[1].mask = None;
+        assert!(t.shown_mask().is_none(), "the selected curve has no mask to show");
+    }
+
+    #[test]
+    fn a_mask_being_shaped_is_shown_over_a_pin_in_the_other_module() {
+        use raw_core::curve::CurveMask;
+        use raw_gpu::MaskLook;
+        let mut t = two_masks_tab();
+        let curves = t.params.curve.instances[1].mask.clone().expect("a mask");
+        let layers = CurveMask::of_layer(&t.params.dodgeburn.instances[0]);
+
+        // The curve's overlay is pinned, and the layer's tone ruler is dragged: the
+        // layer's mask, alone, for as long as the drag lasts.
+        t.mask_pin = Some((MaskOwner::Curve, MaskLook::Overlay));
+        t.zone_drag = Some(crate::widgets::ZoneGrab::Lo);
+        assert_eq!(t.shown_mask(), Some((layers.clone(), MaskLook::Mask)));
+        t.zone_drag = None;
+        assert_eq!(t.shown_mask(), Some((curves.clone(), MaskLook::Overlay)));
+
+        // The other way round: the layer's is pinned and the curve's ruler is dragged.
+        t.mask_pin = Some((MaskOwner::Layer, MaskLook::Overlay));
+        t.curve_zone_drag = Some(crate::widgets::ZoneGrab::Hi);
+        assert_eq!(t.shown_mask(), Some((curves.clone(), MaskLook::Mask)));
+        t.curve_zone_drag = None;
+
+        // A gradient's handle dragged on the picture shows the film; a brush stroke is
+        // not a handle, and painting does not put a mask up.
+        t.mask_pin = None;
+        let paint = |grab| Mode::Paint {
+            sign: raw_core::Sign::Burn,
+            tool: crate::paint::Tool::Linear,
+            grab,
+            entered: Box::new(raw_core::DodgeBurnParams::default()),
+        };
+        t.mode = paint(Some(PaintGrab::Handle(crate::paint::End::To)));
+        assert_eq!(t.shown_mask(), Some((layers, MaskLook::Overlay)));
+        t.mode = paint(Some(PaintGrab::Stroke {
+            last: (0.5, 0.5),
+            erasing: false,
+            bearing: None,
+        }));
+        assert!(t.shown_mask().is_none());
+        t.mode = paint(None);
+        assert!(t.shown_mask().is_none());
+    }
+
+    #[test]
+    fn the_overlay_key_puts_the_film_on_the_mask_in_hand_and_takes_it_off() {
+        use raw_gpu::MaskLook;
+        let mut t = two_masks_tab();
+        // Nothing open: the selected Curve instance's, and the same key takes it down.
+        assert!(t.toggle_mask_overlay());
+        assert_eq!(t.mask_pin, Some((MaskOwner::Curve, MaskLook::Overlay)));
+        assert!(t.toggle_mask_overlay());
+        assert_eq!(t.mask_pin, None);
+        // From `view mask`, the film.
+        t.mask_pin = Some((MaskOwner::Curve, MaskLook::Mask));
+        assert!(t.toggle_mask_overlay());
+        assert_eq!(t.mask_pin, Some((MaskOwner::Curve, MaskLook::Overlay)));
+        // A layer's look that is up comes down, rather than the curve's going up.
+        t.mask_pin = Some((MaskOwner::Layer, MaskLook::Overlay));
+        assert!(t.toggle_mask_overlay());
+        assert_eq!(t.mask_pin, None);
+        // The brush open on a layer: that layer's.
+        t.mode = Mode::paint(
+            raw_core::Sign::Burn,
+            crate::paint::Tool::default(),
+            t.params.dodgeburn.clone(),
+        );
+        assert!(t.toggle_mask_overlay());
+        assert_eq!(t.mask_pin, Some((MaskOwner::Layer, MaskLook::Overlay)));
+        // With no mask in either module there is nothing to show, and nothing changes.
+        let mut bare = Tab::placeholder();
+        assert!(!bare.toggle_mask_overlay());
+        assert_eq!(bare.mask_pin, None);
+    }
+
+    /// A tab whose selected Curve pass has a tone range, with the eyedropper armed on it.
+    fn sampling_tab() -> Tab {
+        let mut t = Tab::placeholder();
+        crate::curve_mask::flip_tone(&mut t.params.curve.instances[0]);
+        t.mode = t.mode.tone_sample(ToneTarget::Curve(0), &t.params);
+        t
+    }
+
+    /// A tab painting on its one layer.
+    fn painting_tab() -> Tab {
+        let mut t = Tab::placeholder();
+        t.params.dodgeburn.instances.push(raw_core::dodgeburn::Instance::new(
+            raw_core::Sign::Burn,
+            "Burn 1".into(),
+        ));
+        t.db_active = Some(0);
+        t.mode = Mode::paint(
+            raw_core::Sign::Burn,
+            crate::paint::Tool::default(),
+            t.params.dodgeburn.clone(),
+        );
+        t
+    }
+
+    #[test]
+    fn the_tone_sampler_is_a_tool_that_stays_and_says_how_to_leave() {
+        let t = sampling_tab();
+        assert_eq!(t.mode.tone_target(), Some(ToneTarget::Curve(0)));
+        assert!(t.mode.claims_drag(), "a drag draws the box, it must not pan");
+        assert!(!t.mode.pans_with_drag(false));
+        assert!(t.mode.pans_with_drag(true), "it stays armed, so Space has to pan");
+        let hint = t.mode.hint().expect("a mode says what it is");
+        assert!(hint.starts_with("TONE SAMPLER"), "{hint}");
+        assert!(hint.contains("Esc") && hint.contains("Return") && hint.contains('⇧'));
+    }
+
+    #[test]
+    fn an_island_changes_what_the_tone_sampler_says_a_click_does() {
+        let mut t = sampling_tab();
+        let Mode::ToneSample { island, .. } = &mut t.mode else {
+            panic!("the sampler is armed");
+        };
+        *island = true;
+        let hint = t.mode.hint().expect("a mode says what it is");
+        assert!(hint.starts_with("TONE ISLAND"), "{hint}");
+        // Removing a seed is the gesture nothing on screen suggests.
+        assert!(hint.contains('⌥') && hint.contains('⇧') && hint.contains("Esc"));
+        // Armed again on the same range, it is still an island's tool: the flag is the
+        // tool's own and re-arming does not reset it for a frame.
+        t.mode = t.mode.tone_sample(ToneTarget::Curve(0), &t.params);
+        assert!(matches!(t.mode, Mode::ToneSample { island: true, .. }));
+    }
+
+    #[test]
+    fn a_tone_target_names_one_range_in_either_module() {
+        let mut t = sampling_tab();
+        t.params.dodgeburn.instances.push(raw_core::dodgeburn::Instance::new(
+            raw_core::Sign::Burn,
+            "Burn 1".into(),
+        ));
+        t.tone_range_mut(ToneTarget::Curve(0)).expect("the curve's").hi = 1.0;
+        t.tone_range_mut(ToneTarget::Layer(0)).expect("the layer's").lo = -1.0;
+        assert_eq!(t.tone_range(ToneTarget::Curve(0)).map(|m| m.hi), Some(1.0));
+        assert_eq!(t.params.dodgeburn.instances[0].mask.lo, -1.0);
+        // Nothing to name: no such instance, no such layer, a mask with no tone part.
+        assert!(t.tone_range(ToneTarget::Curve(3)).is_none());
+        assert!(t.tone_range(ToneTarget::Layer(1)).is_none());
+        t.params.curve.instances[0].mask = None;
+        assert!(t.tone_range_mut(ToneTarget::Curve(0)).is_none());
+    }
+
+    #[test]
+    fn escape_in_the_tone_sampler_puts_back_the_module_its_range_belongs_to() {
+        let mut t = sampling_tab();
+        let before = t.params.curve.clone();
+        if let Some(tone) = t.params.curve.instances[0]
+            .mask
+            .as_mut()
+            .and_then(|m| m.tone.as_mut())
+        {
+            tone.sample(1.0, 1.0);
+        }
+        assert_eq!(t.mode.cancelled_curves(), Some(&before));
+        assert!(t.mode.cancelled_strokes().is_none(), "a curve's range, not a layer's");
+        assert_eq!(t.mode.left(), Mode::View, "opened over nothing, it leaves to pan");
+
+        // On a layer it is the layers that go back.
+        let mut t = painting_tab();
+        let before = t.params.dodgeburn.clone();
+        t.mode = t.mode.tone_sample(ToneTarget::Layer(0), &t.params);
+        t.params.dodgeburn.instances[0].mask.sample(-2.0, -2.0);
+        assert_eq!(t.mode.cancelled_strokes(), Some(&before));
+        assert!(t.mode.cancelled_curves().is_none());
+    }
+
+    #[test]
+    fn leaving_the_tone_sampler_gives_the_brush_back() {
+        // The eyedropper is reached from inside a layer being painted. Leaving it returns
+        // to that brush session, snapshot and all, and not to pan.
+        let mut t = painting_tab();
+        let painting = t.mode.clone();
+        t.mode = t.mode.tone_sample(ToneTarget::Layer(0), &t.params);
+        assert!(t.mode.tone_target().is_some());
+        assert_eq!(t.mode.left(), painting);
+
+        // And a mask's handles, on a curve.
+        let mut t = masking_tab();
+        crate::curve_mask::flip_tone(&mut t.params.curve.instances[1]);
+        let adjusting = t.mode.clone();
+        t.mode = t.mode.tone_sample(ToneTarget::Curve(1), &t.params);
+        assert_eq!(t.mode.left(), adjusting);
+
+        // A tool with nothing to resume is not resumed: pins are placed, not returned to.
+        let mut t = Tab::placeholder();
+        t.mode = Mode::Pin;
+        t.mode = t.mode.tone_sample(ToneTarget::Curve(0), &t.params);
+        assert_eq!(t.mode.left(), Mode::View);
+    }
+
+    #[test]
+    fn arming_the_tone_sampler_again_keeps_what_escape_discards() {
+        let mut t = sampling_tab();
+        let before = t.params.curve.clone();
+        if let Some(tone) = t.params.curve.instances[0]
+            .mask
+            .as_mut()
+            .and_then(|m| m.tone.as_mut())
+        {
+            tone.sample(1.0, 1.0);
+        }
+        t.mode = t.mode.tone_sample(ToneTarget::Curve(0), &t.params);
+        assert_eq!(
+            t.mode.cancelled_curves(),
+            Some(&before),
+            "re-arming redefined what Esc puts back"
+        );
+    }
+
+    #[test]
+    fn the_tone_sampler_leaves_with_the_range_it_sets() {
+        let mut t = sampling_tab();
+        t.end_stale_tone_sample();
+        assert!(t.mode.tone_target().is_some(), "nothing had changed");
+
+        // Another curve selected.
+        let mut t = sampling_tab();
+        let second = t.params.curve.add_instance().expect("room");
+        t.curve_active = second;
+        let sampled = t.params.curve.clone();
+        t.end_stale_tone_sample();
+        assert_eq!(t.mode, Mode::View);
+        assert_eq!(t.params.curve, sampled, "leaving is Return, not Esc");
+
+        // The tone part, the mask or the pass gone.
+        let mut t = sampling_tab();
+        if let Some(mask) = &mut t.params.curve.instances[0].mask {
+            mask.tone = None;
+        }
+        t.end_stale_tone_sample();
+        assert_eq!(t.mode, Mode::View);
+
+        // A layer deselected: the brush it was opened over comes back.
+        let mut t = painting_tab();
+        t.mode = t.mode.tone_sample(ToneTarget::Layer(0), &t.params);
+        t.db_active = None;
+        t.end_stale_tone_sample();
+        assert!(t.mode.is_paint());
+
+        // Other modes are not this method's business.
+        let mut t = Tab::placeholder();
+        t.mode = Mode::Pin;
+        t.end_stale_tone_sample();
+        assert_eq!(t.mode, Mode::Pin);
     }
 
     #[test]

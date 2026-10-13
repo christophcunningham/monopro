@@ -959,6 +959,14 @@ impl Params {
                             .any(|(a, b)| a.opacity != b.opacity),
                         "instance opacity",
                     ),
+                    (
+                        a.curve
+                            .instances
+                            .iter()
+                            .zip(&b.curve.instances)
+                            .any(|(a, b)| a.mask != b.mask),
+                        "mask",
+                    ),
                 ])
                 .or(Some("points")),
             ));
@@ -1655,6 +1663,39 @@ mod tests {
             a.what_changed(&b),
             Some(("Curve", Some("instance opacity")))
         );
+    }
+
+    #[test]
+    fn a_mask_edit_redraws_without_rebaking_and_names_itself_in_history() {
+        use crate::curve::CurveMask;
+        use crate::dodgeburn::{Linear, Shape};
+        let sky = |y1| {
+            Shape::Linear(Linear {
+                x0: 0.5,
+                y0: 0.0,
+                x1: 0.5,
+                y1,
+                feather: 1.0,
+                ev: 0.0,
+            })
+        };
+        let mut a = Params::default();
+        a.curve.instances[0].curve.add(0.5, 0.65);
+        a.curve.instances[0].mask = Some(CurveMask::of_shape(sky(0.5)));
+        let mut b = a.clone();
+        b.curve.instances[0].mask = Some(CurveMask::of_shape(sky(0.3)));
+        let dirty = a.diff(&b);
+        assert!(dirty.render, "moving a mask must redraw");
+        assert!(!dirty.decode && !dirty.luminance);
+        assert_eq!(a.what_changed(&b), Some(("Curve", Some("mask"))));
+        // And a mask that is switched off is the same picture as none.
+        let mut off = a.clone();
+        if let Some(mask) = &mut off.curve.instances[0].mask {
+            mask.enabled = false;
+        }
+        let mut none = a.clone();
+        none.curve.instances[0].mask = None;
+        assert_eq!(off.diff(&none), Dirty::NONE);
     }
 
     #[test]

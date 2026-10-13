@@ -1,5 +1,6 @@
 //! The Dodge & Burn brush: the tool's own settings, where dabs land, and which
-//! instance a pass goes onto.
+//! instance a pass goes onto. A Curve instance's painted mask is painted with it too,
+//! through `begin_pass` and `extend_pass`, which lay a pass on any painted shape.
 //!
 //! # Why this is not in `viewport_panel`
 //!
@@ -292,9 +293,13 @@ impl Default for Brush {
         // quarter stop — small enough that a first stroke is a suggestion rather
         // than a statement, which is the right way round for a tool you cannot see
         // the effect of until you have used it.
+        //
+        // Feather 0.60 and not the prototype's 0.40, which was a bell's: with the core
+        // falloff, 0.40 would hold full strength over most of the brush. 0.60 fades
+        // over the outer three fifths, chosen by the maintainer.
         Self {
             radius: 0.06,
-            feather: 0.40,
+            feather: 0.60,
             nib: Nib::Round,
             aspect: 1.0,
             angle: 0.0,
@@ -346,6 +351,9 @@ impl Brush {
             aspect: self.aspect,
             angle: bearing.filter(|_| self.follow).unwrap_or(self.angle),
             nib,
+            // Every stroke painted now: the core falloff, whose Feather is the width
+            // of the fade. See `raw_core::dodgeburn::Falloff`.
+            falloff: raw_core::dodgeburn::Falloff::Core,
         }
     }
 
@@ -526,10 +534,19 @@ pub fn instance_for(
 /// The first dab of a following nib has no direction yet — nothing has moved — so it
 /// takes the brush's own angle and the second dab onwards take the drag's.
 pub fn begin(inst: &mut Instance, brush: &Brush, at: (f32, f32), erasing: bool) {
-    let nib = inst.shape.nib().unwrap_or_default();
-    let dab = brush.dab(at, inst.sign, erasing, None, nib);
-    if let Some(g) = inst.gestures_mut() {
-        g.push(Gesture::new(vec![dab]));
+    begin_pass(&mut inst.shape, inst.sign, brush, at, erasing);
+}
+
+/// [`begin`] on a painted shape that is not a layer's: a Curve mask's.
+///
+/// `sign` is which way a pass that paints points. A mask is painted in the positive
+/// direction, so its callers pass [`Sign::Dodge`]: a pass that paints carries a positive
+/// `ev` and an eraser pass a negative one, which is all a mask reads of it.
+pub fn begin_pass(shape: &mut Shape, sign: Sign, brush: &Brush, at: (f32, f32), erasing: bool) {
+    let nib = shape.nib().unwrap_or_default();
+    let dab = brush.dab(at, sign, erasing, None, nib);
+    if let Some(passes) = shape.passes_mut() {
+        passes.push(Gesture::new(vec![dab]));
     }
 }
 
@@ -545,8 +562,20 @@ pub fn extend(
     aspect: f32,
     erasing: bool,
 ) -> ((f32, f32), Option<f32>) {
-    let sign = inst.sign;
-    let nib = inst.shape.nib().unwrap_or_default();
+    extend_pass(&mut inst.shape, inst.sign, brush, from, to, aspect, erasing)
+}
+
+/// [`extend`] on a painted shape that is not a layer's; see [`begin_pass`].
+pub fn extend_pass(
+    shape: &mut Shape,
+    sign: Sign,
+    brush: &Brush,
+    from: (f32, f32),
+    to: (f32, f32),
+    aspect: f32,
+    erasing: bool,
+) -> ((f32, f32), Option<f32>) {
+    let nib = shape.nib().unwrap_or_default();
     // The bearing of the drag, in the same width-normalised space the nib is
     // measured in — so a nib following a diagonal on a wide frame lies along the
     // path as it appears, rather than as the coordinates happen to be scaled.
@@ -559,7 +588,7 @@ pub fn extend(
         .map(|at| brush.dab(*at, sign, erasing, bearing, nib))
         .collect();
     let last = dabs.last().map_or(from, |d| (d.x, d.y));
-    if let Some(g) = inst.gestures_mut().and_then(|g| g.last_mut()) {
+    if let Some(g) = shape.passes_mut().and_then(|g| g.last_mut()) {
         g.dabs_mut().extend(dabs);
     }
     (last, bearing)

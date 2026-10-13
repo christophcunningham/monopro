@@ -22,6 +22,9 @@
 // Chemical toning, baked to flat [y, a, b] triples over L*. See `raw_core::toning`.
 @group(0) @binding(9) var<storage, read> tone_lut: array<f32>;
 @group(0) @binding(10) var<storage, read_write> histogram: array<atomic<u32>>;
+// The Curve mask the mask view draws, when `p.overlays` asks for one: the selected
+// pass's, as one segment record. See `curve_mask.wgsl` and `Viewport::set_mask_view`.
+@group(0) @binding(13) var<uniform> mask_view: Segment;
 
 // The maximum over a capped footprint. Point sampling makes a fine clipped region
 // sparkle below 100%; averaging makes a warning fade out. Maximum is conservative,
@@ -270,7 +273,21 @@ fn false_colour(v: f32) -> vec3<f32> {
 }
 
 @compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    // **A painted mask in the mask view is scanned first, before anything returns.**
+    // The scan culls with barriers every invocation of the workgroup has to reach. It
+    // runs only while a mask is being shown and that mask is painted; `mask_view.len`
+    // is how many dabs it has.
+    if ((p.overlays & 192u) != 0u && mask_view.len > 0u) {
+        let at = source_coord(gid.xy);
+        let sw = f32(p.src_w);
+        let sh = f32(p.src_h);
+        scan_painted(mask_view.len, lid, wid, at.x / sw, at.y / sh, sh / sw);
+    }
     if (gid.x >= p.out_w || gid.y >= p.out_h) {
         return;
     }
@@ -407,22 +424,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // and the colours are its colours, so the two apps flag the same pixels.
     var rgb = o3;
 
-    // -- The mask view ------------------------------------------------------
-    //
-    // Yellow, darktable's convention: a greyscale coverage map is indistinguishable at
-    // a glance from a very flat photograph, and a hue says "this is not your picture"
-    // before you have read anything. Slightly warm rather than #FFFF00, which vibrates
-    // against this panel's near-black.
-    //
-    // **Multiplies rather than tints**, so black stays black and the mask's own gradient
-    // — the thing you opened the view to judge — survives.
-    if (p.db_show_mask >= 0) {
-        rgb = vec3<f32>(o, o, o) * vec3<f32>(1.0, 0.886, 0.157);
-    }
-
     // -- Rubylith: the dodge and burn maps ----------------------------------
     //
-    // Multiplies, like the mask view above and for the same reason: an *additive* tint
+    // Multiplies, like the mask view below and for the same reason: an *additive* tint
     // would flood the unpainted ground and hide the boundary you are looking for.
     //
     // Ruby for burn, cool blue for dodge — `theme::BURN` and `theme::DODGE`. The theme's
@@ -434,6 +438,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if ((p.overlays & 16u) != 0u) {
         rgb = vec3<f32>(o, o, o) * vec3<f32>(0.980, 0.533, 0.510);
+    }
+
+    // -- The mask view ------------------------------------------------------
+    //
+    // One mask, a Curve instance's or a Dodge & Burn layer's, from the record at
+    // `mask_view`. Bits 64 and 128 of p.overlays; see raw_gpu::MaskLook. The weight is
+    // `segment_weight`, the function the curve pass blends by, read at this pixel's place
+    // on the negative, so what is shown is what was applied.
+    //
+    // 64 shows the mask in place of the picture. Yellow, darktable's convention: a gray
+    // coverage map is indistinguishable at a glance from a very flat photograph, and a
+    // hue says "this is not your picture" before you have read anything. Slightly warm
+    // rather than #FFFF00, which vibrates against this panel's near-black. **Multiplied
+    // rather than tinted**, so black stays black and the mask's own gradient, the thing
+    // the view is opened to judge, survives.
+    //
+    // 128 lays red film over what the mask PROTECTS and leaves what it selects clear:
+    // Photoshop's layer-mask overlay, and the darkroom's rubylith. Pure red at 75% where
+    // the mask is zero (`MaskLook::FILM`), thinning as the mask rises, so a soft edge
+    // reads as a soft edge. Interpolated toward the film rather than multiplied by it:
+    // a multiply cannot redden a black shadow, and a protected shadow has to read as
+    // protected.
+    if ((p.overlays & 192u) != 0u) {
+        let at = source_coord(gid.xy);
+        let sw = f32(p.src_w);
+        let sh = f32(p.src_h);
+        let m = segment_weight(mask_view, at.x / sw, at.y / sh, sh / sw, painted[0]);
+        if ((p.overlays & 64u) != 0u) {
+            rgb = vec3<f32>(m, m, m) * vec3<f32>(1.0, 0.886, 0.157);
+        } else {
+            rgb = mix(rgb, vec3<f32>(1.0, 0.0, 0.0), 0.75 * (1.0 - m));
+        }
     }
 
     // False colour replaces the image; the clipping overlays sit on top of

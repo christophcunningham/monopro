@@ -171,7 +171,18 @@ impl Basis {
             return None;
         }
         let ev = self.read(m);
-        let mut out: Vec<f32> = ev.iter().map(|&e| m.evaluate(e)).collect();
+        let mut out: Vec<f32> = ev.iter().map(|&e| m.select(e)).collect();
+        // The island, before `Inv`: it limits what the range selects, and `Inv` then
+        // turns over the selection it leaves, so inverted it is everything but the
+        // island.
+        if m.island.is_live() {
+            island(&mut out, self.w, self.h, m.island.seeds());
+        }
+        if m.invert {
+            for v in &mut out {
+                *v = 1.0 - *v;
+            }
+        }
         // The diffusion spacer. Masks were printed unsharp on purpose; without
         // this the mask carries whatever granularity the trapezoid's edges cut
         // into the proxy.
@@ -180,6 +191,71 @@ impl Basis {
             out = gaussian(&out, self.w, self.h, sigma);
         }
         Some(out)
+    }
+
+    /// The image a range with `m`'s settings reads, held so the eyedropper can ask it
+    /// about points of the negative.
+    ///
+    /// **The same image the mask is cut from**, regional when the range is edge-aware,
+    /// which is the point: a tone read from anything else (the exposed pixel, say) is
+    /// not the tone the trapezoid will be compared against, and a click on a cloud would
+    /// set a range the cloud then falls outside of.
+    ///
+    /// Edge-aware, this runs the guided filter once over the proxy. That is the cost of
+    /// one mask, paid on a click and not on a frame.
+    pub fn reading(&self, m: &ZoneMask) -> Reading<'_> {
+        Reading {
+            w: self.w,
+            h: self.h,
+            ev: self.read(m),
+        }
+    }
+
+    /// The eyedropper, whole: read the tones under `points` and set `tone`'s range from
+    /// them, or widen it to take them in when `extend` is set. `false`, and nothing
+    /// changed, when no point was on the negative.
+    ///
+    /// One point is a click and many are a box; both are the span of what was sampled,
+    /// which for one point is that point's tone twice. The picture is read **with
+    /// `tone`'s own settings**, regionally when it is edge-aware, so the range is set
+    /// against the image it will be compared with.
+    pub fn sample_into(
+        &self,
+        tone: &mut ZoneMask,
+        points: impl IntoIterator<Item = (f32, f32)>,
+        extend: bool,
+    ) -> bool {
+        let Some((lo, hi)) = self.reading(tone).span(points) else {
+            return false;
+        };
+        if extend {
+            tone.extend(lo, hi);
+        } else {
+            tone.sample(lo, hi);
+        }
+        true
+    }
+
+    /// The prepared mask's value at a point of the negative: what the shader's lookup
+    /// returns there, diffusion included. One for a range that masks nothing.
+    ///
+    /// `x` and `y` are source-normalized. This evaluates the whole mask to read one
+    /// point of it, so it is for a click, such as the curve's point sampler asking how
+    /// much of a masked pass reached the pixel, and not for a loop over pixels: that is
+    /// what [`prepare`](Self::prepare) is for.
+    pub fn weight_at(&self, m: &ZoneMask, x: f32, y: f32) -> f32 {
+        self.prepare(m).at(x, y)
+    }
+
+    /// The mask of a range, prepared once and held to be read at many points: what the
+    /// zone worker uploads for the shader, kept on the CPU for a caller that weighs
+    /// samples of the picture by it, such as the curve editor's histogram.
+    pub fn prepare(&self, m: &ZoneMask) -> PreparedMask {
+        PreparedMask {
+            w: self.w,
+            h: self.h,
+            mask: self.evaluate(m),
+        }
     }
 
     /// The EV distribution, normalised so the tallest bin is 1.0, for the ghost
@@ -223,6 +299,353 @@ impl Basis {
         let peak = smooth.iter().copied().fold(0.0f32, f32::max).max(1.0);
         smooth.iter().map(|c| c / peak).collect()
     }
+}
+
+/// One tonal range's mask at proxy resolution, for reading at points: see
+/// [`Basis::prepare`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedMask {
+    w: usize,
+    h: usize,
+    /// `None` for a range that masks nothing, which weighs one everywhere.
+    mask: Option<Vec<f32>>,
+}
+
+impl PreparedMask {
+    /// The mask at a source-normalized point, blended as the shader blends it.
+    pub fn at(&self, x: f32, y: f32) -> f32 {
+        match &self.mask {
+            Some(mask) => bilinear(mask, self.w, self.h, x, y),
+            None => 1.0,
+        }
+    }
+}
+
+/// The EV image one tonal range reads, for sampling: see [`Basis::reading`].
+#[derive(Debug, Clone)]
+pub struct Reading<'a> {
+    w: usize,
+    h: usize,
+    ev: std::borrow::Cow<'a, [f32]>,
+}
+
+impl Reading<'_> {
+    /// Where in a sampled area's tones its range begins and ends: the 10th and the 90th
+    /// percentile, so a few stray pixels (a specular glint in a wall, a bird in a sky)
+    /// do not stretch the range to reach them.
+    pub const SPAN: (f32, f32) = (0.10, 0.90);
+
+    /// The tone at a point of the negative, in EV against middle gray.
+    ///
+    /// `x` and `y` are source-normalized. Blended from the four proxy pixels around the
+    /// point, as the shader blends the mask it looks up, so a click between two of them
+    /// reads what the mask is compared against there.
+    pub fn at(&self, x: f32, y: f32) -> f32 {
+        bilinear(&self.ev, self.w, self.h, x, y)
+    }
+
+    /// The span of tones under `points`, as `(low, high)` in EV: the percentiles
+    /// [`SPAN`](Self::SPAN) names. Points off the negative are skipped, and `None` means
+    /// none were on it.
+    ///
+    /// **Points and not a rectangle**, because the box is dragged on the picture as it
+    /// is shown and the negative under it may be turned, straightened or corrected for
+    /// perspective: the caller lays a lattice across the box on screen and carries each
+    /// point onto the negative, which is right whatever lies between the two.
+    pub fn span(&self, points: impl IntoIterator<Item = (f32, f32)>) -> Option<(f32, f32)> {
+        let mut tones: Vec<f32> = points
+            .into_iter()
+            .filter(|(x, y)| (0.0..=1.0).contains(x) && (0.0..=1.0).contains(y))
+            .map(|(x, y)| self.at(x, y))
+            .collect();
+        if tones.is_empty() {
+            return None;
+        }
+        tones.sort_by(f32::total_cmp);
+        // Between ranks rather than the nearest one, so a small sample's ends do not
+        // jump by a whole pixel's tone as the box grows by one.
+        let at = |q: f32| {
+            let f = q * (tones.len() - 1) as f32;
+            let i = f.floor() as usize;
+            let next = tones[(i + 1).min(tones.len() - 1)];
+            tones[i] + (next - tones[i]) * (f - i as f32)
+        };
+        Some((at(Self::SPAN.0), at(Self::SPAN.1)))
+    }
+}
+
+/// One value of a proxy-sized image at a source-normalized point, blended from the four
+/// pixels around it.
+///
+/// **The shader's `mask_at`, on the CPU** (`raw-gpu/src/zone_mask.wgsl`): pixel centers,
+/// clamped at the border. The two change together, or a sample stops reading what the
+/// picture shows.
+fn bilinear(a: &[f32], w: usize, h: usize, u: f32, v: f32) -> f32 {
+    let fx = (u * w as f32 - 0.5).clamp(0.0, (w - 1) as f32);
+    let fy = (v * h as f32 - 0.5).clamp(0.0, (h - 1) as f32);
+    let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+    let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+    let at = |x: usize, y: usize| a[y * w + x];
+    let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
+    let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
+    top + (bottom - top) * ty
+}
+
+/// How strongly a range must select a pixel for an island to grow through it: half.
+///
+/// Through the range's full-strength band and the inner half of its shoulders, and no
+/// further. Growing through anything the range selects at all would let an island leak
+/// along the faintest shoulder tones, across a sky that is only a little like the cloud
+/// in it, and out to every other bright thing the sky touches.
+const ISLAND_GROWS_THROUGH: f32 = 0.5;
+
+/// How far past its edge an island lets the range fade out, as a fraction of the
+/// proxy's long edge: a little over one percent of the frame.
+///
+/// The band of shoulder tones around a subject is the subject's own soft edge, and
+/// cutting the island off where it stopped growing would cut that edge hard. This is
+/// wide enough to keep it and narrow enough that nothing across a gap is reached.
+///
+/// Counted in pixels from the island, and not blurred out of it: a blur gives a thin
+/// part of a subject less of an edge than a broad one, and was about a third of what
+/// an island cost to work out.
+const ISLAND_EDGE: f32 = 0.0125;
+
+/// The narrowest connection an island grows across, as a fraction of the proxy's long
+/// edge on each side of the pixel: a neck has to be wider than about one percent of
+/// the frame to carry it.
+///
+/// Two subjects of the same tone nearly always touch somewhere, by a strip of rock that
+/// reaches the water or a highlight along an edge, and an island that grew through one
+/// pixel of contact would be the whole range again: on a cliff over the sea it was, for
+/// a click on either. So the growing ignores necks this thin, and a subject is what is
+/// joined by something with width.
+///
+/// **It errs toward selecting too little**, on purpose: a subject whose parts are
+/// joined only thinly, a rock face divided by its cracks, comes out one part at a time,
+/// and another seed takes the next part. A leak has no such remedy, since no seed takes
+/// a thing away.
+const ISLAND_NECK: f32 = 0.004;
+
+/// Limit a range's selection to what is connected to its seeds.
+///
+/// `weights` is the range's selection at each proxy pixel, before `Inv`. Each seed
+/// grows through its neighbors, diagonals included, wherever the range selects by at
+/// least [`ISLAND_GROWS_THROUGH`]; what none of them reaches is taken out. A seed on a
+/// pixel the range does not select that strongly grows nothing, which is what a seed
+/// left behind by a moved range should do.
+///
+/// **It grows through the body of a subject and not through its necks.** The growing
+/// runs over the selection worn back by [`ISLAND_NECK`] on every side, where a thin
+/// connection has no pixels left, and that finds the bodies the seeds are in. Every
+/// other strongly selected pixel, the rim that was worn off and whatever is too thin to
+/// have a body, then goes to the body it is nearest to along the selection: a twig
+/// stays with its branch, and a neck between two subjects is divided between them. A
+/// seed's own pixel counts as a body however thin the thing it is on, so a click on a
+/// wire selects the wire: a click always selects what is under it.
+///
+/// **The edge is the range's own.** Inside what was reached the selection is untouched,
+/// and just outside it the range's shoulder is kept in a band [`ISLAND_EDGE`] wide and
+/// fades to nothing across it, so the island ends as softly as the range does there
+/// and there is no step where the growing stopped. Only the shoulder: a pixel the range
+/// selects strongly and no seed reached is another subject, however near, and is out.
+///
+/// **Except across a neck**, the one place the island ends where the range is still at
+/// full strength on both sides. There the selection fades out over the same
+/// [`ISLAND_EDGE`], on the island's side of the cut, or the cut would be a step with
+/// the proxy's pixels for its outline.
+fn island(weights: &mut [f32], w: usize, h: usize, seeds: &[(f32, f32)]) {
+    let strong: Vec<bool> = weights
+        .iter()
+        .map(|&weight| weight >= ISLAND_GROWS_THROUGH)
+        .collect();
+    let neck = (ISLAND_NECK * w.max(h) as f32).round() as usize;
+    let body = worn(&strong, w, h, neck);
+    // Where the seeds are, and the bodies within a neck's width of them.
+    let on: Vec<usize> = seeds
+        .iter()
+        .map(|&(x, y)| {
+            let px = ((x * w as f32) as usize).min(w - 1);
+            let py = ((y * h as f32) as usize).min(h - 1);
+            py * w + px
+        })
+        .filter(|&at| strong[at])
+        .collect();
+    let near = grown(&strong, w, h, &on, neck);
+    let starts: Vec<usize> = (0..w * h).filter(|&p| near[p] && body[p]).collect();
+    let seeded = grown(&body, w, h, &starts, usize::MAX);
+
+    // Whose each strongly selected pixel is: the island's, or another body's. Both
+    // kinds of body grow outward through the selection a step at a time, and a pixel
+    // is taken by whichever gets to it first, the island's on a tie.
+    const UNCLAIMED: u8 = 0;
+    const ISLANDS: u8 = 1;
+    const ANOTHERS: u8 = 2;
+    let mut owner = vec![UNCLAIMED; w * h];
+    let mut frontier: Vec<usize> = Vec::new();
+    for at in (0..w * h).filter(|&p| seeded[p]).chain(on.iter().copied()) {
+        if owner[at] == UNCLAIMED {
+            owner[at] = ISLANDS;
+            frontier.push(at);
+        }
+    }
+    for at in (0..w * h).filter(|&p| body[p]) {
+        if owner[at] == UNCLAIMED {
+            owner[at] = ANOTHERS;
+            frontier.push(at);
+        }
+    }
+    let mut next = Vec::new();
+    while !frontier.is_empty() {
+        for &at in &frontier {
+            let (px, py) = (at % w, at / w);
+            for ny in py.saturating_sub(1)..=(py + 1).min(h - 1) {
+                for nx in px.saturating_sub(1)..=(px + 1).min(w - 1) {
+                    let to = ny * w + nx;
+                    if strong[to] && owner[to] == UNCLAIMED {
+                        owner[to] = owner[at];
+                        next.push(to);
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut frontier, &mut next);
+        next.clear();
+    }
+    let reached: Vec<bool> = owner.iter().map(|&o| o == ISLANDS).collect();
+    let band = ((ISLAND_EDGE * w.max(h) as f32).round() as usize).max(1);
+    let ease = |t: f32| t * t * (3.0 - 2.0 * t);
+    let all = || 0..w * h;
+
+    // The cuts: what was reached and touches something as strongly selected that was
+    // not, which only a neck leaves. The island fades toward them from `band` pixels
+    // back, counted through the island and so never around a corner into its body.
+    let cut: Vec<usize> = all()
+        .filter(|&at| reached[at])
+        .filter(|&at| {
+            let (px, py) = (at % w, at / w);
+            (py.saturating_sub(1)..=(py + 1).min(h - 1)).any(|ny| {
+                (px.saturating_sub(1)..=(px + 1).min(w - 1))
+                    .any(|nx| strong[ny * w + nx] && !reached[ny * w + nx])
+            })
+        })
+        .collect();
+    if !cut.is_empty() {
+        let back = steps(&cut, |p| reached[p], w, h, band);
+        for at in all().filter(|&at| reached[at] && back[at] < band) {
+            weights[at] *= ease((back[at] + 1) as f32 / (band + 1) as f32);
+        }
+    }
+
+    // Outside it: another subject is out, and the range's shoulder fades to nothing
+    // over the band, by how many pixels it is from the island.
+    let edge: Vec<usize> = all().filter(|&at| reached[at]).collect();
+    let out = steps(&edge, |p| !reached[p], w, h, band);
+    for at in all().filter(|&at| !reached[at]) {
+        if strong[at] {
+            weights[at] = 0.0;
+        } else if weights[at] > 0.0 {
+            weights[at] *= ease(1.0 - out[at] as f32 / (band + 1) as f32);
+        }
+    }
+}
+
+/// How many steps each pixel is from the nearest of `from`, neighbor to neighbor with
+/// the diagonals and only through pixels `through` allows, counted as far as `most`:
+/// zero on `from` itself, and `most + 1` for whatever is further or cannot be reached.
+fn steps(
+    from: &[usize],
+    through: impl Fn(usize) -> bool,
+    w: usize,
+    h: usize,
+    most: usize,
+) -> Vec<usize> {
+    let mut far = vec![most + 1; w * h];
+    let mut frontier: Vec<usize> = from.to_vec();
+    for &at in from {
+        far[at] = 0;
+    }
+    let mut next = Vec::new();
+    for step in 1..=most {
+        if frontier.is_empty() {
+            break;
+        }
+        for &at in &frontier {
+            let (px, py) = (at % w, at / w);
+            for ny in py.saturating_sub(1)..=(py + 1).min(h - 1) {
+                for nx in px.saturating_sub(1)..=(px + 1).min(w - 1) {
+                    let to = ny * w + nx;
+                    if far[to] > most && through(to) {
+                        far[to] = step;
+                        next.push(to);
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut frontier, &mut next);
+        next.clear();
+    }
+    far
+}
+
+/// What `from` reaches through the pixels of `through`, neighbor to neighbor with the
+/// diagonals, in at most `steps` steps. A start that is not itself in `through` reaches
+/// nothing.
+fn grown(through: &[bool], w: usize, h: usize, from: &[usize], steps: usize) -> Vec<bool> {
+    let mut reached = vec![false; w * h];
+    let mut frontier = Vec::new();
+    for &at in from {
+        if through[at] && !reached[at] {
+            reached[at] = true;
+            frontier.push(at);
+        }
+    }
+    let mut next = Vec::new();
+    let mut step = 0;
+    while !frontier.is_empty() && step < steps {
+        for &at in &frontier {
+            let (px, py) = (at % w, at / w);
+            for ny in py.saturating_sub(1)..=(py + 1).min(h - 1) {
+                for nx in px.saturating_sub(1)..=(px + 1).min(w - 1) {
+                    let to = ny * w + nx;
+                    if through[to] && !reached[to] {
+                        reached[to] = true;
+                        next.push(to);
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut frontier, &mut next);
+        next.clear();
+        step += 1;
+    }
+    reached
+}
+
+/// `set` worn back by `by` pixels on every side: the pixels whose whole neighborhood,
+/// `by` out in each direction, is in it. The frame's edge wears nothing away, so a
+/// subject against the border keeps its body there.
+fn worn(set: &[bool], w: usize, h: usize, by: usize) -> Vec<bool> {
+    if by == 0 {
+        return set.to_vec();
+    }
+    // Along rows and then along columns, which is the square neighborhood.
+    let mut rows = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            rows[y * w + x] =
+                (x.saturating_sub(by)..=(x + by).min(w - 1)).all(|nx| set[y * w + nx]);
+        }
+    }
+    let mut out = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            out[y * w + x] =
+                (y.saturating_sub(by)..=(y + by).min(h - 1)).all(|ny| rows[ny * w + x]);
+        }
+    }
+    out
 }
 
 /// Proxy dimensions for a source of `(w, h)`: [`PROXY_WIDTH`] on the long edge,
@@ -651,6 +1074,481 @@ mod tests {
             "bright half: {}",
             mask[16 * b.w + b.w - 4]
         );
+    }
+
+    // ── Sampling the picture ─────────────────────────────────────────────────
+
+    /// A synthetic basis: a wall at -2 EV on the left half and a sky at +2 EV on the
+    /// right, each with a fine ±0.1 EV ripple, so the regional read and the per-pixel
+    /// read are different images.
+    fn wall_and_sky() -> Basis {
+        let (w, h) = (64, 32);
+        let ev = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let level = if x < w / 2 { -2.0 } else { 2.0 };
+                level + if (x + y) % 2 == 0 { 0.1 } else { -0.1 }
+            })
+            .collect();
+        Basis { w, h, ev }
+    }
+
+    /// The center of proxy pixel `(x, y)`, source-normalized.
+    fn center(b: &Basis, x: usize, y: usize) -> (f32, f32) {
+        ((x as f32 + 0.5) / b.w as f32, (y as f32 + 0.5) / b.h as f32)
+    }
+
+    fn per_pixel() -> ZoneMask {
+        ZoneMask {
+            edge_aware: false,
+            ..ZoneMask::default()
+        }
+    }
+
+    #[test]
+    fn a_sample_reads_pixel_centers_and_blends_between_them() {
+        let b = Basis {
+            w: 2,
+            h: 2,
+            ev: vec![0.0, 1.0, 2.0, 3.0],
+        };
+        let r = b.reading(&per_pixel());
+        // The four centers are the four values.
+        for (i, want) in [0.0, 1.0, 2.0, 3.0].into_iter().enumerate() {
+            let (x, y) = center(&b, i % 2, i / 2);
+            assert!((r.at(x, y) - want).abs() < 1e-6, "pixel {i}");
+        }
+        // Half way between all four is their mean, and past a center the edge holds.
+        assert!((r.at(0.5, 0.5) - 1.5).abs() < 1e-6);
+        assert!((r.at(0.0, 0.0) - 0.0).abs() < 1e-6, "clamped, not extrapolated");
+        assert!((r.at(1.0, 1.0) - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_click_sets_a_range_around_the_tone_that_was_clicked() {
+        // Per pixel, the click reads the pixel: the wall's ripple and all.
+        let b = wall_and_sky();
+        let (x, y) = center(&b, 10, 16);
+        let tone = b.reading(&per_pixel()).at(x, y);
+        assert!((tone - b.ev[16 * b.w + 10]).abs() < 1e-6);
+        let mut m = per_pixel();
+        m.sample(tone, tone);
+        assert!((m.lo - (tone - 0.5)).abs() < 1e-6 && (m.hi - (tone + 0.5)).abs() < 1e-6);
+        // The wall is in and the sky is out.
+        let mask = b.evaluate(&m).expect("a bounded range");
+        assert!(mask[16 * b.w + 10] > 0.99);
+        assert!(mask[16 * b.w + 50] < 0.01);
+    }
+
+    #[test]
+    fn an_edge_aware_sample_reads_the_region_and_what_is_clicked_is_selected() {
+        // Edge-aware, the range reads the wall as one tone, -2 EV, with the ripple
+        // smoothed away, and the sample has to read that same image: the property is
+        // that the point clicked ends up inside the range it set, on either side of the
+        // edge and close up against it.
+        let b = wall_and_sky();
+        let regional = ZoneMask::default();
+        assert!(regional.edge_aware, "the default a new range starts with");
+        let r = b.reading(&regional);
+        let (x, y) = center(&b, 10, 16);
+        assert!((r.at(x, y) + 2.0).abs() < 0.05, "the wall's level: {}", r.at(x, y));
+        for px in [3, 10, 29, 34, 50, 60] {
+            let (x, y) = center(&b, px, 16);
+            let tone = r.at(x, y);
+            let mut m = regional;
+            m.sample(tone, tone);
+            let weight = b.weight_at(&m, x, y);
+            assert!(weight > 0.99, "column {px}: clicked {tone}, selected {weight}");
+        }
+    }
+
+    #[test]
+    fn a_box_spans_its_tones_and_stray_pixels_do_not_stretch_it() {
+        // A ramp from -3 to +3 EV across the frame, with one blown pixel in it.
+        let (w, h) = (100, 10);
+        let mut ev: Vec<f32> = (0..w * h)
+            .map(|i| -3.0 + 6.0 * ((i % w) as f32 + 0.5) / w as f32)
+            .collect();
+        ev[5 * w + 30] = 9.0;
+        let b = Basis { w, h, ev };
+        let r = b.reading(&per_pixel());
+        // Every pixel center in the columns 20 to 59: tones -1.8 to +0.6, and the glint.
+        let points = (20..60).flat_map(|x| (0..h).map(move |y| (x, y)));
+        let (lo, hi) = r
+            .span(points.map(|(x, y)| center(&b, x, y)))
+            .expect("the box is on the negative");
+        // The 10th and 90th percentiles of a ramp are a tenth of the way in from its ends,
+        // to within the 0.06 EV step between two columns.
+        assert!((lo - (-1.77 + 0.1 * 2.34)).abs() < 0.07, "low end {lo}");
+        assert!((hi - (-1.77 + 0.9 * 2.34)).abs() < 0.07, "high end {hi}");
+        assert!(hi < 1.0, "the glint stretched the range to {hi}");
+
+        // And the range it sets covers the middle of the box, not the frame.
+        let mut m = per_pixel();
+        m.sample(lo, hi);
+        assert_eq!(m.evaluate(-0.6), 1.0);
+        assert_eq!(m.evaluate(2.5), 0.0);
+    }
+
+    #[test]
+    fn a_box_off_the_negative_samples_nothing() {
+        let b = wall_and_sky();
+        let r = b.reading(&per_pixel());
+        assert!(r.span([(-0.2, 0.5), (1.3, 0.5), (0.5, f32::NAN)]).is_none());
+        assert!(r.span(std::iter::empty()).is_none());
+        // One point on it is enough, and both ends are that point's tone.
+        let (x, y) = center(&b, 50, 4);
+        let (lo, hi) = r.span([(-0.2, 0.5), (x, y)]).expect("one point landed");
+        assert_eq!(lo, hi);
+        assert!((lo - b.ev[4 * b.w + 50]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_eyedropper_sets_a_range_from_a_click_a_box_and_a_shift_click() {
+        let b = wall_and_sky();
+        let wall = center(&b, 10, 16);
+        let sky = center(&b, 50, 16);
+        let mut tone = ZoneMask::default();
+
+        // A click on the wall: one zone around the wall's level, switched on.
+        assert!(b.sample_into(&mut tone, [wall], false));
+        assert!(tone.enabled);
+        assert!((tone.lo + 2.5).abs() < 0.05 && (tone.hi + 1.5).abs() < 0.05, "{tone:?}");
+        assert!(b.weight_at(&tone, wall.0, wall.1) > 0.99);
+        assert!(b.weight_at(&tone, sky.0, sky.1) < 0.01);
+
+        // Shift-click the sky: the range grows to reach it and still holds the wall.
+        let clicked = tone;
+        assert!(b.sample_into(&mut tone, [sky], true));
+        assert!((tone.lo - clicked.lo).abs() < 1e-6, "the low end moved");
+        assert!((tone.hi - 2.0).abs() < 0.05, "{tone:?}");
+        assert!(b.weight_at(&tone, wall.0, wall.1) > 0.99);
+        assert!(b.weight_at(&tone, sky.0, sky.1) > 0.99);
+
+        // A box inside the sky replaces the range with the sky's.
+        let points = (40..60).flat_map(|x| (8..24).map(move |y| (x, y)));
+        assert!(b.sample_into(&mut tone, points.map(|(x, y)| center(&b, x, y)), false));
+        assert!((tone.lo - 1.5).abs() < 0.05 && (tone.hi - 2.5).abs() < 0.05, "{tone:?}");
+
+        // A click that missed the negative changes nothing and says so.
+        let before = tone;
+        assert!(!b.sample_into(&mut tone, [(1.5, 0.5)], false));
+        assert_eq!(tone, before);
+    }
+
+    // ── The island ───────────────────────────────────────────────────────────
+
+    /// A cloud and a shirt: two bright patches at +2 EV on a ground at -3 EV, far
+    /// apart, each with an edge that ramps down to the ground over five pixels. The
+    /// cloud is centered at (30, 20), the shirt at (90, 40), each 12 pixels in radius
+    /// to where its ramp begins.
+    fn cloud_and_shirt() -> Basis {
+        let (w, h) = (120usize, 60usize);
+        let ev = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as f32, (i / w) as f32);
+                let to = |cx: f32, cy: f32| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+                let nearest = to(30.0, 20.0).min(to(90.0, 40.0));
+                // Full brightness to radius 12, the ground from radius 17.
+                2.0 - 5.0 * ((nearest - 12.0) / 5.0).clamp(0.0, 1.0)
+            })
+            .collect();
+        Basis { w, h, ev }
+    }
+
+    /// The highlights, read per pixel, with a one-stop shoulder below them.
+    fn brights() -> ZoneMask {
+        ZoneMask {
+            enabled: true,
+            lo: 1.0,
+            f_lo: 1.0,
+            edge_aware: false,
+            ..ZoneMask::default()
+        }
+    }
+
+    fn seeded(seeds: &[(usize, usize)], b: &Basis) -> ZoneMask {
+        let mut m = brights();
+        m.island.enabled = true;
+        for &(x, y) in seeds {
+            assert!(m.island.add(center(b, x, y)));
+        }
+        m
+    }
+
+    #[test]
+    fn an_island_takes_what_is_connected_to_its_seed_and_leaves_the_rest() {
+        let b = cloud_and_shirt();
+        let at = |mask: &[f32], x: usize, y: usize| mask[y * b.w + x];
+        // The plain range takes both: every bright thing in the frame.
+        let plain = b.evaluate(&brights()).expect("a bounded range");
+        assert_eq!(at(&plain, 30, 20), 1.0);
+        assert_eq!(at(&plain, 90, 40), 1.0);
+
+        // Seeded on the cloud, it is the cloud, whole, and none of the shirt.
+        let cloud = b.evaluate(&seeded(&[(30, 20)], &b)).expect("a bounded range");
+        for (x, y) in [(30, 20), (22, 14), (40, 20), (30, 31)] {
+            assert_eq!(at(&cloud, x, y), 1.0, "the cloud at ({x}, {y})");
+        }
+        for (x, y) in [(90, 40), (84, 36), (100, 40)] {
+            assert_eq!(at(&cloud, x, y), 0.0, "the shirt at ({x}, {y})");
+        }
+        assert_eq!(at(&cloud, 60, 30), 0.0, "the ground between them");
+        // Inside what it reached, the island is the range, untouched.
+        for i in 0..b.w * b.h {
+            assert!(cloud[i] <= plain[i] + 1e-6, "an island selected more than its range");
+        }
+
+        // And seeded on the shirt, the other way round.
+        let shirt = b.evaluate(&seeded(&[(90, 40)], &b)).expect("a bounded range");
+        assert_eq!(at(&shirt, 90, 40), 1.0);
+        assert_eq!(at(&shirt, 30, 20), 0.0);
+    }
+
+    #[test]
+    fn several_seeds_are_several_islands_in_one_mask() {
+        let b = cloud_and_shirt();
+        let both = b
+            .evaluate(&seeded(&[(30, 20), (90, 40)], &b))
+            .expect("a bounded range");
+        let plain = b.evaluate(&brights()).expect("a bounded range");
+        // Every bright thing in this frame has a seed in it, so wherever the range
+        // selects strongly the two are the range, and nowhere do they select more.
+        for i in 0..b.w * b.h {
+            assert!(both[i] <= plain[i] + 1e-6, "pixel {i}");
+            if plain[i] >= 0.5 {
+                assert!((both[i] - plain[i]).abs() < 1e-6, "pixel {i}");
+            }
+        }
+        assert_eq!(both[20 * b.w + 30], 1.0);
+        assert_eq!(both[40 * b.w + 90], 1.0);
+        // A second seed in the same patch changes nothing.
+        let twice = b
+            .evaluate(&seeded(&[(30, 20), (34, 24)], &b))
+            .expect("a bounded range");
+        assert_eq!(twice, b.evaluate(&seeded(&[(30, 20)], &b)).unwrap());
+    }
+
+    #[test]
+    fn an_island_ends_as_softly_as_its_range_does() {
+        // A bright field that ramps down to the ground over sixty pixels of a strip as
+        // wide as the proxy, a stop every twelve, so the range's shoulder is twelve
+        // pixels of the ramp. The island grows to the half-strength line and must not
+        // step off there: it follows the range down into its shoulder and fades.
+        let (w, h) = (480usize, 8usize);
+        let ev = (0..w * h)
+            .map(|i| 2.0 - 5.0 * (((i % w) as f32 - 200.0) / 60.0).clamp(0.0, 1.0))
+            .collect();
+        let b = Basis { w, h, ev };
+        let plain = b.evaluate(&brights()).expect("a bounded range");
+        let mut seeded = brights();
+        seeded.island.enabled = true;
+        seeded.island.add(center(&b, 100, 4));
+        let island = b.evaluate(&seeded).expect("a bounded range");
+
+        let row = |mask: &[f32]| -> Vec<f32> { (190..250).map(|x| mask[4 * w + x]).collect() };
+        let (range, island) = (row(&plain), row(&island));
+        let half = range.iter().position(|&r| r < 0.5).expect("the range lets go");
+        assert!(range[half] > 0.3, "the test's shoulder is not gentle: {}", range[half]);
+        for (i, (r, m)) in range.iter().zip(&island).enumerate() {
+            assert!(m <= r, "column {}: {m} above the range's {r}", 190 + i);
+            if i < half {
+                assert_eq!(m, r, "column {}: inside the island", 190 + i);
+            }
+        }
+        // Just past where it grew to, it is still nearly the range.
+        assert!(
+            island[half] > range[half] * 0.9,
+            "the shoulder was cut where the growing stopped: {} of {}",
+            island[half],
+            range[half]
+        );
+        // And there is no cliff. Cut off where it stopped growing, it would drop by all
+        // of what the range still selects there in one pixel; it lets go over several,
+        // somewhat faster than the range does and nowhere by half that drop.
+        let steepest = |row: &[f32]| row.windows(2).map(|w| (w[0] - w[1]).abs()).fold(0.0f32, f32::max);
+        assert!(
+            steepest(&island) < range[half] * 0.5,
+            "a step of {} where a cut would be {} and the range's steepest is {}",
+            steepest(&island),
+            range[half],
+            steepest(&range)
+        );
+        // Far down the ramp it is nothing, as the range is.
+        assert_eq!(island.last().copied(), Some(0.0));
+    }
+
+    #[test]
+    fn a_subject_close_by_and_not_touching_is_left_out_whole() {
+        // Two bright fields a few pixels apart, closer than the band the island's edge
+        // fades over. The unseeded one is strongly selected by the range and no seed
+        // reached it, so it is another subject and none of it comes with the island.
+        let (w, h) = (480usize, 8usize);
+        let ev = (0..w * h)
+            .map(|i| {
+                let x = i % w;
+                if x < 200 || (203..300).contains(&x) { 2.0 } else { -3.0 }
+            })
+            .collect();
+        let b = Basis { w, h, ev };
+        let mut seeded = brights();
+        seeded.island.enabled = true;
+        seeded.island.add(center(&b, 100, 4));
+        let island = b.evaluate(&seeded).expect("a bounded range");
+        assert_eq!(island[4 * w + 199], 1.0, "the seeded field, to its edge");
+        for x in [203, 204, 210, 250] {
+            assert_eq!(island[4 * w + x], 0.0, "column {x} of the field next door");
+        }
+    }
+
+    #[test]
+    fn an_island_with_nowhere_to_grow_from_selects_as_it_should() {
+        let b = cloud_and_shirt();
+        let plain = b.evaluate(&brights()).expect("a bounded range");
+        // Switched on with no seed placed: nothing to be connected to, so the range.
+        let mut unseeded = brights();
+        unseeded.island.enabled = true;
+        assert_eq!(b.evaluate(&unseeded).unwrap(), plain);
+        // Seeds, and switched off: the range, with the seeds kept for when it is on.
+        let mut off = seeded(&[(30, 20)], &b);
+        off.island.enabled = false;
+        assert_eq!(b.evaluate(&off).unwrap(), plain);
+        assert_eq!(off.island.seeds().len(), 1);
+        // A seed on a tone the range does not select grows nothing at all.
+        let stranded = b.evaluate(&seeded(&[(60, 30)], &b)).expect("a bounded range");
+        assert!(stranded.iter().all(|&v| v == 0.0), "an island grew from the ground");
+        // Inverted, the island is the hole: everything but the cloud.
+        let mut inverted = seeded(&[(30, 20)], &b);
+        inverted.invert = true;
+        let hole = b.evaluate(&inverted).expect("inverted is never the identity");
+        assert_eq!(hole[20 * b.w + 30], 0.0, "the cloud");
+        assert_eq!(hole[40 * b.w + 90], 1.0, "the shirt, which the island left out");
+        assert_eq!(hole[30 * b.w + 60], 1.0);
+        // And a range open at both ends is everything, island or not.
+        let mut open = ZoneMask {
+            enabled: true,
+            ..ZoneMask::default()
+        };
+        open.island.enabled = true;
+        open.island.add((0.25, 0.3));
+        assert!(b.evaluate(&open).is_none());
+    }
+
+    #[test]
+    fn an_island_grows_across_a_diagonal_and_not_across_a_gap() {
+        // A staircase of bright pixels touching only at their corners is one subject;
+        // the same pixels one further apart are not.
+        let (w, h) = (24usize, 24usize);
+        let stairs = |gap: usize| {
+            let mut ev = vec![-3.0f32; w * h];
+            for i in 0..8 {
+                ev[(2 + i * gap) * w + 2 + i * gap] = 2.0;
+            }
+            Basis { w, h, ev }
+        };
+        let mut m = brights();
+        m.island.enabled = true;
+        m.island.add((2.5 / w as f32, 2.5 / h as f32));
+        let joined = stairs(1).evaluate(&m).expect("a bounded range");
+        assert_eq!(joined[9 * w + 9], 1.0, "the far end of the staircase");
+        let apart = stairs(2).evaluate(&m).expect("a bounded range");
+        assert_eq!(apart[2 * w + 2], 1.0, "the pixel the seed is on");
+        assert!(apart[16 * w + 16] < 0.01, "a pixel across a gap: {}", apart[16 * w + 16]);
+    }
+
+    /// Two bright blocks on a full-size proxy, joined by a strip `neck` pixels tall.
+    fn two_blocks_joined_by(neck: usize) -> Basis {
+        let (w, h) = (480usize, 120usize);
+        let mut ev = vec![-3.0f32; w * h];
+        for y in 20..100 {
+            for x in (40..140).chain(300..400) {
+                ev[y * w + x] = 2.0;
+            }
+        }
+        for y in 60 - neck / 2..60 - neck / 2 + neck {
+            for x in 140..300 {
+                ev[y * w + x] = 2.0;
+            }
+        }
+        Basis { w, h, ev }
+    }
+
+    #[test]
+    fn an_island_grows_through_a_subject_and_not_through_a_thin_neck() {
+        // Joined by three pixels of contact, the second block is another subject.
+        let b = two_blocks_joined_by(3);
+        let m = seeded(&[(90, 60)], &b);
+        let mask = b.evaluate(&m).expect("a bounded range");
+        let at = |mask: &[f32], x: usize, y: usize| mask[y * b.w + x];
+        for (x, y) in [(90, 60), (41, 21), (138, 98), (60, 40)] {
+            assert_eq!(at(&mask, x, y), 1.0, "the block the seed is in, at ({x}, {y})");
+        }
+        // The neck is divided between the two, so its far half is the other block's.
+        for (x, y) in [(350, 60), (301, 21), (260, 60)] {
+            assert_eq!(at(&mask, x, y), 0.0, "past the neck, at ({x}, {y})");
+        }
+        assert_eq!(at(&mask, 160, 60), 1.0, "the near end of the neck");
+        // The plain range takes all of it, which is what the island is for.
+        let plain = b.evaluate(&brights()).expect("a bounded range");
+        assert_eq!(at(&plain, 350, 60), 1.0);
+
+        // Joined by something with width, the two are one subject.
+        let b = two_blocks_joined_by(9);
+        let mask = b.evaluate(&seeded(&[(90, 60)], &b)).expect("a bounded range");
+        assert_eq!(at(&mask, 350, 60), 1.0, "the far block, across a wide join");
+        assert_eq!(at(&mask, 220, 60), 1.0, "the join itself");
+    }
+
+    #[test]
+    fn an_island_fades_out_where_a_neck_cuts_it() {
+        // The one place an island ends with the range at full strength on both sides.
+        // Along the neck, from the island's half into the other's, there is no cliff.
+        let b = two_blocks_joined_by(3);
+        let mask = b.evaluate(&seeded(&[(90, 60)], &b)).expect("a bounded range");
+        let row: Vec<f32> = (180..260).map(|x| mask[60 * b.w + x]).collect();
+        assert_eq!(row[0], 1.0, "the island's half of the neck");
+        assert_eq!(*row.last().unwrap(), 0.0, "the other block's half");
+        let steepest = row.windows(2).map(|p| (p[0] - p[1]).abs()).fold(0.0, f32::max);
+        assert!(steepest < 0.35, "a step of {steepest} at the cut");
+        // And only there: the block's far side is the range, untouched.
+        assert_eq!(mask[60 * b.w + 41], 1.0);
+        assert_eq!(mask[21 * b.w + 90], 1.0);
+    }
+
+    #[test]
+    fn a_seed_on_something_thin_still_selects_what_is_under_it() {
+        // A wire across the frame has no body to grow through, and a click on it must
+        // not select nothing.
+        let (w, h) = (480usize, 120usize);
+        let mut ev = vec![-3.0f32; w * h];
+        for x in 20..460 {
+            ev[60 * w + x] = 2.0;
+        }
+        let b = Basis { w, h, ev };
+        let mask = b.evaluate(&seeded(&[(240, 60)], &b)).expect("a bounded range");
+        for x in [20, 100, 240, 459] {
+            assert_eq!(mask[60 * w + x], 1.0, "the wire at {x}");
+        }
+        assert_eq!(mask[30 * w + 240], 0.0, "the ground");
+    }
+
+    #[test]
+    fn the_weight_at_a_point_is_the_prepared_mask_there() {
+        let b = wall_and_sky();
+        let m = ZoneMask {
+            enabled: true,
+            lo: 1.0,
+            hi: 5.0,
+            blur: 0.05,
+            ..ZoneMask::default()
+        };
+        let mask = b.evaluate(&m).expect("a bounded range");
+        for (px, py) in [(4, 4), (31, 16), (32, 16), (60, 28)] {
+            let (x, y) = center(&b, px, py);
+            assert!((b.weight_at(&m, x, y) - mask[py * b.w + px]).abs() < 1e-6);
+        }
+        // A range that masks nothing weighs one, everywhere.
+        assert_eq!(b.weight_at(&ZoneMask::default(), 0.3, 0.3), 1.0);
     }
 
     #[test]

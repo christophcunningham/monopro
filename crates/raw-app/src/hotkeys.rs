@@ -59,6 +59,10 @@ pub enum Action {
     Surround,
     FalseColour,
     CyclePreviewSource,
+    /// Red film over what the mask in hand protects, on and off: the selected Curve
+    /// instance's mask, or the selected Dodge & Burn layer's. The same switch as the
+    /// `overlay` chip in either module's mask heading.
+    MaskOverlay,
     TogglePanels,
     CompareViewer,
     /// How many cells the compare grid shows. **`1` is the single view**, so the key
@@ -401,6 +405,15 @@ pub const TABLE: &[Binding] = &[
         None,
         "j",
         "Cycle JPEG-color and raw-linear previews",
+        View,
+        true,
+    ),
+    b(
+        Action::MaskOverlay,
+        Key::Slash,
+        None,
+        "/",
+        "Mask overlay — red film over what the mask protects",
         View,
         true,
     ),

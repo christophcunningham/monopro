@@ -67,11 +67,36 @@ struct Spec {
     lut: bool,
     tone_lut: bool,
     histogram: bool,
-    /// Binds the dab buffer, the instance buffer and the zone-mask strip.
+    /// Binds the dab buffer and the instance buffer: Dodge & Burn's layers.
     ///
-    /// Grouped as one flag rather than three because they are one payload: a pass
-    /// that reads strokes reads all three, and a pass that does not reads none.
+    /// Grouped as one flag rather than two because they are one payload: a pass that
+    /// reads layers reads both, and a pass that does not reads neither.
     strokes: bool,
+    /// Binds a painted mask's dabs, in the slot a layer's dabs have: the Curve's painted
+    /// masks for the curve pass, the viewed mask's for the display pass. No instance
+    /// buffer goes with them, since a mask's dabs belong to a segment and not a layer.
+    painted: Option<Painted>,
+    /// Binds the zone-mask array. Its own flag because three passes read it: Dodge & Burn,
+    /// whose layers can have a tone mask, the Curve, whose masks can have a tone part, and
+    /// Display, which shows a Curve mask and so reads that tone part too.
+    masks: bool,
+    /// Binds the curve's segments and their tables, for a stack with a masked pass.
+    /// One flag for two buffers, for the reason `strokes` is: the segments say which
+    /// table is whose, and a table is no use without them.
+    segments: bool,
+    /// Binds the one mask record the mask view draws: the selected Curve pass's mask.
+    /// Display only. A record of its own rather than an entry in `segments`, because a
+    /// pass can have a mask worth looking at before it has a curve to make a segment of.
+    mask_view: bool,
+}
+
+/// Whose painted dabs a pass reads; see [`Spec::painted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Painted {
+    /// Every painted Curve mask's, each dab naming its segment.
+    CurveMasks,
+    /// The one mask the mask view is showing.
+    MaskView,
 }
 
 impl Spec {
@@ -84,6 +109,10 @@ impl Spec {
             tone_lut: false,
             histogram: false,
             strokes: false,
+            painted: None,
+            masks: false,
+            segments: false,
+            mask_view: false,
         }
     }
 
@@ -102,10 +131,14 @@ impl Spec {
             // shader skips the second read.
             PassKey::DodgeBurn => Spec {
                 strokes: true,
+                masks: true,
                 ..Spec::plain(2)
             },
             PassKey::Curve => Spec {
                 lut: true,
+                segments: true,
+                masks: true,
+                painted: Some(Painted::CurveMasks),
                 ..Spec::plain(1)
             },
             // Toning rides in the display pass because that is where the tone map
@@ -114,6 +147,9 @@ impl Spec {
                 out: OutKind::Display,
                 tone_lut: true,
                 histogram: true,
+                masks: true,
+                mask_view: true,
+                painted: Some(Painted::MaskView),
                 ..Spec::plain(2)
             },
         }
@@ -131,7 +167,9 @@ impl Spec {
 /// - 5: second input texture (Contrast Mask's mask)
 /// - 6: dab storage buffer
 /// - 7: instance storage buffer
-/// - 8: zone-mask strip
+/// - 8: zone-mask array
+/// - 11: curve segments, and 12: their tables
+/// - 13: the mask view's record
 const B_IN0: u32 = 0;
 const B_WORK_OUT: u32 = 1;
 const B_DISPLAY_OUT: u32 = 2;
@@ -146,6 +184,13 @@ const B_MASKS: u32 = 8;
 /// 4, which is why it is not the apparent gap in the sequence above.
 const B_TONE_LUT: u32 = 9;
 const B_HISTOGRAM: u32 = 10;
+/// A masked curve's segments and the tables they point into. Their own slots rather
+/// than part of `B_LUT`: the unmasked curve sizes its table with `arrayLength`, and a
+/// buffer grown to hold sixteen tables would leave it reading the wrong entries.
+const B_SEGMENTS: u32 = 11;
+const B_TABLES: u32 = 12;
+/// The mask the mask view draws, one record. A uniform: it is one struct of fixed size.
+const B_MASK_VIEW: u32 = 13;
 
 pub struct Pass {
     pipeline: wgpu::ComputePipeline,
@@ -174,8 +219,18 @@ pub struct Resources<'a> {
     /// an unpainted image carries one inert dab. See `Viewport::write_strokes`.
     pub dabs: &'a wgpu::Buffer,
     pub instances: &'a wgpu::Buffer,
-    /// Zone masks, stacked vertically. A 1x1 texture when nothing is masked.
+    /// Zone masks, one array layer each. A 1x1 single-layer array when nothing is masked.
     pub masks: &'a wgpu::TextureView,
+    /// The curve's segments, and the tables they index. Never empty, for the reason
+    /// `dabs` is not: an unmasked curve carries inert ones and never reads them.
+    pub segments: &'a wgpu::Buffer,
+    pub tables: &'a wgpu::Buffer,
+    /// The mask the mask view draws: one segment record, inert when nothing is viewed.
+    pub mask_view: &'a wgpu::Buffer,
+    /// The dabs of the Curve's painted masks, each naming its segment, and of the mask
+    /// the mask view is showing. Never empty, for the reason `dabs` is not.
+    pub curve_dabs: &'a wgpu::Buffer,
+    pub view_dabs: &'a wgpu::Buffer,
 }
 
 /// Device-level state shared by every tab: compiled pipelines and the
@@ -203,10 +258,28 @@ impl GpuContext {
             (PassKey::Curve, include_str!("curve.wgsl")),
             (PassKey::Display, include_str!("display.wgsl")),
         ] {
-            let body = if matches!(key, PassKey::Input | PassKey::MaskInput) {
-                format!("{}\n{body}", include_str!("sample_common.wgsl"))
-            } else {
-                body.to_owned()
+            // The gradients and the brush are one definition each, prepended to the passes
+            // that lay a shape on the negative, so a layer and a mask cannot disagree about
+            // one. A Curve mask's weight is one definition too, shared by the pass that
+            // applies it and the pass that shows it.
+            let body = match key {
+                PassKey::Input | PassKey::MaskInput => {
+                    format!("{}\n{body}", include_str!("sample_common.wgsl"))
+                }
+                PassKey::DodgeBurn => format!(
+                    "{}\n{}\n{}\n{body}",
+                    include_str!("gradients.wgsl"),
+                    include_str!("zone_mask.wgsl"),
+                    include_str!("dabs.wgsl")
+                ),
+                PassKey::Curve | PassKey::Display => format!(
+                    "{}\n{}\n{}\n{}\n{body}",
+                    include_str!("gradients.wgsl"),
+                    include_str!("zone_mask.wgsl"),
+                    include_str!("dabs.wgsl"),
+                    include_str!("curve_mask.wgsl")
+                ),
+                _ => body.to_owned(),
             };
             passes.insert(key, Pass::new(device, key, &body));
         }
@@ -455,6 +528,19 @@ impl Pass {
         if spec.inputs > 1 {
             entries.push(texture(B_IN1));
         }
+        if spec.painted.is_some() {
+            debug_assert!(!spec.strokes, "one dab buffer to a pass: they share a slot");
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: B_DABS,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
         if spec.strokes {
             for binding in [B_DABS, B_INSTANCES] {
                 entries.push(wgpu::BindGroupLayoutEntry {
@@ -468,7 +554,47 @@ impl Pass {
                     count: None,
                 });
             }
-            entries.push(texture(B_MASKS));
+        }
+        if spec.masks {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: B_MASKS,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            });
+        }
+        if spec.segments {
+            for binding in [B_SEGMENTS, B_TABLES] {
+                entries.push(wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                });
+            }
+        }
+
+        if spec.mask_view {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: B_MASK_VIEW,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<crate::GpuSegment>() as u64,
+                    ),
+                },
+                count: None,
+            });
         }
 
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -557,6 +683,16 @@ impl Pass {
                 resource: wgpu::BindingResource::TextureView(inputs[1]),
             });
         }
+        if let Some(painted) = self.spec.painted {
+            entries.push(wgpu::BindGroupEntry {
+                binding: B_DABS,
+                resource: match painted {
+                    Painted::CurveMasks => res.curve_dabs,
+                    Painted::MaskView => res.view_dabs,
+                }
+                .as_entire_binding(),
+            });
+        }
         if self.spec.strokes {
             entries.push(wgpu::BindGroupEntry {
                 binding: B_DABS,
@@ -566,9 +702,27 @@ impl Pass {
                 binding: B_INSTANCES,
                 resource: res.instances.as_entire_binding(),
             });
+        }
+        if self.spec.masks {
             entries.push(wgpu::BindGroupEntry {
                 binding: B_MASKS,
                 resource: wgpu::BindingResource::TextureView(res.masks),
+            });
+        }
+        if self.spec.segments {
+            entries.push(wgpu::BindGroupEntry {
+                binding: B_SEGMENTS,
+                resource: res.segments.as_entire_binding(),
+            });
+            entries.push(wgpu::BindGroupEntry {
+                binding: B_TABLES,
+                resource: res.tables.as_entire_binding(),
+            });
+        }
+        if self.spec.mask_view {
+            entries.push(wgpu::BindGroupEntry {
+                binding: B_MASK_VIEW,
+                resource: res.mask_view.as_entire_binding(),
             });
         }
         device.create_bind_group(&wgpu::BindGroupDescriptor {

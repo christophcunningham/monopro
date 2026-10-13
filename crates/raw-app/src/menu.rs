@@ -141,6 +141,7 @@ fn code(key: egui::Key) -> Option<Code> {
         K::Num6 => Code::Digit6,
         K::Comma => Code::Comma,
         K::Period => Code::Period,
+        K::Slash => Code::Slash,
         K::Minus => Code::Minus,
         // Both spell the same physical key. `Plus` is the shifted form and the table
         // binds it separately so `⌘⇧+` and `⌘+` can both reach zoom-in.

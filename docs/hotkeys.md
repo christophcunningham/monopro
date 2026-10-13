@@ -16,6 +16,7 @@ Letter shortcuts are suppressed while typing into text fields.
 | `b` | Surround — border around the image |
 | `y` | False-color exposure map |
 | `j` | Cycle JPEG-color and raw-linear previews |
+| `/` | Mask overlay — red film over what the mask protects |
 | `Tab` | Hide / show panels |
 | `z` | 100% / fit |
 | `Cmd+0` | Fit to window |

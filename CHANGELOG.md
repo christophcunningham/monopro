@@ -17,6 +17,82 @@ changes belong in [docs/known-limitations.md](docs/known-limitations.md).
 ## Unreleased
 
 New
+- A Curve instance can be limited to part of the picture. Select an instance and open
+  its MASK section, which sits inside the instance between its red rules, and pick
+  Linear or Radial. Picking one places a mask at once and opens it on the picture:
+  Linear starts as a sky grad, full at the top edge of the picture and gone by the
+  middle, and Radial as a soft ellipse in the center. Drag a handle to move it, or
+  press on empty canvas to lay the shape again; Return keeps it, Esc puts everything
+  back as it was, and Space pans. The section is one row of icons, the four shapes and
+  then Adjust on image (a crosshair), Invert and Remove, with Transition, Core, Aspect
+  and Angle under it. An instance that has a mask shows a mask icon
+  beside its opacity, red while the mask is on; click it to switch the mask off and on
+  without losing the shape. Masks follow the photograph through crop, rotation and
+  export. The point sampler reads the masks where you click.
+- A Curve instance's mask can also be limited to a range of tones, on its own or inside
+  a shape. The MASK section has a TONE switch with the same ruler, Shadows, Midtones
+  and Highlights presets, Inv, and Edge and diffusion that Dodge & Burn's tone mask has.
+  A tone on its own is a luminosity mask across the whole frame. When a mask has both a
+  shape and a tone, Join says how they combine: Intersect, Subtract or Add. The range
+  reads the picture as it stood before Dodge & Burn, so burning never moves it, and
+  switching the tone off keeps its range.
+- A Curve instance's mask can be painted. Round and Card on the MASK row give the
+  instance a painted mask and put Dodge & Burn's brush in your hand: drag to paint
+  where the curve applies, Option-drag to erase, Shift-click for a straight pass, and
+  the bracket keys for the brush's radius and feather. A painted mask starts empty,
+  so the curve applies nowhere until it is painted in, as a Dodge & Burn layer does.
+  Radius, Feather, Aspect, Angle and Opacity are in the MASK section. Picking the
+  other nib keeps what you have painted. A painted mask joins a tone range as a
+  Linear or Radial one does, and can be inverted.
+- A tone range can be sampled from the picture, in the Curve's TONE section and in
+  Dodge & Burn's TONE MASK alike. The eyedropper at the end of the Shadows, Midtones
+  and Highlights row stays armed while you work. Click a tone to set the range around
+  it, one zone wide with one-zone shoulders. Drag a box to span the tones inside it,
+  leaving out the brightest and darkest tenth so a stray highlight does not stretch
+  the range. Hold Shift to add to the range instead of replacing it. Return, or the
+  eyedropper again, keeps the range; Esc puts it back as it was; Space pans. It reads
+  the same image the range selects from, regionally when the range is edge-aware, so
+  what you click is what gets selected. In Dodge & Burn, leaving the eyedropper
+  gives the brush back.
+- A tone range can be an island: only the tones connected to where you click, instead
+  of every part of the picture that has them, so a range set on the sea leaves out the
+  rock of the same gray above it. Island is a switch at the end of the L1 to D4 row,
+  in the Curve's TONE section and in Dodge & Burn's TONE MASK alike. Turning it on arms
+  the eyedropper. Click the picture to set the range around that tone and select what
+  is connected to that spot; Shift-click another spot to add it, up to eight; Option-
+  click a seed to take it away. The seeds show on the picture while the eyedropper is
+  armed, and the switch shows how many there are. The ruler is the tolerance: narrow
+  the range and the island stops sooner. Two areas that only touch along a thin strip
+  count as separate, so an island does not leak through a sliver. An island follows
+  the photograph through crop and rotation, and is worked out again when exposure
+  changes. Switching Island off keeps the seeds.
+- A mask can be seen on the picture, for a Curve instance and for a Dodge & Burn
+  layer alike. The Curve's MASK header and Dodge & Burn's TONE MASK heading have the
+  same two switches: "overlay" lays red film over what the mask protects and leaves
+  what it applies to clear, as Photoshop shows a layer mask, and "view mask" shows
+  the mask alone in place of the picture. They are one choice, since the picture
+  shows one mask at a time. With neither on, a mask still shows itself while you
+  shape it and goes when you let go: dragging a shape's or a gradient's handle on
+  the picture shows the overlay, and dragging a handle on the tone ruler shows the
+  mask alone. It works before a Curve instance has a curve or a layer has a stroke,
+  and with the module bypassed.
+- The / key turns the mask overlay on and off: red film over what the mask protects,
+  the same switch as "overlay" in the Curve's MASK header and Dodge & Burn's TONE MASK
+  heading. It shows the mask you are working on: the brush's layer while the brush is
+  open, otherwise the selected Curve instance's mask, or the selected layer's.
+- The Curve editor's histogram and Average are taken inside the selected instance's
+  mask. The histogram behind the graph shows the tones the curve actually reaches, a
+  red band along its foot marks where most of them lie, and the readout says, for
+  example, "Average: 0.42 EV darker inside the mask (38% of the frame)". Instances
+  above the selected one are counted where their own masks lie.
+- The Curve's point sampler has a "limit to tone" option beside it. With it on, the
+  click that places a point also limits the instance to the tones around the one you
+  clicked, so dragging the new point moves only those tones. The range it sets is in
+  the MASK section, which opens to show it.
+- Photographs with a Curve mask, a tone island on a Dodge & Burn layer, or a Dodge &
+  Burn stroke painted with this version's brush are saved as sidecar version 19.
+  monopro 0.2.1 and earlier will refuse to open or overwrite them, so their edits are
+  not lost. Every other photograph is still saved as version 18.
 - A start page: with no folder chosen, Lightbox shows the monopro mark, a way into
   the folder tree and your ten most recent folders, and Develop with no image open
   shows Open Image and your ten most recent images. Both link to Settings and the
@@ -30,13 +106,39 @@ New
   layer's tone mask on and off, and shows red while it is on, so you can see which
   layers are limited to a tonal range without opening them.
 
+Faster
+- Dragging a point or an opacity in the Curve is several times faster, most of all
+  with many instances.
+
 Changed
+- The brush's Feather now means how much of the brush fades, as in Lightroom. A dab is
+  at full strength inside the cursor's dashed inner circle and fades smoothly to
+  nothing at the outer circle; Feather 0 is a hard edge and 1.0 fades from the middle
+  all the way out. Before, a higher Feather painted a smaller mark, and at 1.0 the
+  paint had faded out by half the brush. This is the same brush for Dodge & Burn and
+  for a painted Curve mask. Strokes saved before this change keep the edge they were
+  painted with, so prints already made look as they did. The brush now starts at
+  Feather 0.60.
+- Tone masks, in Dodge & Burn and in the Curve, have eight new presets under Shadows,
+  Midtones and Highlights: L1 to L4 and D1 to D4, approximating Tony Kuyper's Lights 1
+  to 4 and Darks 1 to 4. They are soft masks with no flat top, and each step selects a
+  narrower part of the picture than the last.
 - Dodge & Burn's shape picker has larger buttons, each with an icon beside its
   name: Round, Card, Linear and Radial, spread evenly across the panel. The area
   that holds them and the Dodge and Burn buttons is now a card like the modules
   above it.
 - Icons throughout the app are drawn a little larger inside their buttons, so their
   detail is easier to see. The buttons themselves are the same size.
+- The Curve's point sampler is an icon directly above the graph, without the "Point
+  sampler" label, and its cursor is drawn in dark and light so it shows on a bright sky.
+- Dodge & Burn's "view mask" shows a Linear or Radial layer's whole mask, the
+  gradient through its tone mask, where it used to show the tone mask alone. A
+  brushed layer still shows its tone mask. It also works on a layer with no strokes
+  yet, which it did not before.
+
+Fixed
+- A tool open on the picture no longer blinks out, or misses a press, in the moment
+  tone masks are being prepared after a change.
 
 ## 0.2.1 — 2026-09-26
 

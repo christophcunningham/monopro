@@ -1085,6 +1085,7 @@ pub fn curve_editor(
     drag: &mut Option<usize>,
     selected: &mut Option<usize>,
     ghost: Option<&[u32]>,
+    masked: Option<(f32, f32)>,
 ) -> bool {
     const HIT: f32 = 9.0;
     let width = ui.available_width();
@@ -1114,6 +1115,28 @@ pub fn curve_editor(
     };
 
     painter.rect_filled(rect, 2.0, Color32::from_gray(20));
+
+    // **The tones the instance's mask selects, shaded on the axis.** A faint ruby wash
+    // over the span holding most of what the mask lets the curve reach, with a rule
+    // along its foot: where on this graph a point will actually move the picture. It is
+    // taken from the masked ghost itself and not from the tone ruler's numbers, which
+    // are in another unit (the picture before Dodge & Burn, read regionally), so it is
+    // right for a shape as well as a tone.
+    if let Some((lo, hi)) = masked {
+        let (x0, x1) = (
+            rect.left() + lo * rect.width(),
+            rect.left() + hi.max(lo) * rect.width(),
+        );
+        painter.rect_filled(
+            Rect::from_min_max(pos2(x0, rect.top()), pos2(x1.max(x0 + 1.0), rect.bottom())),
+            0.0,
+            RUBY.gamma_multiply(0.07),
+        );
+        painter.line_segment(
+            [pos2(x0, rect.bottom() - 1.0), pos2(x1.max(x0 + 1.0), rect.bottom() - 1.0)],
+            Stroke::new(2.0, RUBY.gamma_multiply(0.75)),
+        );
+    }
 
     // Match Tonal Distribution's filled outline, but keep the bins on the
     // curve's input EV axis so control points still target the correct tones.
@@ -1146,7 +1169,7 @@ pub fn curve_editor(
         painter.add(egui::Shape::line(points, Stroke::new(1.0, color)));
     }
     resp.clone().on_hover_text(crate::theme::tip(
-        "Background: sampled input tones on the curve's −10 to +2 EV axis. Height uses square-root scaling. Tonal Distribution shows output tones after the display transform. Contrast Mask is not included.",
+        "Background: sampled input tones on the curve's −10 to +2 EV axis, taken inside this instance's mask when it has one; the red band marks where most of them lie. Height uses square-root scaling. Tonal Distribution shows output tones after the display transform. Contrast Mask is not included.",
     ));
 
     // Independent spacing avoids stretched cells in a wide editor. Positions
@@ -1699,6 +1722,188 @@ fn handle(painter: &egui::Painter, at: Pos2, ink: Color32, hot: bool) {
         ink,
         Stroke::new(1.0, Color32::from_gray(20)),
     ));
+}
+
+/// A tonal range's controls, under a heading the caller draws: the ruler with its ghost
+/// histogram, the presets and TK9's ladder, `Inv`, the eyedropper, and the "Edge and
+/// diffusion" group.
+///
+/// **One set of controls for both modules that have a tonal range**, Dodge & Burn's layers
+/// and a Curve instance's mask, so the two read alike and one fix is a fix to both. What
+/// differs is only the heading above it, which the caller owns, and what the range is
+/// *for*. `more_id` keys the disclosure for "Edge and diffusion", which each caller makes
+/// from its own row so two ranges on screen do not open together.
+///
+/// Choosing a preset or a step of the ladder switches the range on, as editing the ruler
+/// does: asking for a range is asking to see it work.
+///
+/// **The ladder sets the trapezoid and is not a separate kind of mask.** See
+/// [`ZoneMask::LADDER`] for what each step approximates and why it is no more than that.
+///
+/// **The eyedropper ends the presets row**, at its right: it is one more way of saying
+/// where the range is, beside the others, and inside this function it is in the same
+/// place in both modules. `sampling` is whether it is armed on *this* range, and the
+/// return value is what was asked of it; arming a tool on the picture is the caller's,
+/// which owns the mode.
+///
+/// **`Island` ends the row under it**, because the two are one gesture: the island is
+/// where the eyedropper's clicks are allowed to reach from. Switching it on with no
+/// seed yet asks for the eyedropper, since a seed is placed by clicking the picture and
+/// an island with none limits nothing.
+#[must_use = "what the eyedropper was asked is reported here; drop it and the button is dead"]
+pub fn tone_range(
+    ui: &mut egui::Ui,
+    icons: &crate::icons::Icons,
+    m: &mut ZoneMask,
+    hist: &[f32],
+    drag: &mut Option<ZoneGrab>,
+    sampling: bool,
+    more_id: egui::Id,
+) -> Option<SamplerAsk> {
+    zone_ruler(ui, m, hist, drag);
+    let mut sample = None;
+    // Shadows, Midtones, Highlights, the one switch the range has of its own, and the
+    // eyedropper.
+    ui.horizontal(|ui| {
+        for (label, lo, hi, f_lo, f_hi) in ZoneMask::PRESETS {
+            let on = m.enabled && (m.lo - lo).abs() < 1e-4 && (m.hi - hi).abs() < 1e-4;
+            if theme::bracket(ui, label, on, theme::size::CAPTION).clicked() {
+                (m.lo, m.hi, m.f_lo, m.f_hi) = (lo, hi, f_lo, f_hi);
+                m.enabled = true;
+            }
+        }
+        if theme::bracket(ui, "Inv", m.invert, theme::size::CAPTION).clicked() {
+            m.invert = !m.invert;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if crate::icons::toggle(
+                ui,
+                icons,
+                "eyedropper",
+                "⌖",
+                sampling,
+                crate::icons::BOX,
+            )
+            .on_hover_text(theme::tip(
+                "Sample the range from the picture: click a tone to set the range around \
+                 it, drag a box to span the tones inside it, and hold ⇧ to add to the \
+                 range instead. Return keeps it, Esc puts it back as it was.",
+            ))
+            .clicked()
+            {
+                sample = Some(SamplerAsk::Toggle);
+            }
+        });
+    });
+    // TK9's Lights and Darks, one chip each as `L1` to `L4` and `D1` to `D4`: the whole
+    // name in a chip would be eight words across a panel that is not that wide, so the
+    // chip is the family and the step and the name is in its tooltip.
+    ui.horizontal(|ui| {
+        for (i, (name, lo, hi, f_lo, f_hi)) in ZoneMask::LADDER.into_iter().enumerate() {
+            if i == 4 {
+                ui.add_space(8.0);
+            }
+            let chip = format!("{}{}", &name[..1], &name[name.len() - 1..]);
+            let on = m.enabled
+                && [(m.lo, lo), (m.hi, hi), (m.f_lo, f_lo), (m.f_hi, f_hi)]
+                    .iter()
+                    .all(|(a, b)| (a - b).abs() < 1e-4);
+            if theme::bracket(ui, &chip, on, theme::size::CAPTION)
+                .on_hover_text(theme::tip(format!(
+                    "{name}: a soft mask with no flat top, stiffer with each step, \
+                     approximating TK9's luminosity mask of that name."
+                )))
+                .clicked()
+            {
+                (m.lo, m.hi, m.f_lo, m.f_hi) = (lo, hi, f_lo, f_hi);
+                m.enabled = true;
+            }
+        }
+        // The island, with how many seeds it has once it has any: a count is the only
+        // sign in the panel that a click on the picture took.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let seeds = m.island.seeds().len();
+            let label = if seeds > 0 {
+                format!("Island {seeds}")
+            } else {
+                "Island".to_owned()
+            };
+            if theme::bracket(ui, &label, m.island.enabled, theme::size::CAPTION)
+                .on_hover_text(theme::tip(
+                    "Island: select only the tones connected to where you click, not \
+                     every part of the picture that has them. Click the picture with \
+                     the eyedropper to place a seed, ⇧-click to add another, ⌥-click a \
+                     seed to remove it.",
+                ))
+                .clicked()
+            {
+                m.island.enabled = !m.island.enabled;
+                if m.island.enabled {
+                    // An island is this range's, so asking for one is asking for the
+                    // range; and with no seed yet, for the tool that places one.
+                    m.enabled = true;
+                    if seeds == 0 {
+                        sample = Some(SamplerAsk::Arm);
+                    }
+                }
+            }
+        });
+    });
+
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), more_id, false)
+        .show_header(ui, |ui| {
+            ui.label(theme::caption("Edge and diffusion"));
+        })
+        // **`body_unindented`.** The default body indents, and an indented row is handed less
+        // width than its neighbors — so Diffusion, Region and Edge got a shorter track
+        // starting further right than the rows directly above them. The disclosure triangle
+        // already says these three belong to the section; the indent was saying it a second
+        // time and paying for it in the one alignment the panel is built on.
+        .body_unindented(|ui| {
+            Row::new(&mut m.blur, 0.0, ZoneMask::BLUR_RANGE, "Diffusion")
+                .decimals(3)
+                .show(ui);
+            ui.horizontal(|ui| {
+                if theme::bracket(ui, "Edge-aware", m.edge_aware, theme::size::CAPTION)
+                    .on_hover_text(theme::tip(
+                        "Reads exposure REGIONALLY, so a zone selects a coherent area \
+                         with clean edges — a hand under the enlarger — instead of a \
+                         scatter of pixels of the right brightness.",
+                    ))
+                    .clicked()
+                {
+                    m.edge_aware = !m.edge_aware;
+                }
+            });
+            ui.add_enabled_ui(m.edge_aware, |ui| {
+                Row::new(
+                    &mut m.region,
+                    ZoneMask::default().region,
+                    ZoneMask::REGION_RANGE,
+                    "Region",
+                )
+                .decimals(3)
+                .show(ui);
+                Row::new(
+                    &mut m.edge,
+                    ZoneMask::default().edge,
+                    ZoneMask::EDGE_RANGE,
+                    "Edge",
+                )
+                .suffix(" EV")
+                .show(ui);
+            });
+        });
+    sample
+}
+
+/// What a tone range's controls asked of the eyedropper this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplerAsk {
+    /// Its own button: arm it, or, armed, put it away keeping what was sampled.
+    Toggle,
+    /// Arm it if it is not armed already: an island was switched on with no seed.
+    Arm,
 }
 
 /// What a zone-ruler drag has hold of. Spans frames, like `crop::Grab`.
@@ -2405,7 +2610,7 @@ mod tests {
                 if pass == 0 {
                     ui.memory_mut(|m| m.request_focus(id));
                 }
-                curve_editor(ui, &mut curve, &mut drag, &mut selected, None);
+                curve_editor(ui, &mut curve, &mut drag, &mut selected, None, None);
                 let _ = ui.button("focusable control below");
             });
             assert_eq!(
@@ -2446,7 +2651,7 @@ mod tests {
                     ui.cursor().min,
                     egui::vec2(width, 220.0),
                 ));
-                curve_editor(ui, &mut curve, &mut drag, &mut selected, None);
+                curve_editor(ui, &mut curve, &mut drag, &mut selected, None, None);
             });
         };
 

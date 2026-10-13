@@ -178,9 +178,13 @@ pub struct NodeParams {
     db_dabs: u32,
     /// How many instances of the buffer are live. Same argument as `db_dabs`.
     db_instances: u32,
-    /// Which instance's zone mask to show instead of the picture; `-1` is off.
-    /// Indexes the *rasterised* list — see `Overlays::zone_mask`.
-    db_show_mask: i32,
+    /// How many dabs the Curve's painted masks have between them; zero skips the curve
+    /// pass's dab scan altogether. **Not `arrayLength`**, for the reason `db_dabs` is
+    /// not. The word once named the Dodge & Burn layer whose tone mask to show in the
+    /// picture's place, until the mask view became one record of its own
+    /// ([`Viewport::set_mask_view`]); this block is exactly one stride, and that was
+    /// the last free word in it.
+    curve_dabs: u32,
     /// The zone-mask strip: one mask's dimensions, not the whole texture's. The
     /// strip is `mask_h` per masked instance tall and rows are addressed by offset.
     mask_w: u32,
@@ -195,7 +199,13 @@ pub struct NodeParams {
     histogram: u32,
     input_scale: f32,
     mask_scale: f32,
-    _pad4: f32,
+    /// How many segments of the curve's buffer are live, or zero for a curve with no
+    /// mask, which keeps the shader on its original single-table code. Took this
+    /// block's last padding word.
+    ///
+    /// **Not `arrayLength`**, for the reason `db_dabs` is not: the buffer is grown, not
+    /// shrunk, so its length is not its contents.
+    curve_segments: u32,
 }
 
 /// One dab, as the shader reads it.
@@ -215,8 +225,9 @@ struct GpuDab {
     opacity: f32,
     ev: f32,
     /// The nib's own height/width ratio, its rotation in **radians** — converted on
-    /// this side, once per change rather than once per pixel per frame — and 0 for a
-    /// round nib, 1 for a card.
+    /// this side, once per change rather than once per pixel per frame — and the nib's
+    /// kind and the dab's falloff as two bits of one word: 1 for a card, 2 for the core
+    /// falloff (`dabs.wgsl`'s `NIB_CARD` and `FALLOFF_CORE`).
     aspect: f32,
     angle: f32,
     nib: u32,
@@ -230,20 +241,45 @@ struct GpuDab {
     gesture: u32,
 }
 
+impl GpuDab {
+    /// Append `passes`' dabs to `out` as the shader reads them, each naming `inst` as
+    /// what it belongs to (a layer, or a painted mask's segment) and its pass by
+    /// position, so the dabs of one pass stay adjacent and comparable in the scan.
+    fn pack(passes: &[raw_core::dodgeburn::Gesture], inst: u32, out: &mut Vec<Self>) {
+        for (gesture, pass) in passes.iter().enumerate() {
+            out.extend(pass.dabs.iter().map(|d| Self {
+                x: d.x,
+                y: d.y,
+                radius: d.radius,
+                feather: d.feather,
+                opacity: d.opacity,
+                ev: d.ev,
+                aspect: d.aspect,
+                angle: d.angle.to_radians(),
+                nib: u32::from(d.nib == raw_core::dodgeburn::Nib::Card)
+                    | u32::from(d.falloff == raw_core::dodgeburn::Falloff::Core) << 1,
+                bound: d.bound(),
+                inst,
+                gesture: gesture as u32,
+            }));
+        }
+    }
+}
+
 /// One instance's composite settings, and its geometry when it is a gradient.
 ///
 /// **The gradient parameters ride here rather than in a buffer of their own.** An
 /// instance is one of three shapes and at most `MAX_INSTANCES` of them exist, so a
 /// third storage binding would carry at most eight records — and the shader needs
-/// the sign, the opacity and the mask row in the same breath as the geometry
+/// the sign, the opacity and the mask layer in the same breath as the geometry
 /// anyway. The brush case simply leaves them zero.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuInstance {
     sign: f32,
     opacity: f32,
-    /// First row of this instance's mask in the strip, or -1 for no mask.
-    mask_row: i32,
+    /// This instance's layer of the zone-mask array, or -1 for no mask.
+    mask_layer: i32,
     /// 0 brush, 1 linear, 2 radial. The shader's dab scan skips anything but a
     /// brush; a second, short loop over instances handles the other two.
     kind: u32,
@@ -274,7 +310,7 @@ impl GpuInstance {
     const EMPTY: Self = Self {
         sign: 1.0,
         opacity: 0.0,
-        mask_row: -1,
+        mask_layer: -1,
         kind: Self::BRUSH,
         g0: 0.0,
         g1: 0.0,
@@ -289,6 +325,109 @@ impl GpuInstance {
         invert: 0,
         contrast: 0.0,
     };
+}
+
+/// One stretch of a masked curve, as the shader reads it: where its table starts and how
+/// long it is, and the shape that limits it.
+///
+/// **The shape rides here rather than in a buffer of its own**, as a Dodge & Burn
+/// gradient rides in `GpuInstance`: at most sixteen of these exist, and the shader needs
+/// the table and the shape in the same breath. `kind` zero is a stretch that applies
+/// everywhere, whose geometry is unused.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuSegment {
+    /// First entry of this segment's table in the tables buffer, and its length.
+    table: u32,
+    len: u32,
+    /// The shape: 0 none, 1 linear, 2 radial, 3 painted.
+    kind: u32,
+    /// The shape's invert.
+    invert: u32,
+    /// How a shape and a tone join: 0 Intersect, 1 Subtract, 2 Add.
+    rule: u32,
+    /// Whether the mask has a tone part switched on, and the zone-mask layer holding it.
+    /// A tone with nothing to prepare, fully open, is there with layer -1 and weighs one.
+    has_tone: u32,
+    tone_layer: i32,
+    /// Linear: `from` and `to`. Radial: the center in `g0`/`g1`, then inner, outer, the
+    /// ellipse's height over width, and its turn in radians.
+    g0: f32,
+    g1: f32,
+    g2: f32,
+    g3: f32,
+    g4: f32,
+    g5: f32,
+    g6: f32,
+    g7: f32,
+    feather: f32,
+}
+
+impl GpuSegment {
+    const NO_SHAPE: u32 = 0;
+    const LINEAR: u32 = 1;
+    const RADIAL: u32 = 2;
+    /// Strokes of the brush. The segment says only that it is painted; the strokes are
+    /// in a dab buffer, each naming the segment it belongs to.
+    const PAINTED: u32 = 3;
+
+    /// A stretch of `len` entries from `table`, applying everywhere. The shape fields
+    /// are left for the caller to fill in when a mask limits it.
+    const fn unmasked(table: u32, len: u32) -> Self {
+        Self {
+            table,
+            len,
+            kind: Self::NO_SHAPE,
+            invert: 0,
+            rule: 0,
+            has_tone: 0,
+            tone_layer: -1,
+            g0: 0.0,
+            g1: 0.0,
+            g2: 0.0,
+            g3: 0.0,
+            g4: 0.0,
+            g5: 0.0,
+            g6: 0.0,
+            g7: 0.0,
+            feather: 0.0,
+        }
+    }
+
+    /// The segment at `table` limited by `mask`, whose tone range (if it has one switched
+    /// on) was given layer `tone_layer`, or -1 when it is fully open and there is no
+    /// mask to read.
+    fn masked(table: u32, len: u32, mask: &raw_core::curve::CurveMask, tone_layer: i32) -> Self {
+        use raw_core::curve::Rule;
+        let mut segment = Self::unmasked(table, len);
+        segment.rule = match mask.rule {
+            Rule::Intersect => 0,
+            Rule::Subtract => 1,
+            Rule::Add => 2,
+        };
+        segment.has_tone = u32::from(mask.live_tone().is_some());
+        segment.tone_layer = tone_layer;
+        match &mask.shape {
+            Some(Shape::Linear(l)) => {
+                segment.kind = Self::LINEAR;
+                (segment.g0, segment.g1, segment.g2, segment.g3) = (l.x0, l.y0, l.x1, l.y1);
+                segment.feather = l.feather;
+            }
+            Some(Shape::Radial(r)) => {
+                segment.kind = Self::RADIAL;
+                (segment.g0, segment.g1) = (r.cx, r.cy);
+                // Radians here, once per change, as a Dodge & Burn radial's are.
+                (segment.g4, segment.g5, segment.g6, segment.g7) =
+                    (r.inner, r.outer, r.aspect, r.angle.to_radians());
+                segment.feather = r.feather;
+            }
+            Some(Shape::Brush { .. }) => segment.kind = Self::PAINTED,
+            // No shape: the tone alone, if any.
+            None => return segment,
+        }
+        segment.invert = u32::from(mask.invert);
+        segment
+    }
 }
 
 /// Stride between node blocks in the uniform buffer.
@@ -365,15 +504,6 @@ pub struct Overlays {
     pub underexposed: bool,
     /// Cinema-standard exposure map. Replaces the image rather than marking it.
     pub false_colour: bool,
-    /// Show one instance's **zone mask** instead of the picture, by its index in the
-    /// rasterised list — `raw_core::DodgeBurnParams::active_index`. `-1` is off.
-    ///
-    /// Judging a tonal range without seeing it is guesswork: the ruler says which
-    /// tones are selected and the picture says where they are, and only one of those
-    /// is the question you are actually asking. The prototype flashes the mask while
-    /// the ruler is dragged; this is a toggle, which the maintainer chose so it can be left on
-    /// while the Region and Edge controls are worked.
-    pub zone_mask: i32,
     /// Show the accumulated dodge or burn EV map instead of the picture, held on
     /// `⇧D` / `⇧X`. A display-only monotonic expansion keeps the working 0.25–0.5 EV
     /// range legible; it changes neither the mask nor the adjustment.
@@ -388,6 +518,40 @@ pub struct Overlays {
     /// photosite in the block still measured the highlight; yellow means all four
     /// were censored and the sensor recorded no interior highlight detail.
     pub sensor: bool,
+    /// Show the mask handed to [`Viewport::set_mask_view`], and how. `None` is the
+    /// picture alone.
+    ///
+    /// One mask at a time, whichever module it belongs to: a Curve instance's, or a
+    /// Dodge & Burn layer's as [`raw_core::curve::CurveMask::of_layer`] gives it.
+    /// Judging a tonal range without seeing it is guesswork: the ruler says which tones
+    /// are selected and the picture says where they are, and only one of those is the
+    /// question you are actually asking.
+    pub mask: Option<MaskLook>,
+}
+
+/// How a mask is shown on the picture: a Curve instance's, or a Dodge & Burn layer's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskLook {
+    /// The mask in place of the picture: bright where the pass applies in full, black
+    /// where it does not. For judging the mask as a shape, which is easier alone than
+    /// over the photograph it is laid on.
+    ///
+    /// Yellow, darktable's convention, and not gray: a grayscale coverage map is
+    /// indistinguishable at a glance from a very flat photograph, and a hue says "this
+    /// is not your picture" before you have read anything.
+    Mask,
+    /// The picture, with red film over what the mask protects: Photoshop's layer-mask
+    /// overlay and the darkroom's rubylith. Where the pass applies in full the picture is
+    /// clear, and where it does not apply at all the film is [`MaskLook::FILM`] deep.
+    /// For seeing the mask against the subject it was made for.
+    Overlay,
+}
+
+impl MaskLook {
+    /// How much of the film shows where a mask protects completely. The maintainer's
+    /// figure, from Photoshop's overlay set to 75%: deep enough to read at a glance as
+    /// "not here", with the picture still legible under it.
+    pub const FILM: f32 = 0.75;
 }
 
 impl Overlays {
@@ -395,20 +559,20 @@ impl Overlays {
         overexposed: false,
         underexposed: false,
         false_colour: false,
-        zone_mask: -1,
         dodge_map: false,
         burn_map: false,
         sensor: false,
+        mask: None,
     };
 
     pub fn any(self) -> bool {
         self.overexposed
             || self.underexposed
             || self.false_colour
-            || self.zone_mask >= 0
             || self.dodge_map
             || self.burn_map
             || self.sensor
+            || self.mask.is_some()
     }
 
     /// The bitmask the shader reads. Kept beside the shader's own comment naming
@@ -420,6 +584,8 @@ impl Overlays {
             | (u32::from(self.dodge_map) << 3)
             | (u32::from(self.burn_map) << 4)
             | (u32::from(self.sensor) << 5)
+            | (u32::from(self.mask == Some(MaskLook::Mask)) << 6)
+            | (u32::from(self.mask == Some(MaskLook::Overlay)) << 7)
     }
 }
 
@@ -519,7 +685,8 @@ struct Params {
     db_ev_max: f32,
     db_dabs: u32,
     db_instances: u32,
-    db_show_mask: i32,
+    // How many dabs the curve's painted masks have; zero skips the curve's dab scan.
+    curve_dabs: u32,
     mask_w: u32,
     mask_h: u32,
     // Non-zero when chemical toning is live. Took this block's padding word; see
@@ -528,7 +695,8 @@ struct Params {
     histogram: u32,
     input_scale: f32,
     mask_scale: f32,
-    _pad4: f32,
+    // How many curve segments are live; zero keeps the curve on its single table.
+    curve_segments: u32,
 };
 
 @group(0) @binding(4) var<uniform> p: Params;
@@ -697,14 +865,28 @@ pub struct Viewport {
     /// uniforms rewritten every frame.
     dabs: wgpu::Buffer,
     instances: wgpu::Buffer,
-    /// Zone masks stacked vertically, and the size of one of them.
+    /// A masked curve's segments, and the tables they index, one `LUT_SIZE` run each.
+    /// Grown, never shrunk, and never empty: see `stroke_buffer`.
+    segments: wgpu::Buffer,
+    tables: wgpu::Buffer,
+    /// Live segments, which is not the buffer's capacity. See `NodeParams::curve_segments`.
+    live_segments: u32,
+    /// The dabs of the Curve's painted masks, each naming the segment it belongs to, in
+    /// the layout a layer's dabs have. Grown, never shrunk, and never empty.
+    curve_dabs: wgpu::Buffer,
+    live_curve_dabs: u32,
+    /// The dabs of the mask the mask view is showing, when that mask is painted. Their
+    /// count rides in the view's record.
+    view_dabs: wgpu::Buffer,
+    /// Zone masks, one array layer each: Dodge & Burn's layers' first and then the Curve's
+    /// tone ranges. See [`MaskLayout`].
     masks: wgpu::Texture,
     masks_view: wgpu::TextureView,
-    /// One mask's size, and how many rows of them the strip is allocated for.
+    /// One mask's size, and how many layers the array is allocated for.
     /// Grown, never shrunk: the count changes a handful of times in a session and
     /// only ever by the user adding a masked instance.
     mask_dims: (u32, u32),
-    mask_rows: u32,
+    mask_layers: u32,
     /// Live dabs, which is not the dab buffer's capacity. See `NodeParams::db_dabs`.
     live_dabs: u32,
     live_instances: u32,
@@ -714,6 +896,15 @@ pub struct Viewport {
     zones: zones::Zones,
     interactive_zones: bool,
     zone_render_pending: bool,
+    /// The Curve mask the mask view shows, set by the host; see [`Self::set_mask_view`].
+    mask_view: Option<raw_core::curve::CurveMask>,
+    /// Its record for the display pass: one [`GpuSegment`], inert when nothing is viewed.
+    mask_view_record: wgpu::Buffer,
+    /// The record is stale: the viewed mask changed since it was written.
+    mask_view_dirty: bool,
+    /// The viewed tone whose mask is in the array, so a change to it re-sends the masks
+    /// and a shape that only moved does not.
+    mask_view_tone: Option<raw_core::ZoneMask>,
     // These describe actual resident resources, independently of the target's
     // last frame: comparison cells and exports share these resources.
     resource_params: Option<Arc<Params>>,
@@ -870,6 +1061,55 @@ impl PendingPatch {
     }
 }
 
+/// Where each zone mask lives in the layer array.
+///
+/// Dodge & Burn's come first, one per **active** layer in order, then the Curve's, one per
+/// tone range in [`raw_core::CurveStack::tone_masks`] order. The zone worker prepares them
+/// in that same order (`Zones::request`), so a mask is found by position. A mask with
+/// nothing to prepare, because it is fully open, is given no layer: -1, which the shaders
+/// read as "selects everything".
+struct MaskLayout<'a> {
+    /// Per active Dodge & Burn layer: its layer, or -1.
+    db: Vec<i32>,
+    /// Per Curve tone range: its layer, or -1.
+    curve: Vec<i32>,
+    /// The layer of the tone the mask view is showing, or -1 when it shows none or the
+    /// tone is fully open.
+    view: i32,
+    /// The masks to upload, in layer order. Borrowed, not copied: assigning is index work.
+    masks: Vec<&'a [f32]>,
+}
+
+impl<'a> MaskLayout<'a> {
+    /// `view` is whether a viewed tone was asked for, after the passes' own.
+    fn assign(params: &Params, prepared: Option<&'a zones::Prepared>, view: bool) -> Self {
+        let db_count = params.dodgeburn.active().count();
+        let tone_count = params.curve.tone_masks().len();
+        let mut masks: Vec<&'a [f32]> = Vec::new();
+        let mut take = |index: usize| -> i32 {
+            match prepared
+                .and_then(|p| p.masks.get(index))
+                .and_then(|m| m.as_deref())
+            {
+                Some(mask) => {
+                    masks.push(mask);
+                    (masks.len() - 1) as i32
+                }
+                None => -1,
+            }
+        };
+        let db = (0..db_count).map(&mut take).collect();
+        let curve = (0..tone_count).map(|t| take(db_count + t)).collect();
+        let view = if view { take(db_count + tone_count) } else { -1 };
+        Self {
+            db,
+            curve,
+            view,
+            masks,
+        }
+    }
+}
+
 impl Viewport {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, luma: &LumaImage) -> Self {
         let (w, h) = (luma.output_dims.w as u32, luma.output_dims.h as u32);
@@ -921,6 +1161,10 @@ impl Viewport {
         let dabs = Self::stroke_buffer(device, "db dabs", 0);
         let instances = Self::stroke_buffer(device, "db instances", 0);
         let (masks, masks_view) = Self::make_masks(device, 1, 1, 1);
+        let segments = Self::stroke_buffer(device, "curve segments", 0);
+        let tables = Self::stroke_buffer(device, "curve tables", 0);
+        let curve_dabs = Self::stroke_buffer(device, "curve mask dabs", 0);
+        let view_dabs = Self::stroke_buffer(device, "mask view dabs", 0);
 
         Self {
             mask_cache: None,
@@ -931,15 +1175,29 @@ impl Viewport {
             tone_lut,
             dabs,
             instances,
+            segments,
+            tables,
+            live_segments: 0,
+            curve_dabs,
+            live_curve_dabs: 0,
+            view_dabs,
             masks,
             masks_view,
             mask_dims: (1, 1),
-            mask_rows: 1,
+            mask_layers: 1,
             live_dabs: 0,
             live_instances: 0,
             zones: zones::Zones::default(),
             interactive_zones: false,
             zone_render_pending: false,
+            mask_view: None,
+            mask_view_record: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mask view"),
+                contents: bytemuck::bytes_of(&GpuSegment::unmasked(0, 0)),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            }),
+            mask_view_dirty: false,
+            mask_view_tone: None,
             resource_params: None,
             proxy: Arc::new(proxy),
             source,
@@ -969,19 +1227,23 @@ impl Viewport {
         })
     }
 
-    /// The zone-mask strip: room for `rows` masks of `w` x `h`, stacked.
+    /// The zone-mask array: room for `layers` masks of `w` x `h`, one per layer.
+    ///
+    /// An array and not a strip of rows stacked in one texture, because eight Dodge & Burn
+    /// layers and sixteen Curve passes at up to 480 rows apiece is 11,520 rows, past the
+    /// 8,192 a dimension is guaranteed. See `zone_mask.wgsl`.
     fn make_masks(
         device: &wgpu::Device,
         w: u32,
         h: u32,
-        rows: u32,
+        layers: u32,
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("zone masks"),
             size: wgpu::Extent3d {
                 width: w,
-                height: h * rows.max(1),
-                depth_or_array_layers: 1,
+                height: h,
+                depth_or_array_layers: layers.max(1),
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -990,7 +1252,10 @@ impl Viewport {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let view = texture.create_view(&Default::default());
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
         (texture, view)
     }
 
@@ -1019,56 +1284,138 @@ impl Viewport {
 
     pub fn request_zone_histogram(&mut self, params: &Params) -> Option<Vec<f32>> {
         self.zones
-            .request(&self.proxy, params, true, false)
+            .request(&self.proxy, params, true, None, false)
             .map(|p| p.histogram.clone())
     }
 
+    /// The picture's pre-Dodge & Burn basis, **when it is ready**, for a panel that reads
+    /// it every frame it is open: the curve editor taking its histogram inside a mask.
+    ///
+    /// Never waits, like [`request_zone_histogram`](Self::request_zone_histogram), whose
+    /// cache entry it shares: `None` means the worker has it in hand, and the caller
+    /// draws what it had and asks again. Ask only while something on screen needs it.
+    pub fn request_zone_basis(&mut self, params: &Params) -> Option<Arc<raw_core::Basis>> {
+        self.zones
+            .request(&self.proxy, params, true, None, false)
+            .map(|p| Arc::clone(&p.basis))
+    }
+
+    /// The picture's pre-Dodge & Burn basis itself, **waited for**, for a tone sampled
+    /// from the picture on a click.
+    ///
+    /// The eyedropper reads the image a tone range reads, and that image lives here with
+    /// the proxy it is made from. This hands out the same basis the masks and the ruler's
+    /// ghost are prepared from, by the same key, so a sample cannot read an older
+    /// exposure than the picture shows.
+    ///
+    /// It blocks, which the render path never does while it is interactive, because a
+    /// click is one act that needs the right answer and not a frame that can be drawn
+    /// again: the wait is the worker finishing a basis at proxy size, a few milliseconds.
+    /// **Call it on the click and not while a tool is merely armed**, or an armed sampler
+    /// would build a basis for a picture that has no tone range to need one.
+    pub fn zone_basis(&mut self, params: &Params) -> Arc<raw_core::Basis> {
+        let prepared = self
+            .zones
+            .request(&self.proxy, params, true, None, true)
+            .expect("a blocking zone request returns its result");
+        Arc::clone(&prepared.basis)
+    }
+
     pub fn zones_ready(&mut self, params: &Params) -> bool {
-        !Self::needs_zones(params)
+        let view = self.view_tone();
+        !self.needs_zones(params)
             || self
                 .zones
-                .request(&self.proxy, params, false, false)
+                .request(&self.proxy, params, false, view, false)
                 .is_some()
     }
 
-    fn needs_zones(params: &Params) -> bool {
-        params.dodgeburn.is_active() && params.dodgeburn.active().any(|i| !i.mask.is_identity())
+    /// Whether anything needs a mask prepared from the picture: a Dodge & Burn layer with a
+    /// tone mask, a Curve pass with a tone range, or a viewed mask with one. **When none
+    /// does, nothing asks the worker for a basis**, which is
+    /// `docs/zone-preparation-performance.md`'s rule and the reason this is asked before
+    /// the worker is.
+    fn needs_zones(&self, params: &Params) -> bool {
+        (params.dodgeburn.is_active() && params.dodgeburn.active().any(|i| !i.mask.is_identity()))
+            || params.curve.needs_zones()
+            || self.view_tone().is_some()
     }
 
-    /// Repack and upload the stroke buffers and the zone-mask strip.
+    /// Hand the viewport the Curve mask the mask view shows, or `None` for none.
+    ///
+    /// **The mask itself, not which pass it belongs to.** A mask is looked at while it is
+    /// being made, which is before its pass has a curve: that pass does not run, has no
+    /// segment, and with the module bypassed is not in the rendered parameters at all. So
+    /// the view carries its own copy, drawn by the display pass from a record of its own,
+    /// and nothing about it depends on the stack.
+    ///
+    /// View state, like the overlays: whether it is drawn, and how, is
+    /// [`Overlays::mask`] on each render. Setting it costs nothing until it
+    /// changes; a mask with a tone range then has that range prepared by the worker like
+    /// any other, and a shape alone asks the picture for nothing.
+    pub fn set_mask_view(&mut self, mask: Option<&raw_core::curve::CurveMask>) {
+        if self.mask_view.as_ref() == mask {
+            return;
+        }
+        self.mask_view = mask.cloned();
+        self.mask_view_dirty = true;
+        // The live target may show the old mask.
+        self.dirty = true;
+    }
+
+    /// The viewed mask's tone range, when it has one that needs a mask prepared: switched
+    /// on and not fully open.
+    fn view_tone(&self) -> Option<raw_core::ZoneMask> {
+        self.mask_view
+            .as_ref()
+            .and_then(|mask| mask.live_tone())
+            .filter(|tone| !tone.is_identity())
+            .copied()
+    }
+
+    /// Write the mask view's record: the viewed mask, with its tone at `layer`, and
+    /// its strokes when it is painted. The record's `len`, which names a table's length
+    /// in the curve pass, is here the number of dabs to scan.
+    fn write_mask_view(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layer: i32) {
+        let mut dabs: Vec<GpuDab> = Vec::new();
+        let record = match &self.mask_view {
+            Some(mask) => {
+                if let Some(shape) = &mask.shape {
+                    GpuDab::pack(shape.passes(), 0, &mut dabs);
+                }
+                GpuSegment::masked(0, dabs.len() as u32, mask, layer)
+            }
+            None => GpuSegment::unmasked(0, 0),
+        };
+        Self::write_dabs(device, queue, &mut self.view_dabs, "mask view dabs", &dabs);
+        queue.write_buffer(&self.mask_view_record, 0, bytemuck::bytes_of(&record));
+        self.mask_view_dirty = false;
+    }
+
+    /// Repack and upload the stroke buffers.
     ///
     /// Called only when `dodgeburn` changed, or when the two modules the masks are
-    /// computed *from* changed — exposure and Contrast Mask. Not every frame: this
-    /// packs dabs and uploads masks already prepared by the CPU worker. Filtering
-    /// is never performed here, and a pan must not repack unchanged strokes.
+    /// computed *from* changed — exposure and Contrast Mask — or when a Curve tone range
+    /// moved the layers. Not every frame: a pan must not repack unchanged strokes.
     ///
-    /// Masks are resolved before instances because packing an instance needs to
-    /// know which strip row it was given, and an instance whose mask is the
-    /// identity is given none at all.
+    /// `layers` is each active instance's zone-mask layer, from [`MaskLayout`], because
+    /// packing an instance needs to know which layer it was given, and an instance whose
+    /// mask is the identity is given none at all.
     fn write_strokes(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         params: &Params,
-        prepared: Option<&zones::Prepared>,
+        layers: &[i32],
     ) {
         let db: &DodgeBurnParams = &params.dodgeburn;
 
-        let mut mask_data: Vec<f32> = Vec::new();
         let mut instances: Vec<GpuInstance> = Vec::new();
         for (index, inst) in db.active().enumerate() {
-            let mask_row = match prepared.and_then(|p| p.masks[index].as_ref()) {
-                Some(m) => {
-                    let row = (mask_data.len() / self.proxy.w) as i32;
-                    mask_data.extend_from_slice(m);
-                    row
-                }
-                None => -1,
-            };
             let mut gi = GpuInstance {
                 sign: inst.sign.ev(),
                 opacity: inst.opacity,
-                mask_row,
+                mask_layer: layers.get(index).copied().unwrap_or(-1),
                 contrast: inst.contrast,
                 ..GpuInstance::EMPTY
             };
@@ -1104,36 +1451,10 @@ impl Viewport {
         // second loop instead.
         let mut dabs: Vec<GpuDab> = Vec::new();
         for (ii, inst) in db.active().enumerate() {
-            for (gi, g) in inst.gestures().iter().enumerate() {
-                for d in g.dabs.iter() {
-                    dabs.push(GpuDab {
-                        x: d.x,
-                        y: d.y,
-                        radius: d.radius,
-                        feather: d.feather,
-                        opacity: d.opacity,
-                        ev: d.ev,
-                        aspect: d.aspect,
-                        angle: d.angle.to_radians(),
-                        nib: u32::from(d.nib == raw_core::dodgeburn::Nib::Card),
-                        bound: d.bound(),
-                        inst: ii as u32,
-                        gesture: gi as u32,
-                    });
-                }
-            }
+            GpuDab::pack(inst.gestures(), ii as u32, &mut dabs);
         }
 
-        // Grow in doublings. A drag appends a dab per frame, and reallocating a
-        // buffer sixty times a second to add twenty-four bytes is the kind of
-        // churn that shows up as a stutter rather than as a number.
-        let need = std::mem::size_of_val(&dabs[..]) as u64;
-        if self.dabs.size() < need {
-            self.dabs = Self::stroke_buffer(device, "db dabs", need.next_power_of_two());
-        }
-        if !dabs.is_empty() {
-            queue.write_buffer(&self.dabs, 0, bytemuck::cast_slice(&dabs));
-        }
+        Self::write_dabs(device, queue, &mut self.dabs, "db dabs", &dabs);
         self.live_dabs = dabs.len() as u32;
         self.live_instances = instances.len() as u32;
 
@@ -1144,32 +1465,135 @@ impl Viewport {
         if !instances.is_empty() {
             queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&instances));
         }
+    }
 
-        let (mw, mh) = (self.proxy.w as u32, self.proxy.h as u32);
-        let rows = (mask_data.len() / self.proxy.w.max(1) / self.proxy.h.max(1)) as u32;
-        if rows > 0 {
-            if self.mask_dims != (mw, mh) || self.mask_rows < rows {
-                let (t, v) = Self::make_masks(device, mw, mh, rows);
-                self.masks = t;
-                self.masks_view = v;
-                self.mask_dims = (mw, mh);
-                self.mask_rows = rows;
-            }
-            queue.write_texture(
-                self.masks.as_image_copy(),
-                bytemuck::cast_slice(&mask_data),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(mw * 4),
-                    rows_per_image: Some(mh * rows),
-                },
-                wgpu::Extent3d {
-                    width: mw,
-                    height: mh * rows,
-                    depth_or_array_layers: 1,
-                },
-            );
+    /// Upload the zone masks, one array layer each, in the order [`MaskLayout`] gave.
+    ///
+    /// Nothing to write leaves the array as it is, and every layer index is then -1, so
+    /// the shaders read none of it.
+    fn write_mask_array(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, masks: &[&[f32]]) {
+        if masks.is_empty() {
+            return;
         }
+        debug_assert!(
+            masks.len() <= limits::MAX_MASK_LAYERS,
+            "more zone masks than there can be layers for"
+        );
+        let (mw, mh) = (self.proxy.w as u32, self.proxy.h as u32);
+        let layers = masks.len() as u32;
+        if self.mask_dims != (mw, mh) || self.mask_layers < layers {
+            let (t, v) = Self::make_masks(device, mw, mh, layers);
+            self.masks = t;
+            self.masks_view = v;
+            self.mask_dims = (mw, mh);
+            self.mask_layers = layers;
+        }
+        let flat: Vec<f32> = masks.concat();
+        queue.write_texture(
+            self.masks.as_image_copy(),
+            bytemuck::cast_slice(&flat),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(mw * 4),
+                rows_per_image: Some(mh),
+            },
+            wgpu::Extent3d {
+                width: mw,
+                height: mh,
+                depth_or_array_layers: layers,
+            },
+        );
+    }
+
+    /// Upload a masked curve: its segments, and its tables when they changed.
+    ///
+    /// A stack with no mask writes nothing and leaves `live_segments` at zero, which is
+    /// what keeps the shader on its original single-table code. `tables` says whether
+    /// the tables themselves are stale; a mask that only moved re-sends the segments,
+    /// each of which finds its table where it was, at `index * LUT_SIZE`. `layers` is each
+    /// tone range's zone-mask layer, from [`MaskLayout`].
+    fn write_segments(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        curve: &raw_core::CurveStack,
+        tables: bool,
+        layers: &[i32],
+    ) {
+        let len = raw_core::curve::LUT_SIZE as u32;
+        let masks = curve.segment_masks();
+        self.live_segments = masks.len() as u32;
+        self.live_curve_dabs = 0;
+        if masks.is_empty() {
+            return;
+        }
+        if tables {
+            // Baked here, once per change to a curve and never in the shader.
+            let baked = curve.segments();
+            let flat: Vec<f32> = baked.iter().flat_map(|s| s.table.iter().copied()).collect();
+            let need = std::mem::size_of_val(&flat[..]) as u64;
+            if self.tables.size() < need {
+                self.tables = Self::stroke_buffer(device, "curve tables", need);
+            }
+            queue.write_buffer(&self.tables, 0, bytemuck::cast_slice(&flat));
+        }
+        let records: Vec<GpuSegment> = masks
+            .iter()
+            .enumerate()
+            .map(|(k, masked)| {
+                let table = k as u32 * len;
+                match masked.and_then(|i| Some((i, curve.instances[i].live_mask()?))) {
+                    Some((pass, mask)) => {
+                        // This pass's tone range is the one `tone_index` says, and the
+                        // layer it was given, if it had anything to prepare.
+                        let layer = curve
+                            .tone_index(pass)
+                            .and_then(|t| layers.get(t).copied())
+                            .unwrap_or(-1);
+                        GpuSegment::masked(table, len, mask, layer)
+                    }
+                    None => GpuSegment::unmasked(table, len),
+                }
+            })
+            .collect();
+        let need = std::mem::size_of_val(&records[..]) as u64;
+        if self.segments.size() < need {
+            self.segments = Self::stroke_buffer(device, "curve segments", need);
+        }
+        queue.write_buffer(&self.segments, 0, bytemuck::cast_slice(&records));
+
+        // The painted masks' strokes, each dab naming its segment, in segment order:
+        // the order the shader's scan depends on.
+        let mut dabs: Vec<GpuDab> = Vec::new();
+        for (k, masked) in masks.iter().enumerate() {
+            if let Some(mask) = masked.and_then(|i| curve.instances[i].live_mask())
+                && let Some(shape) = &mask.shape
+            {
+                GpuDab::pack(shape.passes(), k as u32, &mut dabs);
+            }
+        }
+        self.live_curve_dabs = dabs.len() as u32;
+        Self::write_dabs(device, queue, &mut self.curve_dabs, "curve mask dabs", &dabs);
+    }
+
+    /// Upload `dabs` into `buffer`, growing it in doublings: a stroke appends a dab a
+    /// frame, and reallocating sixty times a second to add a few bytes is the kind of
+    /// churn that shows up as a stutter rather than as a number.
+    fn write_dabs(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &mut wgpu::Buffer,
+        label: &'static str,
+        dabs: &[GpuDab],
+    ) {
+        if dabs.is_empty() {
+            return;
+        }
+        let need = std::mem::size_of_val(dabs) as u64;
+        if buffer.size() < need {
+            *buffer = Self::stroke_buffer(device, label, need.next_power_of_two());
+        }
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(dabs));
     }
 
     fn make_source(
@@ -1466,7 +1890,7 @@ impl Viewport {
             db_ev_max: EV_MAX,
             db_dabs: self.live_dabs,
             db_instances: self.live_instances,
-            db_show_mask: view.overlays.zone_mask,
+            curve_dabs: self.live_curve_dabs,
             mask_w: self.mask_dims.0,
             mask_h: self.mask_dims.1,
             cm_contrast: 0.0,
@@ -1490,7 +1914,9 @@ impl Viewport {
             histogram: u32::from(histogram),
             input_scale: plan.sink().out.scale,
             mask_scale: plan.sink().out.scale,
-            _pad4: 0.0,
+            // On `common` for the reason `toning` is: only the curve node reads it, and
+            // a per-node exception is a thing to forget.
+            curve_segments: self.live_segments,
         };
 
         plan.steps
@@ -1755,11 +2181,15 @@ impl Viewport {
             return None;
         }
 
-        let prepared = if Self::needs_zones(params) {
-            match self
-                .zones
-                .request(&self.proxy, params, false, !self.interactive_zones)
-            {
+        let view_tone = self.view_tone();
+        let prepared = if self.needs_zones(params) {
+            match self.zones.request(
+                &self.proxy,
+                params,
+                false,
+                view_tone,
+                !self.interactive_zones,
+            ) {
                 Some(ready) => Some(ready),
                 None => {
                     self.zone_render_pending = true;
@@ -1792,11 +2222,20 @@ impl Viewport {
 
         // Re-bake the LUT only when the curve itself changed. A 256 KB upload is
         // cheap but not free, and it must not happen on every exposure frame.
-        let curve_changed = self
+        //
+        // **Two questions, not one.** A mask's tables change when a curve or an opacity
+        // does, or when a pass becomes masked; where the mask lies changes only a few
+        // bytes of segments. Dragging a mask's handle must not re-bake sixteen tables.
+        let luts_changed = self
             .resource_params
             .as_ref()
-            .is_none_or(|p| !p.curve.same_render(&params.curve));
-        if curve_changed {
+            .is_none_or(|p| !p.curve.same_luts(&params.curve));
+        let curve_changed = luts_changed
+            || self
+                .resource_params
+                .as_ref()
+                .is_none_or(|p| !p.curve.same_render(&params.curve));
+        if luts_changed {
             queue.write_buffer(&self.lut, 0, bytemuck::cast_slice(&params.curve.bake()));
         }
 
@@ -1816,11 +2255,34 @@ impl Viewport {
 
         let strokes_changed = self.resource_params.as_ref().is_none_or(|p| {
             p.dodgeburn != params.dodgeburn
-                || (Self::needs_zones(params)
+                || (self.needs_zones(params)
                     && (p.exposure != params.exposure || p.contrast_mask != params.contrast_mask))
         });
-        if strokes_changed {
-            self.write_strokes(device, queue, params, prepared.as_deref());
+        // The Curve's tone ranges are masks of the picture like Dodge & Burn's, so they
+        // share the array and the worker, and a change to either moves the layers.
+        let tone_changed = self
+            .resource_params
+            .as_ref()
+            .is_none_or(|p| !p.curve.same_tone(&params.curve));
+        // The mask view's tone is one more mask in the array, so a change to it moves
+        // the layers too. Its shape is not: that is a record of a few bytes.
+        let view_tone_changed = self.mask_view_tone != view_tone;
+        let masks_changed = strokes_changed || tone_changed || view_tone_changed;
+        // **Layers are assigned cheaply and the masks copied only when they changed.**
+        // Dragging a mask's handle changes `curve_changed` and nothing else, and must
+        // re-send a few bytes of segments, not copy twenty-four masks into the array.
+        if masks_changed || curve_changed || self.mask_view_dirty {
+            let layout = MaskLayout::assign(params, prepared.as_deref(), view_tone.is_some());
+            if masks_changed {
+                self.write_mask_array(device, queue, &layout.masks);
+                self.write_strokes(device, queue, params, &layout.db);
+                self.mask_view_tone = view_tone;
+            }
+            if masks_changed || curve_changed {
+                self.write_segments(device, queue, &params.curve, luts_changed, &layout.curve);
+            }
+            let view_layer = layout.view;
+            self.write_mask_view(device, queue, view_layer);
         }
 
         // Record restored resources even if the live target is already valid.
@@ -1888,6 +2350,11 @@ impl Viewport {
             dabs: &self.dabs,
             instances: &self.instances,
             masks: &self.masks_view,
+            segments: &self.segments,
+            tables: &self.tables,
+            mask_view: &self.mask_view_record,
+            curve_dabs: &self.curve_dabs,
+            view_dabs: &self.view_dabs,
         };
         let cache_key = (!tap && !histogram)
             .then(|| {

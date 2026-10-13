@@ -33,6 +33,7 @@
 mod cli;
 mod contact_sheet;
 mod crop;
+mod curve_mask;
 mod curve_presets;
 mod decode;
 mod dialogs;
@@ -58,6 +59,7 @@ mod snapshot;
 mod splash;
 mod tabs;
 mod theme;
+mod tone_sampler;
 mod toning;
 #[cfg(target_os = "macos")]
 mod updater;
@@ -156,6 +158,45 @@ fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static>
 
 /// Result of a background encode.
 type Exported = Result<PathBuf, String>;
+
+/// What a Curve instance's MASK section needs from the tab that it cannot own: whether the
+/// on-image tool is open on it, the ghost behind its tone ruler, and the ruler's drag.
+struct MaskView<'a> {
+    adjusting: bool,
+    /// The pre-Dodge & Burn tonal distribution over the ruler's window, or empty when no
+    /// tone range is on screen to need it.
+    hist: &'a [f32],
+    zone_drag: &'a mut Option<widgets::ZoneGrab>,
+    /// The mask kept on the picture, which the header's two chips set for this module.
+    pin: &'a mut Option<(tabs::MaskOwner, raw_gpu::MaskLook)>,
+    /// The brush, whose controls a painted mask shows, and whether one that changes the
+    /// nib's outline is being worked this frame.
+    brush: &'a mut paint::Brush,
+    touched: &'a mut bool,
+    /// Whether the tone eyedropper is armed on this instance's range.
+    sampling: bool,
+    /// Open the section this frame: the point sampler has just set this instance's tone
+    /// range, and a range made by a click on the picture should be on screen.
+    reveal: bool,
+}
+
+/// What a Curve instance's MASK section asked for in one frame.
+///
+/// Collected rather than acted on in place, because the section draws inside the
+/// CURVE module's closure, which holds the tab, and starting the on-image tool needs the
+/// tab's frame and mode as well as its parameters. The module's handlers read these once
+/// the closure has ended.
+#[derive(Default)]
+struct MaskActions {
+    /// A shape picked on this instance: which pass, and which of the four.
+    pick: Option<(usize, paint::Pick)>,
+    /// Adjust on image was clicked.
+    adjust: bool,
+    /// Remove was clicked.
+    remove: bool,
+    /// What the tone range's controls asked of the eyedropper.
+    sample_tone: Option<widgets::SamplerAsk>,
+}
 
 /// The name sheet keeps a snapshot of the selected instance from the frame Save was pressed.
 /// Editing can continue behind the sheet without quietly changing what is saved.
@@ -2788,7 +2829,7 @@ impl eframe::App for App {
         let temporary_hand = self
             .tabs
             .active()
-            .is_some_and(|tab| tab.mode.is_paint() || tab.mode.is_keystone());
+            .is_some_and(|tab| tab.mode.lends_space_to_pan());
         if !temporary_hand || !raw_input.focused {
             self.brush_pan = false;
         } else {
@@ -2930,8 +2971,8 @@ impl eframe::App for App {
         // exactly and every bare key is suppressed while a text field has focus —
         // both of which used to be each call site's problem. See `hotkeys`.
         // Whether an interaction mode is claiming its own chords this frame. Only
-        // the brush does today; `Mode::claims_keys` is where the next one says so.
-        let modal = self.tabs.active().is_some_and(|t| t.mode.is_paint());
+        // the brush does, painting a layer or a Curve mask; `Mode::brush_open` says so.
+        let modal = self.tabs.active().is_some_and(|t| t.mode.brush_open());
         // **Installed on the first frame**, which is the earliest `NSApp` exists —
         // eframe creates it during startup and offers no callback that says so.
         //
@@ -3109,6 +3150,17 @@ impl eframe::App for App {
                 hotkeys::Action::Surround => {
                     if let Some(t) = self.tabs.active_mut() {
                         t.surround = !t.surround;
+                    }
+                }
+                hotkeys::Action::MaskOverlay => {
+                    if let Some(t) = self.tabs.active_mut().filter(|t| t.has_image())
+                        && !t.toggle_mask_overlay()
+                    {
+                        self.pending_note = Some(
+                            "No mask to show: select a Curve instance with a mask, or a \
+                             Dodge & Burn layer"
+                                .into(),
+                        );
                     }
                 }
                 hotkeys::Action::FalseColour => {
@@ -3323,7 +3375,10 @@ impl eframe::App for App {
                     };
                     let tool = self.tool;
                     let nib = self.brush.nib;
-                    if let Some(t) = self.tabs.active_mut() {
+                    // Dodge & Burn's own, and inert while the brush is painting a Curve
+                    // mask: a new layer made from inside another module's tool would be
+                    // a layer nobody asked for.
+                    if let Some(t) = self.tabs.active_mut().filter(|t| t.mode.is_paint()) {
                         if let tabs::Mode::Paint { sign: s, grab, .. } = &mut t.mode {
                             *s = sign;
                             *grab = None;
@@ -3374,6 +3429,11 @@ impl eframe::App for App {
                         if let Some(before) = t.mode.cancelled_strokes() {
                             t.params.dodgeburn = before.clone();
                         }
+                        // And the curve mask's: the whole stack as it stood when the tool
+                        // opened, which removes a mask the pick had just made.
+                        if let Some(before) = t.mode.cancelled_curves() {
+                            t.params.curve = before.clone();
+                        }
                         // The loupe has nothing to put back — it edits no pixel —
                         // so cancelling it is closing it. Doing that here rather
                         // than leaving the window up over a mode that has ended
@@ -3392,7 +3452,10 @@ impl eframe::App for App {
                         // them. Only the grab in flight is dropped, so a drag
                         // interrupted by `Esc` does not resume on the next press.
                         t.pins.dragging = None;
-                        t.mode = tabs::Mode::View;
+                        // Pan, except that the tone eyedropper hands back the tool it
+                        // was opened over: `Esc` there discards the sampling and not the
+                        // brush session it interrupted.
+                        t.mode = t.mode.left();
                     }
                 }
                 // ...and `↵` applies, which is simply leaving the mode: the crop is
@@ -3409,7 +3472,7 @@ impl eframe::App for App {
                             t.loupe.forget();
                         }
                         t.straighten_armed = false;
-                        t.mode = tabs::Mode::View;
+                        t.mode = t.mode.left();
                     }
                 }
                 // **`l` switches modes**, the other half of the pair `e` has held
@@ -4849,7 +4912,7 @@ impl App {
                             &mut commit_rename,
                         );
                         if selected {
-                            Self::layer_options(ui, tab, i, &zone_hist, brush, &mut touched);
+                            Self::layer_options(ui, tab, i, &zone_hist, icons, brush, &mut touched);
                             ui.add_space(3.0);
                             theme::rule(ui, theme::RUBY);
                             ui.add_space(3.0);
@@ -4906,6 +4969,13 @@ impl App {
         if let Some(i) = select {
             tab.db_active = i;
             tab.db_rename = None;
+            // The tone eyedropper gives way to a row click, the armed layer's own
+            // included. Left before the selection is acted on, so the brush session it
+            // was opened over is back and the arm below keeps that session's snapshot
+            // rather than starting another.
+            if tab.mode.tone_target().is_some() {
+                tab.mode = tab.mode.left();
+            }
             match i.and_then(|i| tab.params.dodgeburn.instances.get(i)) {
                 // **Selecting a layer arms it.** the maintainer's call, and it is what the
                 // word means: the row you have highlighted is the one a drag on the
@@ -4936,7 +5006,10 @@ impl App {
                     self.tool = tool;
                 }
                 None => {
-                    tab.db_view_mask = false;
+                    // With no layer selected there is no layer's mask to keep up.
+                    if tab.mask_pin.is_some_and(|(owner, _)| owner == tabs::MaskOwner::Layer) {
+                        tab.mask_pin = None;
+                    }
                     if tab.mode.is_paint() {
                         tab.mode = tabs::Mode::View;
                     }
@@ -4950,6 +5023,7 @@ impl App {
             // highlighted, and the next stroke picks a sensible one anyway.
             tab.db_active = None;
             tab.db_rename = None;
+            tab.end_stale_tone_sample();
         }
         if let Some(sign) = create {
             let tool = self.tool;
@@ -5180,12 +5254,12 @@ impl App {
         tab: &mut tabs::Tab,
         i: usize,
         hist: &[f32],
+        icons: &icons::Icons,
         brush: &mut paint::Brush,
         touched: &mut bool,
     ) {
         ui.add_space(4.0);
         let mask_active = tab.params.dodgeburn.instances[i].mask.enabled;
-        let view_mask = tab.db_view_mask;
         let inst = &mut tab.params.dodgeburn.instances[i];
         let option_label_size = theme::size::SLIDER;
         // One quiet hairline separates geometry from effect strength. It is fainter
@@ -5207,50 +5281,7 @@ impl App {
             // where the value happens to be stored, and a brush layer with no controls
             // beside it was the odd one out among four shapes.
             raw_core::dodgeburn::Shape::Brush { .. } => {
-                widgets::check(ui, "Angle follows stroke", &mut brush.follow).on_hover_text(
-                    theme::tip(
-                        "Angle the nib to the direction you drag — narrow along the \
-                         path, wide across it. Shading a horizon becomes one gesture.",
-                    ),
-                );
-                // **Radius, Feather, Aspect, Angle, Intensity, Opacity** — the maintainer's
-                // order. Size and softness are the two that get moved on nearly every
-                // stroke, so they lead; aspect and angle shape the nib and are set
-                // once; intensity and opacity are how hard it presses and belong
-                // together at the end.
-                *touched |= widgets::Row::new(
-                    &mut brush.radius,
-                    paint::Brush::default().radius,
-                    paint::Brush::RADIUS_RANGE,
-                    "Radius",
-                )
-                .label_size(option_label_size)
-                .decimals(3)
-                .show(ui);
-                *touched |= widgets::Row::new(
-                    &mut brush.feather,
-                    paint::Brush::default().feather,
-                    paint::Brush::FEATHER_RANGE,
-                    "Feather",
-                )
-                .label_size(option_label_size)
-                .show(ui);
-                *touched |=
-                    widgets::Row::new(&mut brush.aspect, 1.0, paint::Brush::ASPECT_RANGE, "Aspect")
-                        .label_size(option_label_size)
-                        .show(ui);
-                ui.add_enabled_ui(!brush.follow, |ui| {
-                    *touched |= widgets::Row::new(
-                        &mut brush.angle,
-                        0.0,
-                        paint::Brush::ANGLE_RANGE,
-                        "Angle",
-                    )
-                    .label_size(option_label_size)
-                    .decimals(1)
-                    .suffix("°")
-                    .show(ui);
-                });
+                Self::brush_shape_rows(ui, brush, touched, option_label_size);
                 amount_divider(ui);
                 widgets::Row::new(
                     &mut brush.intensity,
@@ -5373,84 +5404,422 @@ impl App {
                 {
                     tab.params.dodgeburn.instances[i].mask.enabled = !mask_active;
                 }
-                if theme::bracket(ui, "view mask", view_mask, theme::size::CAPTION)
-                    .on_hover_text(theme::tip(
-                        "Show the mask instead of the picture — a shape is easier to \
-                         judge on its own.",
-                    ))
-                    .clicked()
-                {
-                    tab.db_view_mask = !view_mask;
-                }
+                // The Curve's two switches, for this layer: one choice across both
+                // modules, drawn by the same code.
+                Self::mask_look_chips(ui, &mut tab.mask_pin, tabs::MaskOwner::Layer);
             });
-        });
-
-        let m = &mut tab.params.dodgeburn.instances[i].mask;
-        widgets::zone_ruler(ui, m, hist, &mut tab.zone_drag);
-        ui.horizontal(|ui| {
-            for (label, lo, hi, f_lo, f_hi) in raw_core::ZoneMask::PRESETS {
-                let on = m.enabled && (m.lo - lo).abs() < 1e-4 && (m.hi - hi).abs() < 1e-4;
-                if theme::bracket(ui, label, on, theme::size::CAPTION).clicked() {
-                    (m.lo, m.hi, m.f_lo, m.f_hi) = (lo, hi, f_lo, f_hi);
-                    m.enabled = true;
-                }
-            }
-            if theme::bracket(ui, "Inv", m.invert, theme::size::CAPTION).clicked() {
-                m.invert = !m.invert;
-            }
         });
 
         let id = ui.make_persistent_id(("zone-more", i));
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
-            .show_header(ui, |ui| {
-                ui.label(theme::caption("Edge and diffusion"));
-            })
-            // **`body_unindented`.** The default body indents, and an indented row is
-            // handed less width than its neighbours — so Diffusion, Region and Edge got
-            // a shorter track starting further right than the Radius and Feather
-            // directly above them. The disclosure triangle already says these three
-            // belong to the section; the indent was saying it a second time and paying
-            // for it in the one alignment the panel is built on.
-            .body_unindented(|ui| {
-                widgets::Row::new(
-                    &mut m.blur,
+        let target = tabs::ToneTarget::Layer(i);
+        let sampling = tab.mode.tone_target() == Some(target);
+        if let Some(ask) = widgets::tone_range(
+            ui,
+            icons,
+            &mut tab.params.dodgeburn.instances[i].mask,
+            hist,
+            &mut tab.zone_drag,
+            sampling,
+            id,
+        ) {
+            // The eyedropper takes the picture from the brush and, pressed again, gives
+            // it back: `Mode::left` returns to the paint session it was armed over.
+            tab.ask_tone_sampler(target, ask);
+        }
+    }
+
+    /// The two switches that keep a mask on the picture, `overlay` and `view mask`, for
+    /// the module `owner`. Laid right to left, so they read in that order from the left.
+    ///
+    /// **One choice, across both modules**: the picture shows one mask at a time, so
+    /// pinning a look here lets go of whatever was pinned, in this module or the other.
+    /// Unpinned, a mask still shows itself while one of its handles is dragged; see
+    /// `curve_mask::shown`.
+    fn mask_look_chips(
+        ui: &mut egui::Ui,
+        pin: &mut Option<(tabs::MaskOwner, raw_gpu::MaskLook)>,
+        owner: tabs::MaskOwner,
+    ) {
+        use raw_gpu::MaskLook;
+        for (label, look, tip) in [
+            (
+                "view mask",
+                MaskLook::Mask,
+                "Show the mask instead of the picture: bright where this applies, dark \
+                 where it does not. A shape is easier to judge on its own.",
+            ),
+            (
+                "overlay",
+                MaskLook::Overlay,
+                "Lay red film over what the mask protects, and leave what this applies to \
+                 clear. Press / to turn it on and off.",
+            ),
+        ] {
+            let on = *pin == Some((owner, look));
+            if theme::bracket(ui, label, on, theme::size::CAPTION)
+                .on_hover_text(theme::tip(tip))
+                .clicked()
+            {
+                *pin = (!on).then_some((owner, look));
+            }
+        }
+    }
+
+    /// The brush's shape: whether its angle follows the stroke, then Radius, Feather,
+    /// Aspect and Angle. Shared by a brushed Dodge & Burn layer and a painted Curve
+    /// mask, which are painted with the one brush.
+    ///
+    /// `touched` is set while a row that changes the nib's outline is being worked, so
+    /// the picture can show the nib being sized; see `App::brush_adjusting`.
+    fn brush_shape_rows(
+        ui: &mut egui::Ui,
+        brush: &mut paint::Brush,
+        touched: &mut bool,
+        option_label_size: f32,
+    ) {
+            widgets::check(ui, "Angle follows stroke", &mut brush.follow).on_hover_text(
+                theme::tip(
+                    "Angle the nib to the direction you drag — narrow along the \
+                     path, wide across it. Shading a horizon becomes one gesture.",
+                ),
+            );
+            // **Radius, Feather, Aspect, Angle, Intensity, Opacity** — the maintainer's
+            // order. Size and softness are the two that get moved on nearly every
+            // stroke, so they lead; aspect and angle shape the nib and are set
+            // once; intensity and opacity are how hard it presses and belong
+            // together at the end.
+            *touched |= widgets::Row::new(
+                &mut brush.radius,
+                paint::Brush::default().radius,
+                paint::Brush::RADIUS_RANGE,
+                "Radius",
+            )
+            .label_size(option_label_size)
+            .decimals(3)
+            .show(ui);
+            *touched |= widgets::Row::new(
+                &mut brush.feather,
+                paint::Brush::default().feather,
+                paint::Brush::FEATHER_RANGE,
+                "Feather",
+            )
+            .label_size(option_label_size)
+            .show(ui);
+            *touched |=
+                widgets::Row::new(&mut brush.aspect, 1.0, paint::Brush::ASPECT_RANGE, "Aspect")
+                    .label_size(option_label_size)
+                    .show(ui);
+            ui.add_enabled_ui(!brush.follow, |ui| {
+                *touched |= widgets::Row::new(
+                    &mut brush.angle,
                     0.0,
-                    raw_core::ZoneMask::BLUR_RANGE,
-                    "Diffusion",
+                    paint::Brush::ANGLE_RANGE,
+                    "Angle",
                 )
-                .decimals(3)
+                .label_size(option_label_size)
+                .decimals(1)
+                .suffix("°")
                 .show(ui);
-                ui.horizontal(|ui| {
-                    if theme::bracket(ui, "Edge-aware", m.edge_aware, theme::size::CAPTION)
+            });
+    }
+
+    /// The selected Curve instance's MASK section: which shape limits it, how that shape
+    /// is set, and the three things done to the mask as a whole.
+    ///
+    /// **Collapsible, and open by default exactly when there is a mask**, so a masked
+    /// instance shows its controls and an unmasked one costs a line. The header says
+    /// what the mask is made of, because a closed section should still answer that. Not
+    /// remembered across a deletion: egui keys the state by position, as the Dodge &
+    /// Burn layer options' is.
+    ///
+    /// **There is no ON/OFF here.** The mask's switch is the icon on the instance's row,
+    /// which is where the maintainer asked for it, so it can be flipped with the section
+    /// closed and a second switch for the same thing would only disagree with it.
+    ///
+    /// The order is the shape of the work, which is TK9's: pick where the mask comes from,
+    /// set it, then refine it. The first row is all icons, the shapes and then the three
+    /// things done to the mask, and the shape's own controls follow it. Tone joins the shape
+    /// here, below it, with the rule that combines them.
+    fn curve_mask_section(
+        ui: &mut egui::Ui,
+        instance: &mut raw_core::CurveInstance,
+        i: usize,
+        view: &mut MaskView<'_>,
+        icons: &icons::Icons,
+        actions: &mut MaskActions,
+    ) {
+        use raw_core::curve::{CurveMask, Rule};
+        use raw_core::dodgeburn::{Linear, Radial, Shape};
+
+        // What the mask is made of, in a word or two, so a closed section still says.
+        let summary = {
+            let mask = instance.mask.as_ref();
+            let shape = match mask.and_then(|m| m.shape.as_ref()) {
+                None => None,
+                Some(Shape::Linear(_)) => Some("linear"),
+                Some(Shape::Radial(_)) => Some("radial"),
+                Some(Shape::Brush { .. }) => Some("painted"),
+            };
+            // A range limited to what its seeds reach is a different thing to look for
+            // on the picture than a range, so it gets its own word.
+            let tone = mask.and_then(|m| m.live_tone()).map(|tone| {
+                if tone.island.is_live() {
+                    "island"
+                } else {
+                    "tone"
+                }
+            });
+            match (shape, tone) {
+                (None, None) => "none".to_owned(),
+                (Some(shape), None) => shape.to_owned(),
+                (None, Some(tone)) => tone.to_owned(),
+                (Some(shape), Some(tone)) => format!("{shape} + {tone}"),
+            }
+        };
+        let id = ui.make_persistent_id(("curve-mask", i));
+        if view.reveal {
+            // Opened in the stored state, ahead of the load below, so the section reads
+            // it as it reads a click on its own triangle.
+            let mut section = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                id,
+                true,
+            );
+            section.set_open(true);
+            section.store(ui.ctx());
+        }
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            id,
+            instance.mask.is_some(),
+        )
+        .show_header(ui, |ui| {
+            // A body-size label, as Dodge & Burn's TONE MASK is: it names one control group
+            // inside an instance's own settings, not a bench to pick from.
+            ui.label(theme::label("MASK"));
+            ui.label(theme::caption(&summary));
+            // **Two ways to keep the mask on the picture**, in the header so they work
+            // with the section closed, and only when there is a mask to look at. They
+            // are one choice: pinning one lets go of the other. Unpinned, the mask still
+            // shows itself while a handle is dragged; see `curve_mask::shown`.
+            if instance.mask.as_ref().is_some_and(curve_mask::viewable) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    Self::mask_look_chips(ui, view.pin, tabs::MaskOwner::Curve);
+                });
+            }
+        })
+        // Not indented, for the reason Dodge & Burn's "Edge and diffusion" is not: an
+        // indented row is handed less width than the rows around it.
+        .body_unindented(|ui| {
+            let option_label_size = theme::size::SLIDER;
+            let lit = instance
+                .mask
+                .as_ref()
+                .and_then(|m| m.shape.as_ref())
+                .map(curve_mask::pick_of);
+            let has_mask = instance.mask.is_some();
+            let has_shape = lit.is_some();
+            let inverted = instance.mask.as_ref().is_some_and(|m| m.invert);
+            let mut flip = false;
+
+            // **One row of icons and no words**: where the mask comes from at the left, in
+            // Dodge & Burn's four shapes, and what to do with it at the right. Round and Card
+            // are painted with the brush, Linear and Radial are laid; the row reads the
+            // same on a layer and on a curve. The three on the right are grayed until
+            // there is something for them to act on, rather than absent, so the row
+            // does not change shape as a mask comes and goes. The words moved to the tooltips.
+            ui.horizontal(|ui| {
+                for pick in paint::Pick::ALL {
+                    if icons::toggle(
+                        ui,
+                        icons,
+                        pick.icon(),
+                        &pick.label()[..1],
+                        lit == Some(pick),
+                        icons::BIG,
+                    )
+                    .on_hover_text(theme::tip(pick.tooltip()))
+                    .clicked()
+                    {
+                        actions.pick = Some((i, pick));
+                    }
+                }
+                // Right to left, so they read crosshair, invert, remove from the left.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icons::sized(ui, icons, "close", "×", has_mask, icons::BIG)
                         .on_hover_text(theme::tip(
-                            "Reads exposure REGIONALLY, so a zone selects a coherent area \
-                             with clean edges — a hand under the enlarger — instead of a \
-                             scatter of pixels of the right brightness.",
+                            "Remove: take the mask off and apply this curve everywhere.",
                         ))
                         .clicked()
                     {
-                        m.edge_aware = !m.edge_aware;
+                        actions.remove = true;
+                    }
+                    if icons::toggle_enabled(
+                        ui,
+                        icons,
+                        "invert",
+                        "◐",
+                        inverted,
+                        has_shape,
+                        icons::BIG,
+                    )
+                    .on_hover_text(theme::tip(
+                        "Invert: turn the shape inside out, so the curve applies everywhere \
+                         but where it was.",
+                    ))
+                    .clicked()
+                    {
+                        flip = true;
+                    }
+                    if icons::toggle_enabled(
+                        ui,
+                        icons,
+                        "crosshair",
+                        "⌖",
+                        view.adjusting,
+                        has_shape,
+                        icons::BIG,
+                    )
+                    .on_hover_text(theme::tip(
+                        "Adjust on image: drag the shape's handles on the picture, or paint \
+                         a painted mask. Return keeps it, Esc puts it back as it was.",
+                    ))
+                    .clicked()
+                    {
+                        actions.adjust = true;
                     }
                 });
-                ui.add_enabled_ui(m.edge_aware, |ui| {
-                    widgets::Row::new(
-                        &mut m.region,
-                        raw_core::ZoneMask::default().region,
-                        raw_core::ZoneMask::REGION_RANGE,
-                        "Region",
+            });
+
+            if let Some(mask) = instance.mask.as_mut() {
+                if flip {
+                    mask.invert = !mask.invert;
+                }
+                match &mut mask.shape {
+                    Some(Shape::Linear(l)) => {
+                        widgets::Row::new(&mut l.feather, 1.0, Linear::FEATHER_RANGE, "Transition")
+                            .label_size(option_label_size)
+                            .show(ui);
+                    }
+                    Some(Shape::Radial(r)) => {
+                        widgets::Row::new(&mut r.inner, 0.0, Radial::INNER_RANGE, "Core")
+                            .label_size(option_label_size)
+                            .decimals(3)
+                            .show(ui);
+                        r.inner = r.inner.min(r.outer * 0.95);
+                        widgets::Row::new(&mut r.aspect, 1.0, Radial::ASPECT_RANGE, "Aspect")
+                            .label_size(option_label_size)
+                            .show(ui);
+                        widgets::Row::new(&mut r.angle, 0.0, Radial::ANGLE_RANGE, "Angle")
+                            .label_size(option_label_size)
+                            .decimals(1)
+                            .suffix("°")
+                            .show(ui);
+                        widgets::Row::new(
+                            &mut r.feather,
+                            1.0,
+                            Radial::FEATHER_RANGE,
+                            "Transition",
+                        )
+                        .label_size(option_label_size)
+                        .show(ui);
+                    }
+                    // Painted: the brush that paints it. Its settings are the tool's and
+                    // not the mask's, as on a layer; a dab keeps its own. No Intensity,
+                    // which a mask has no use for: the curve says how far a tone moves.
+                    Some(Shape::Brush { .. }) => {
+                        Self::brush_shape_rows(ui, view.brush, view.touched, option_label_size);
+                        widgets::Row::new(
+                            &mut view.brush.opacity,
+                            paint::Brush::default().opacity,
+                            paint::Brush::OPACITY_RANGE,
+                            "Opacity",
+                        )
+                        .label_size(option_label_size)
+                        .tip("How much of the curve one pass of the brush lets through.")
+                        .show(ui);
+                    }
+                    // No shape: nothing to set.
+                    None => {}
+                }
+            }
+
+            // **The tone part**, which is the mask's second half and works with or without a
+            // shape: a tone alone is a luminosity mask across the whole frame. Its switch is
+            // the range's own `enabled`, Dodge & Burn's meaning of it, so switching it off
+            // keeps the ruler for when it comes back. Turning it on for an instance with no
+            // mask makes the mask, which is how a tone-only one starts.
+            let tone_on = instance
+                .mask
+                .as_ref()
+                .and_then(|m| m.tone.as_ref())
+                .is_some_and(|t| t.enabled);
+            let mut flip_tone = false;
+            ui.horizontal(|ui| {
+                ui.label(theme::label("TONE"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::bracket(
+                        ui,
+                        if tone_on { "ON" } else { "OFF" },
+                        tone_on,
+                        theme::size::CAPTION,
                     )
-                    .decimals(3)
-                    .show(ui);
-                    widgets::Row::new(
-                        &mut m.edge,
-                        raw_core::ZoneMask::default().edge,
-                        raw_core::ZoneMask::EDGE_RANGE,
-                        "Edge",
-                    )
-                    .suffix(" EV")
-                    .show(ui);
+                    .on_hover_text(theme::tip(
+                        "Limit this curve to a range of tones, on its own or inside a shape. \
+                         Off keeps the range for when it comes back.",
+                    ))
+                    .clicked()
+                    {
+                        flip_tone = true;
+                    }
                 });
             });
+            if flip_tone {
+                curve_mask::flip_tone(instance);
+            }
+            if let Some(mask) = instance.mask.as_mut() {
+                let CurveMask {
+                    shape, tone, rule, ..
+                } = mask;
+                if let Some(tone) = tone {
+                    let more = ui.make_persistent_id(("curve-zone-more", i));
+                    actions.sample_tone = widgets::tone_range(
+                        ui,
+                        icons,
+                        tone,
+                        view.hist,
+                        view.zone_drag,
+                        view.sampling,
+                        more,
+                    );
+                    // **How the two parts join, and only when there are two.** A shape or a
+                    // tone alone is the whole mask and has nothing to join.
+                    if shape.is_some() && tone.enabled {
+                        ui.horizontal(|ui| {
+                            ui.label(theme::caption("Join"));
+                            for candidate in Rule::ALL {
+                                if theme::bracket(
+                                    ui,
+                                    candidate.label(),
+                                    *rule == candidate,
+                                    theme::size::CAPTION,
+                                )
+                                .on_hover_text(theme::tip(match candidate {
+                                    Rule::Intersect => "Only where the shape and the tone both select.",
+                                    Rule::Subtract => "The shape, except where the tone selects.",
+                                    Rule::Add => "Wherever the shape or the tone selects.",
+                                }))
+                                .clicked()
+                                {
+                                    *rule = candidate;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            ui.add_space(2.0);
+        });
     }
 
     /// The History panel: the undo timeline as a list you can click.
@@ -6322,6 +6691,11 @@ impl App {
         let curve_presets = &mut self.curve_presets;
         let curve_preset_name = &mut self.curve_preset_name;
         let pending_note = &mut self.pending_note;
+        // The brush, which a painted Curve mask's section sets and its tool paints with,
+        // and whether a control that changes the nib's outline is being worked.
+        let brush = &mut self.brush;
+        let brush_adjusting = &mut self.brush_adjusting;
+        let mut brush_touched = false;
         // The unit is a preference and lives in Settings, but its toggle belongs in
         // the panel where the sizes are. Read out and written back around the tab
         // borrow, the same way the composition buttons are.
@@ -6611,8 +6985,13 @@ impl App {
             .curve
             .instances
             .get(tab.curve_active)
-            .is_some_and(|i| !i.curve.is_identity() || i.opacity != 1.0);
+            .is_some_and(|i| !i.curve.is_identity() || i.opacity != 1.0 || i.mask.is_some());
         let picking_curve_point = tab.mode.is_curve_point();
+        // Which pass's mask is open on the picture, read here because the module's
+        // closure borrows the tab for the whole of its body.
+        let masking = tab.mode.curve_mask_instance();
+        // And which tone range the eyedropper is armed on, for the same reason.
+        let sampling = tab.mode.tone_target();
         let mut select_curve = None;
         let mut remove_curve = None;
         let mut commit_curve_rename = false;
@@ -6621,6 +7000,66 @@ impl App {
         let mut save_curve_preset = false;
         let mut load_curve_preset = None;
         let mut delete_curve_preset = None;
+        // What the selected instance's MASK section asked for this frame.
+        let mut mask_actions = MaskActions::default();
+        // The ghost behind the tone ruler, the pre-Dodge & Burn distribution, **asked for
+        // only while the selected instance has a tone range to show it behind**: it is the
+        // worker's basis, and a Curve with no tone range must never cost one.
+        let zone_hist: Vec<f32> = if tab
+            .params
+            .curve
+            .instances
+            .get(tab.curve_active)
+            .and_then(|i| i.mask.as_ref())
+            .is_some_and(|m| m.tone.is_some())
+        {
+            let zone_params = tab.params.effective();
+            tab.render
+                .as_mut()
+                .and_then(|r| {
+                    let ready = r.viewport.request_zone_histogram(&zone_params);
+                    if ready.is_none() {
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(16));
+                    }
+                    ready
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // The picture's basis, for taking the editor's histogram inside masks that have a
+        // tone range: the selected instance's, and those above it that shape what enters
+        // it. On the same rule as the ruler's ghost: asked for only while one of them has
+        // a range that reads the picture.
+        let ghost_basis = if tab
+            .params
+            .curve
+            .instances
+            .iter()
+            .take(tab.curve_active + 1)
+            .any(|i| {
+                i.live_mask()
+                    .and_then(|m| m.live_tone())
+                    .is_some_and(|t| !t.is_identity())
+            }) {
+            let zone_params = tab.params.effective();
+            tab.render.as_mut().and_then(|r| {
+                let ready = r.viewport.request_zone_basis(&zone_params);
+                if ready.is_none() {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(16));
+                }
+                ready
+            })
+        } else {
+            None
+        };
+        // The stored image's height over width, which a mask's shape is measured in.
+        let mask_aspect = tab
+            .luma
+            .as_ref()
+            .map_or(1.0, |l| l.output_dims.h as f32 / l.output_dims.w.max(1) as f32);
         let curve = widgets::Module::new("CURVE")
             .open_on_start(false)
             .modified(tab.params.curve.is_modified())
@@ -6628,7 +7067,12 @@ impl App {
             .switch(tab.params.curve.enabled)
             .show(ui, |ui| {
                 refresh_tab_curve_samples(tab);
-                let curve_ghost = tab.histogram.curve_input(&tab.params.curve, tab.curve_active);
+                let curve_ghost = tab.histogram.curve_ghost(
+                    &tab.params.curve,
+                    tab.curve_active,
+                    mask_aspect,
+                    ghost_basis.as_ref(),
+                );
                 ui.horizontal(|ui| {
                     theme::tracked_at(ui, "INSTANCES", theme::DIM, theme::size::SECTION - 2.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -6725,9 +7169,18 @@ impl App {
                                 commit_curve_rename = true;
                             }
                         } else {
+                            // What the right-hand group takes: 78 for the close mark and the
+                            // opacity, and the mask icon with its gap when there is one.
+                            let gap = ui.spacing().item_spacing.x;
+                            let right = 78.0
+                                + if instance.mask.is_some() {
+                                    icons::BOX + gap
+                                } else {
+                                    0.0
+                                };
                             let row = ui
                                 .allocate_ui_with_layout(
-                                    egui::vec2((ui.available_width() - 78.0).max(40.0), 20.0),
+                                    egui::vec2((ui.available_width() - right).max(40.0), 20.0),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
                                         let text = egui::RichText::new(&instance.name)
@@ -6799,20 +7252,62 @@ impl App {
                                     }),
                             )
                             .on_hover_text(theme::tip("curve instance opacity"));
+                            // **The mask's switch, beside the opacity** and left of it, and
+                            // **only on an instance that has a mask**: a pass with none shows
+                            // nothing here, and the MASK section is how one starts. Ruby while
+                            // the mask is on, gray while it is off, so a closed list shows which
+                            // instances are limited to part of the picture. It switches
+                            // `mask.enabled` and nothing else, so the shape is still there when
+                            // it comes back; it stays on screen while off, or there would be no
+                            // way to turn it on again.
+                            if let Some(mask) = &mut instance.mask {
+                                let on = mask.enabled;
+                                if icons::flag(ui, icons, "mask", "M", on, true, icons::BOX)
+                                    .on_hover_text(theme::tip(if on {
+                                        "mask on: click to apply this curve everywhere"
+                                    } else {
+                                        "mask off: click to limit this curve to its mask again"
+                                    }))
+                                    .clicked()
+                                {
+                                    mask.enabled = !on;
+                                }
+                            }
                         });
                     });
                     if selected {
+                        // **The mask's controls live inside the selected instance**, between
+                        // its ruby rules, as a Dodge & Burn layer's options do and for the
+                        // same reason: the controls for the thing you are editing sit with
+                        // it, not under a list that may be eight rows long.
+                        Self::curve_mask_section(
+                            ui,
+                            instance,
+                            i,
+                            &mut MaskView {
+                                adjusting: masking == Some(i),
+                                hist: &zone_hist,
+                                zone_drag: &mut tab.curve_zone_drag,
+                                pin: &mut tab.mask_pin,
+                                brush,
+                                touched: &mut brush_touched,
+                                sampling: sampling == Some(tabs::ToneTarget::Curve(i)),
+                                reveal: tab.curve_mask_reveal.take_if(|r| *r == i).is_some(),
+                            },
+                            icons,
+                            &mut mask_actions,
+                        );
                         theme::rule(ui, theme::RUBY.gamma_multiply(0.75));
                     }
                 }
 
+                // **The graph's tool row**: the point sampler and its one option, directly
+                // above the graph they act on, as icons and a chip with the words in the
+                // tooltips. It was a labeled row, "Point sampler" and then the eyedropper
+                // out in the value column, which the maintainer was unsure of; like the
+                // MASK section's first row, it reads as tools because it has no label.
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
-                    let h = ui.spacing().interact_size.y.min(18.0);
-                    ui.add_sized(
-                        [widgets::Row::LABEL_W, h],
-                        egui::Label::new(theme::caption("Point sampler")),
-                    );
                     if icons::toggle(
                         ui,
                         icons,
@@ -6822,11 +7317,28 @@ impl App {
                         icons::BIG,
                     )
                     .on_hover_text(theme::tip(
-                        "Then click a tone in the picture to add a point to the selected curve instance.",
+                        "Point sampler: then click a tone in the picture to add a point \
+                         there to the selected curve instance.",
                     ))
                     .clicked()
                     {
                         toggle_curve_picker = true;
+                    }
+                    if theme::bracket(
+                        ui,
+                        "limit to tone",
+                        tab.curve_limit_tone,
+                        theme::size::CAPTION,
+                    )
+                    .on_hover_text(theme::tip(
+                        "With this on, the point sampler's click also sets this instance's \
+                         tone range around the tone you clicked, so dragging the new point \
+                         moves only those tones. The range is in the MASK section, to \
+                         widen or soften.",
+                    ))
+                    .clicked()
+                    {
+                        tab.curve_limit_tone = !tab.curve_limit_tone;
                     }
                 });
                 ui.add_space(4.0);
@@ -6837,7 +7349,8 @@ impl App {
                         &mut instance.curve,
                         &mut tab.curve_drag,
                         &mut tab.curve_point,
-                        Some(&curve_ghost),
+                        Some(&curve_ghost.bins),
+                        curve_ghost.span,
                     );
                     if let Some((point_i, point)) = tab
                         .curve_point
@@ -6919,17 +7432,8 @@ impl App {
                                 "Output minus Input at this point, before curve opacity and other processing.",
                             ));
                     } else {
-                        let change = match tab.histogram.curve_average_ev() {
-                            Some(delta) if delta.abs() < 0.005 => "Average: unchanged".to_owned(),
-                            Some(delta) => format!(
-                                "Average: {:.2} EV {}",
-                                delta.abs(),
-                                if delta > 0.0 { "lighter" } else { "darker" },
-                            ),
-                            None => "Average: —".to_owned(),
-                        };
-                        ui.label(theme::caption(change)).on_hover_text(theme::tip(
-                            "Average EV change across sampled positive tones for this curve layer, including opacity and bypass. Individual tones may change differently. Excludes Contrast Mask and other spatial processing. Select a point for Input / Output EV.",
+                        ui.label(theme::caption(curve_ghost.readout())).on_hover_text(theme::tip(
+                            "Average EV change across sampled positive tones for this curve layer, including opacity and bypass. With a mask, it is the change inside the mask: each tone counts by how much of the curve reaches it, and the percentage is how much of the frame the mask selects. Individual tones may change differently. Excludes Contrast Mask and other spatial processing. Select a point for Input / Output EV.",
                         ));
                     }
                 }
@@ -6938,6 +7442,11 @@ impl App {
                 ));
             });
         tab.params.curve.enabled ^= curve.bypass;
+        // Latched for the length of the gesture, as Dodge & Burn's is: a row reports a
+        // change only on frames its value moves, so a drag held still would blink the
+        // nib out.
+        *brush_adjusting =
+            brush_touched || (*brush_adjusting && ui.ctx().input(|i| i.pointer.any_down()));
         if add_curve_instance && let Some(i) = tab.params.curve.add_instance() {
             tab.curve_active = i;
             tab.curve_point = None;
@@ -6951,6 +7460,8 @@ impl App {
             instance.curve = raw_core::Curve::default();
             instance.curve.enabled = enabled;
             instance.opacity = 1.0;
+            // Reset is back to an untouched pass, and a mask is part of what a pass is.
+            instance.mask = None;
             tab.curve_point = None;
             tab.curve_drag = None;
         }
@@ -6969,6 +7480,7 @@ impl App {
         }
         if let Some(i) = remove_curve.filter(|i| *i < tab.params.curve.instances.len()) {
             tab.params.curve.instances.remove(i);
+
             tab.curve_active = tab
                 .curve_active
                 .min(tab.params.curve.instances.len().saturating_sub(1));
@@ -6976,6 +7488,84 @@ impl App {
             tab.curve_drag = None;
             tab.curve_rename = None;
         }
+        if let Some((i, pick)) = mask_actions
+            .pick
+            .filter(|(i, _)| *i < tab.params.curve.instances.len())
+            && let Some(frame) = tab.frame()
+            && let Some(size) = tab
+                .luma
+                .as_ref()
+                .map(|l| (l.output_dims.w as f32, l.output_dims.h as f32))
+        {
+            tab.curve_active = i;
+            tab.curve_point = None;
+            tab.curve_drag = None;
+            tab.curve_rename = None;
+            // **Taken before the pick changes anything**, so `Esc` can remove a mask the
+            // pick has just made. Kept if the tool is already open on this pass, or
+            // switching shapes inside it would quietly redefine what Esc discards.
+            let entered = match &tab.mode {
+                tabs::Mode::CurveMask {
+                    instance, entered, ..
+                } if *instance == i => (**entered).clone(),
+                _ => tab.params.curve.clone(),
+            };
+            let instance = &mut tab.params.curve.instances[i];
+            let had_mask = instance.mask.is_some();
+            // **Picking the shape a pass already has opens the tool on it** and does not
+            // lay it again; see `curve_mask::pick` for what picking another does.
+            let painted = curve_mask::pick(instance, pick, &frame, size);
+            if let Some(nib) = pick.nib() {
+                // The brush follows the mask it is about to paint, as it follows a
+                // layer: the cursor draws the brush's nib, and it must be this one.
+                brush.nib = nib;
+                // **A painted mask on a pass with no curve yet has nothing to show for
+                // a stroke**, since the pass changes no tone. So a mask made that way
+                // goes up as film, where what is painted shows as it is painted. A pass
+                // that has a curve shows its strokes in the picture, and is left alone.
+                if !had_mask && instance.curve.is_identity() {
+                    tab.mask_pin = Some((tabs::MaskOwner::Curve, raw_gpu::MaskLook::Overlay));
+                }
+            }
+            tab.mode = tabs::Mode::curve_mask(i, entered).with_brush(painted);
+        }
+        if mask_actions.adjust {
+            let active = tab.curve_active;
+            if tab.mode.curve_mask_instance() == Some(active) {
+                tab.mode = tabs::Mode::View;
+            } else if let Some(mask) = tab
+                .params
+                .curve
+                .instances
+                .get_mut(active)
+                .and_then(|i| i.mask.as_mut())
+                .filter(|m| m.shape.is_some())
+            {
+                // Adjusting a mask that is off turns it on: the handles move a shape
+                // you cannot see the effect of otherwise.
+                mask.enabled = true;
+                let painted = mask.shape.as_ref().and_then(|shape| shape.nib());
+                if let Some(nib) = painted {
+                    brush.nib = nib;
+                }
+                tab.mode = tabs::Mode::curve_mask(active, tab.params.curve.clone())
+                    .with_brush(painted.is_some());
+            }
+        }
+        if mask_actions.remove
+            && let Some(instance) = tab.params.curve.instances.get_mut(tab.curve_active)
+        {
+            instance.mask = None;
+        }
+        // The eyedropper on the selected instance's tone range: its button arms it and,
+        // pressed again, leaves it keeping what was sampled.
+        if let Some(ask) = mask_actions.sample_tone {
+            tab.ask_tone_sampler(tabs::ToneTarget::Curve(tab.curve_active), ask);
+        }
+        // The eyedropper and the mask tool leave with the pass they were editing; see the
+        // methods, and the first's note on why it goes first.
+        tab.end_stale_tone_sample();
+        tab.end_stale_curve_mask();
         if toggle_curve_picker {
             tab.mode = if picking_curve_point {
                 tabs::Mode::View
@@ -9155,15 +9745,13 @@ impl App {
         let overlays = raw_gpu::Overlays {
             dodge_map: hotkeys::held(ctx, hotkeys::Action::ShowDodgeMap),
             burn_map: hotkeys::held(ctx, hotkeys::Action::ShowBurnMap),
-            // Resolved here rather than stored: the panel names a layer by its index
-            // in the full list and the shader indexes the rasterised one, so the
-            // translation belongs at the boundary between them.
-            zone_mask: self
+            // Resolved here rather than stored: which look, if any, a mask has this
+            // frame, a Curve instance's or a Dodge & Burn layer's. The mask itself is
+            // handed to the viewport below.
+            mask: self
                 .tabs
                 .active()
-                .filter(|t| t.db_view_mask)
-                .and_then(|t| t.db_active.and_then(|i| t.params.dodgeburn.active_index(i)))
-                .map_or(-1, |i| i as i32),
+                .and_then(|t| t.shown_mask().map(|(_, look)| look)),
             ..self.tabs.active().map(|t| t.overlays).unwrap_or_default()
         };
         let surround = self
@@ -9207,12 +9795,17 @@ impl App {
             self.readout = draw_reference(ui, ctx, tab, &img, sample);
             return;
         }
+        // The mask the picture shows, taken before `render` is borrowed. From the stored
+        // parameters and not the rendered ones: a mask is looked at with its module
+        // bypassed, too.
+        let mask_view = tab.shown_mask().map(|(mask, _)| mask);
         let (Some(render), Some(_), Some(frame)) = (&mut tab.render, &tab.luma, frame) else {
             let status = tab.status.clone();
             ui.centered_and_justified(|ui| ui.weak(status));
             return;
         };
         let vp = &mut render.viewport;
+        vp.set_mask_view(mask_view.as_ref());
 
         let avail = ui.available_size();
         let ppp = ctx.pixels_per_point();
@@ -9427,6 +10020,16 @@ impl App {
                     egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(uv[0], uv[1])),
                     egui::Color32::WHITE,
                 );
+                // **The open tool still runs while the masks are prepared.** The frame
+                // is the last picture, held for the frame or two the worker takes, and
+                // without this the tool went with it: its overlay and its cursor blinked
+                // out and a press that landed in the gap was lost. Nothing on the picture
+                // moved a tone range before the eyedropper, which makes every sample one
+                // of these gaps. The view and the frame are this frame's own, so the
+                // tool measures as it will once the picture catches up.
+                self.mode_tools(
+                    ui, ctx, rect, ppp, view_off, view_scale, &frame, sample, &mode,
+                );
             } else {
                 ui.painter().text(
                     rect.center(),
@@ -9599,18 +10202,9 @@ impl App {
             }
         }
 
-        if mode.is_crop() {
-            self.crop_tool(ui, ctx, rect, ppp, view_off, view_scale, &frame);
-        }
-        if mode.is_keystone() {
-            self.keystone_tool(ui, ctx, rect, ppp, view_off, view_scale, &frame);
-        }
-        if mode.is_paint() {
-            self.paint_tool(ui, ctx, rect, ppp, view_off, view_scale, &frame);
-        }
-        if mode.is_curve_point() {
-            self.curve_point_tool(ui, ctx, rect, ppp, view_off, view_scale, &frame, sample);
-        }
+        self.mode_tools(
+            ui, ctx, rect, ppp, view_off, view_scale, &frame, sample, &mode,
+        );
         if self.tabs.active().is_some_and(|t| t.loupe.open) {
             self.print_loupe(
                 ui, ctx, rs, rect, ppp, view_off, view_scale, &frame, &response,
@@ -9624,8 +10218,104 @@ impl App {
         );
     }
 
-    /// One-shot Curve point sampler. Its cursor is Triopro's white-point cursor:
-    /// crosshair for the exact sampled pixel, eyedropper for the operation.
+    /// Run the on-picture tool `mode` has open: its overlay, its cursor and its gesture.
+    ///
+    /// One place, because the viewport reaches it from two: after a frame it rendered,
+    /// and after one it could not render yet and is holding the last picture for.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
+    fn mode_tools(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        ppp: f32,
+        view_off: egui::Vec2,
+        view_scale: f32,
+        frame: &raw_core::Frame,
+        sample: settings::SampleArea,
+        mode: &tabs::Mode,
+    ) {
+        if mode.is_crop() {
+            self.crop_tool(ui, ctx, rect, ppp, view_off, view_scale, frame);
+        }
+        if mode.is_keystone() {
+            self.keystone_tool(ui, ctx, rect, ppp, view_off, view_scale, frame);
+        }
+        if mode.is_paint() {
+            self.paint_tool(ui, ctx, rect, ppp, view_off, view_scale, frame);
+        }
+        if mode.is_curve_mask() {
+            self.curve_mask_tool(ui, ctx, rect, ppp, view_off, view_scale, frame);
+        }
+        if mode.is_curve_point() {
+            self.curve_point_tool(ui, ctx, rect, ppp, view_off, view_scale, frame, sample);
+        }
+        if mode.tone_target().is_some() {
+            self.tone_sample_tool(ui, ctx, rect, ppp, view_off, view_scale, frame);
+        }
+    }
+
+    /// The cursor of a tool that samples the picture. Triopro's white-point cursor: a
+    /// crosshair for the exact pixel, an eyedropper for the operation. `adding` draws a
+    /// plus beside the eyedropper, for a click that will add to what is there.
+    fn sampler_cursor(
+        ui: &egui::Ui,
+        ctx: &egui::Context,
+        icons: &icons::Icons,
+        rect: egui::Rect,
+        p: egui::Pos2,
+        adding: bool,
+    ) {
+        ctx.set_cursor_icon(egui::CursorIcon::None);
+        let painter = ui.painter_at(rect);
+        // **In two inks, dark under light**, as every other overlay on the picture is.
+        // It was white alone, which is the one ink that vanishes on a sky, and a sky is
+        // what a tone is most often sampled from.
+        for (offset, ink) in [
+            (egui::vec2(1.0, 1.0), theme::INK_DARK),
+            (egui::Vec2::ZERO, theme::INK_LIGHT),
+        ] {
+            let at = egui::Rect::from_center_size(
+                p + egui::vec2(11.0, -11.0) + offset,
+                egui::vec2(18.0, 18.0),
+            );
+            icons::paint_at(ui, icons, "eyedropper", "⌖", at, ink, 16.0);
+        }
+        for (width, ink) in [(3.0, theme::INK_DARK), (1.0, theme::INK_LIGHT)] {
+            let stroke = egui::Stroke::new(width, ink);
+            for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                let d = egui::vec2(dx, dy);
+                painter.line_segment([p + d * 3.0, p + d * 8.0], stroke);
+            }
+            if adding {
+                let c = p + egui::vec2(22.0, -3.0);
+                for d in [egui::vec2(3.0, 0.0), egui::vec2(0.0, 3.0)] {
+                    painter.line_segment([c - d, c + d], stroke);
+                }
+            }
+        }
+    }
+
+    /// One-shot Curve point sampler; see [`Self::sampler_cursor`] for its cursor.
+    ///
+    /// # What one click reads
+    ///
+    /// - **The point** is placed at the tone *entering the selected pass* at the pixel
+    ///   clicked: the exposed luminance, through the passes above it. A pass above may
+    ///   be masked, and how much of it reached this pixel is asked of the picture's own
+    ///   basis ([`raw_core::Basis::weight_at`]), which is the prepared mask the shader
+    ///   reads, edge-aware smoothing and diffusion included.
+    /// - **With "limit to tone" on**, the same click sets the selected pass's tone range
+    ///   around the tone the basis reads there, so dragging the new point moves only
+    ///   those tones. The point reads the curve's input and the range reads the basis,
+    ///   two different numbers for the same pixel, each the one its control compares
+    ///   against.
+    ///
+    /// The basis is fetched only when one of those needs it, so sampling a point on a
+    /// stack with no tone range still costs the picture nothing.
     #[expect(
         clippy::too_many_arguments,
         reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
@@ -9645,22 +10335,7 @@ impl App {
             .input(|i| i.pointer.latest_pos())
             .filter(|p| rect.contains(*p))
         {
-            ctx.set_cursor_icon(egui::CursorIcon::None);
-            let painter = ui.painter_at(rect);
-            let stroke = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(200));
-            for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-                let d = egui::vec2(dx, dy);
-                painter.line_segment([p + d * 3.0, p + d * 8.0], stroke);
-            }
-            icons::paint_at(
-                ui,
-                &self.icons,
-                "eyedropper",
-                "⌖",
-                egui::Rect::from_center_size(p + egui::vec2(11.0, -11.0), egui::vec2(18.0, 18.0)),
-                egui::Color32::from_white_alpha(235),
-                16.0,
-            );
+            Self::sampler_cursor(ui, ctx, &self.icons, rect, p, false);
         }
 
         let Some(at) = ctx
@@ -9681,12 +10356,39 @@ impl App {
         let Some(raw) = sample_luma(luma, sx, sy, sample) else {
             return;
         };
+        let (lw, lh) = (luma.output_dims.w as f32, luma.output_dims.h as f32);
 
         let active = tab
             .curve_active
             .min(tab.params.curve.instances.len().saturating_sub(1));
         let scene = (raw - tab.params.exposure.black) * tab.params.exposure.ev.exp2();
-        let entering = tab.params.curve.apply_before(active, scene);
+        let (nx, ny, aspect) = (sx / lw, sy / lh, lh / lw);
+        let limit = tab.curve_limit_tone;
+        // Whether a pass above the selected one is limited to a tone range: only then
+        // does what enters this pass depend on the picture around the pixel.
+        let tone_above = tab.params.curve.instances.iter().take(active).any(|pass| {
+            pass.live_mask()
+                .is_some_and(|mask| mask.live_tone().is_some())
+        });
+        let basis = if limit || tone_above {
+            let Some(render) = tab.render.as_mut() else {
+                return;
+            };
+            Some(render.viewport.zone_basis(&tab.params.effective()))
+        } else {
+            None
+        };
+        // **Where it was clicked, not only what tone.** A pass above the selected one may
+        // be masked, and what enters this pass at this pixel depends on whether that mask
+        // reached it. `apply_before_at` is the shader's own composition, so the point
+        // lands where the picture's tone actually is; a tone range above is weighed by
+        // the prepared mask's own value here, which is what the shader looked up.
+        let entering = tab
+            .params
+            .curve
+            .apply_before_at(active, scene, nx, ny, aspect, &|tone| {
+                basis.as_ref().map_or(1.0, |b| b.weight_at(tone, nx, ny))
+            });
         let x = raw_core::Curve::to_normalized(entering);
         tab.params.curve.enabled = true;
         let Some(instance) = tab.params.curve.instances.get_mut(active) else {
@@ -9699,7 +10401,215 @@ impl App {
         instance.curve.enabled = true;
         tab.curve_point = Some(instance.curve.add(x, y));
         tab.curve_drag = None;
+        // **Point and mask in one click.** The range is read from the basis with the
+        // settings it will keep, regionally unless the range was made per-pixel, and
+        // after the point: what entered the pass does not depend on the pass's own mask.
+        if limit && let Some(basis) = &basis {
+            let ev = basis
+                .reading(&curve_mask::tone_to_limit(instance))
+                .at(nx, ny);
+            curve_mask::limit_to_tone(instance, ev);
+            // Open the MASK section on it, so the range the click made is on screen.
+            tab.curve_mask_reveal = Some(active);
+        }
         tab.mode = tabs::Mode::View;
+    }
+
+    /// The eyedropper on a tone range: a click sets the range around the tone clicked, a
+    /// dragged box spans the tones inside it, and `⇧` adds to the range instead.
+    ///
+    /// One tool for a Curve instance's tone range and a Dodge & Burn layer's tone mask,
+    /// as the range and its controls are one widget. **It reads the picture's basis with
+    /// the range's own settings** ([`raw_core::Basis::sample_into`]): the image the mask
+    /// is cut from, regional when the range is edge-aware, so what is clicked is what
+    /// gets selected.
+    ///
+    /// The gesture is decided on release ([`tone_sampler::points`]): near the press it
+    /// was a click and reads one point, further it was a box and reads a lattice across
+    /// it. Each point is carried onto the negative as a click is, so a turned or
+    /// straightened picture needs nothing special; points that land off the negative are
+    /// skipped, and a gesture wholly off it changes nothing.
+    ///
+    /// **It stays armed**, so a click can be followed by a `⇧`-click without a trip to
+    /// the panel. `Return` or its own button keeps the range, `Esc` puts the module back
+    /// as it was, and Space pans, as in the other tools that stay open.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
+    fn tone_sample_tool(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        ppp: f32,
+        view_off: egui::Vec2,
+        view_scale: f32,
+        frame: &raw_core::Frame,
+    ) {
+        let brush_pan = self.brush_pan;
+        let Some(tab) = self.tabs.active_mut() else {
+            return;
+        };
+        // The range can be gone under the tool, by an undo or from a pane that is not
+        // on screen to notice, and a tool with nothing to set leaves.
+        tab.end_stale_tone_sample();
+        let tabs::Mode::ToneSample { target, anchor, .. } = &tab.mode else {
+            return;
+        };
+        let (target, mut anchor) = (*target, *anchor);
+        let Some(luma) = tab.luma.as_ref() else {
+            return;
+        };
+        let (lw, lh) = (luma.output_dims.w as f32, luma.output_dims.h as f32);
+        // The range's island, as it stands this frame: whether a click places a seed,
+        // and the seeds to draw. A copy, since the range is edited below.
+        let island = tab.tone_range(target).map(|tone| tone.island).unwrap_or_default();
+        // What the tool keeps in the mode across frames, written back on every way out.
+        let keep = |tab: &mut tabs::Tab, held: Option<egui::Pos2>| {
+            if let tabs::Mode::ToneSample { anchor, island: says, .. } = &mut tab.mode {
+                *anchor = held;
+                *says = island.enabled;
+            }
+        };
+
+        let to_negative = |p: egui::Pos2| -> (f32, f32) {
+            let f = view_off + (p - rect.min) * ppp / view_scale;
+            let (sx, sy) = frame.to_source(f.x, f.y);
+            (sx / lw, sy / lh)
+        };
+        let to_screen = |at: (f32, f32)| -> egui::Pos2 {
+            let (fx, fy) = frame.from_source(at.0 * lw, at.1 * lh);
+            rect.min + (egui::vec2(fx, fy) - view_off) * view_scale / ppp
+        };
+
+        let pointer = ctx
+            .input(|i| i.pointer.latest_pos())
+            .filter(|p| rect.contains(*p));
+        if brush_pan {
+            // A box cannot stay live across a pan, for the reason a stroke cannot.
+            keep(tab, None);
+            if pointer.is_some() {
+                ctx.set_cursor_icon(if ctx.input(|i| i.pointer.primary_down()) {
+                    egui::CursorIcon::Grabbing
+                } else {
+                    egui::CursorIcon::Grab
+                });
+            }
+            return;
+        }
+        let (pressed, released, adding, alt) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_released(),
+                i.modifiers.shift,
+                i.modifiers.alt,
+            )
+        });
+
+        // **The seeds, on the picture**, while their island is on: where the selection
+        // grows from is a thing you placed and should be able to see and take back.
+        // Hit-tested in screen points, as a gradient's handles are.
+        const SEED_HIT: f32 = 9.0;
+        let seeds: Vec<egui::Pos2> = if island.enabled {
+            island.seeds().iter().map(|at| to_screen(*at)).collect()
+        } else {
+            Vec::new()
+        };
+        let over_seed = pointer
+            .filter(|_| alt)
+            .and_then(|p| seeds.iter().position(|seed| seed.distance(p) <= SEED_HIT));
+
+        if pressed {
+            match over_seed {
+                // `⌥`-click on a seed takes it away, and is not a sample.
+                Some(index) => {
+                    if let Some(tone) = tab.tone_range_mut(target) {
+                        tone.island.remove(index);
+                    }
+                    anchor = None;
+                }
+                // On the picture, or not at all: a press on a panel is that panel's.
+                None => anchor = pointer,
+            }
+        }
+
+        let painter = ui.painter_at(rect);
+        for (index, seed) in seeds.iter().enumerate() {
+            // A ring and a dot in the two inks; ruby while `⌥` would remove it.
+            let ink = if over_seed == Some(index) {
+                theme::RUBY
+            } else {
+                theme::INK_LIGHT
+            };
+            painter.circle_stroke(*seed, 5.0, egui::Stroke::new(3.0, theme::INK_DARK));
+            painter.circle_stroke(*seed, 5.0, egui::Stroke::new(1.0, ink));
+            painter.circle_filled(*seed, 1.5, ink);
+        }
+
+        // The box, while it is one, in the two inks every overlay on the picture uses.
+        let reach = ctx.input(|i| i.pointer.latest_pos()).map(|p| rect.clamp(p));
+        if let (Some(from), Some(to)) = (anchor, reach)
+            && tone_sampler::is_box(from, to)
+        {
+            let outline = egui::Rect::from_two_pos(from, to);
+            for (width, ink) in [(2.0, theme::INK_DARK), (1.0, theme::INK_LIGHT)] {
+                painter.rect_stroke(
+                    outline,
+                    0.0,
+                    egui::Stroke::new(width, ink),
+                    egui::StrokeKind::Middle,
+                );
+            }
+        }
+        if let Some(p) = pointer {
+            Self::sampler_cursor(ui, ctx, &self.icons, rect, p, adding);
+        }
+
+        let Some(from) = anchor.filter(|_| released) else {
+            keep(tab, anchor);
+            return;
+        };
+        keep(tab, None);
+        // A box dragged off the picture ends at the picture's edge.
+        let at = reach.unwrap_or(from);
+        let points = tone_sampler::points(from, at).into_iter().map(to_negative);
+        // Where the gesture's seed goes: the click, or the middle of the box.
+        let seed = to_negative(egui::Rect::from_two_pos(from, at).center());
+        let Some(render) = tab.render.as_mut() else {
+            return;
+        };
+        let basis = render.viewport.zone_basis(&tab.params.effective());
+        let Some(tone) = tab.tone_range_mut(target) else {
+            return;
+        };
+        if !basis.sample_into(tone, points, adding) {
+            return;
+        }
+        // **An island's click is a tone and a place at once**: the range is set around
+        // the tone, as above, and the seed says which part of the picture with that
+        // tone is meant. A plain click starts again from this seed; `⇧` adds one.
+        let mut full = false;
+        if tone.island.enabled {
+            if adding {
+                full = !tone.island.add(seed)
+                    && tone.island.seeds().len() == raw_core::dodgeburn::Island::MAX;
+            } else {
+                tone.island.set(seed);
+            }
+        }
+        // Sampling a range is asking to see it work, as switching it on is.
+        if let tabs::ToneTarget::Curve(i) = target
+            && let Some(mask) = tab.params.curve.instances.get_mut(i).and_then(|c| c.mask.as_mut())
+        {
+            mask.enabled = true;
+        }
+        if full {
+            self.pending_note = Some(format!(
+                "{} seeds is the limit for one island",
+                raw_core::dodgeburn::Island::MAX
+            ));
+        }
     }
 
     /// The Inspector's pins: placing them, moving them, and drawing them.
@@ -10420,95 +11330,348 @@ impl App {
             return;
         }
 
-        // The brush ring. Radius is a fraction of the negative's WIDTH, so it is
-        // scaled by the width and drawn as a circle — the same aspect convention
-        // the dab itself uses, seen from the other end.
-        //
-        // **Drawn in the middle of the viewport while a brush control is being
-        // worked**, even though the pointer is then over the panel and not the
-        // picture. That is the one case where "draw the cursor where the cursor is"
-        // gives you nothing: reaching Radius means leaving the image, so the nib you
-        // are sizing is exactly the thing you cannot see. See `App::brush_adjusting`.
-        //
-        // **The centre rather than where the pointer last was**, which is the maintainer's
-        // call. The remembered position is wherever you happened to leave the picture
-        // on the way to the panel — often a corner, sometimes under the panel you are
-        // now working in — so the ghost appeared somewhere arbitrary and occasionally
-        // out of sight. The centre is always visible, always the same place, and is
-        // where you look while judging a size.
+        // Dodge light, burn dark, eraser ruby — see `theme::INK_LIGHT`.
+        let (ink, halo) = match (sign, alt) {
+            (_, true) => (theme::RUBY, theme::INK_DARK),
+            (raw_core::Sign::Dodge, _) => (theme::INK_LIGHT, theme::INK_DARK),
+            (raw_core::Sign::Burn, _) => (theme::INK_DARK, theme::INK_LIGHT),
+        };
+        let stroke_bearing = match tab.mode.grab() {
+            Some(tabs::PaintGrab::Stroke { bearing, .. }) => bearing,
+            _ => None,
+        };
+        let r = brush.radius * lw * view_scale / ppp;
+        Self::brush_cursor(
+            ui,
+            ctx,
+            rect,
+            pointer,
+            self.brush_adjusting,
+            &brush,
+            r,
+            (ink, halo),
+            stroke_bearing,
+        );
+    }
+
+    /// The brush's cursor: the nib it will lay, at the size and angle it will lay it.
+    ///
+    /// Shared by the Dodge & Burn brush and the brush painting a Curve mask. `r` is the
+    /// brush's radius in screen points; the radius is a fraction of the negative's WIDTH,
+    /// so the caller scales it by the width, the same aspect convention the dab itself
+    /// uses, seen from the other end. `inks` is the ring and its halo. `stroke_bearing`
+    /// is the direction the stroke in flight was last laid along, if there is one.
+    ///
+    /// **Drawn in the middle of the viewport while a brush control is being worked**
+    /// (`adjusting`), even though the pointer is then over the panel and not the
+    /// picture. That is the one case where "draw the cursor where the cursor is" gives
+    /// you nothing: reaching Radius means leaving the image, so the nib you are sizing
+    /// is exactly the thing you cannot see. See `App::brush_adjusting`.
+    ///
+    /// **The centre rather than where the pointer last was**, which is the maintainer's
+    /// call. The remembered position is wherever you happened to leave the picture on
+    /// the way to the panel — often a corner, sometimes under the panel you are now
+    /// working in — so the ghost appeared somewhere arbitrary and occasionally out of
+    /// sight. The centre is always visible, always the same place, and is where you
+    /// look while judging a size.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a cursor drawn on the canvas needs the canvas, the pointer and the whole of the brush it draws"
+    )]
+    fn brush_cursor(
+        ui: &egui::Ui,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        pointer: Option<egui::Pos2>,
+        adjusting: bool,
+        brush: &paint::Brush,
+        r: f32,
+        inks: (egui::Color32, egui::Color32),
+        stroke_bearing: Option<f32>,
+    ) {
+        let (ink, halo) = inks;
         let ghost = pointer.is_none();
-        if let Some(p) = pointer.or(self.brush_adjusting.then(|| rect.center())) {
-            // Only hide the system cursor when the pointer is actually over the
-            // picture — hiding it while it is over a slider would lose it.
-            if !ghost {
-                ctx.set_cursor_icon(egui::CursorIcon::None);
-            }
-            let r = brush.radius * lw * view_scale / ppp;
-            // Dodge light, burn dark, eraser ruby — see `theme::INK_LIGHT`.
-            let (ink, halo) = match (sign, alt) {
-                (_, true) => (theme::RUBY, theme::INK_DARK),
-                (raw_core::Sign::Dodge, _) => (theme::INK_LIGHT, theme::INK_DARK),
-                (raw_core::Sign::Burn, _) => (theme::INK_DARK, theme::INK_LIGHT),
-            };
-            let painter = ui.painter();
+        let Some(p) = pointer.or(adjusting.then(|| rect.center())) else {
+            return;
+        };
+        // Only hide the system cursor when the pointer is actually over the
+        // picture — hiding it while it is over a slider would lose it.
+        if !ghost {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+        let painter = ui.painter();
 
-            // **The cursor draws the nib, not a circle.** It is the only thing that
-            // says what the brush currently is, and an elliptical or card-shaped
-            // brush with a round cursor cannot be aimed. While the nib follows the
-            // stroke it is drawn at the last direction it was laid along, so it
-            // rotates as you draw rather than lying about being axis-aligned.
-            let angle = match (brush.follow, tab.mode.grab()) {
-                (
-                    true,
-                    Some(tabs::PaintGrab::Stroke {
-                        bearing: Some(b), ..
-                    }),
-                ) => b,
-                (true, _) => 0.0,
-                _ => brush.angle,
+        // **The cursor draws the nib, not a circle.** It is the only thing that
+        // says what the brush currently is, and an elliptical or card-shaped
+        // brush with a round cursor cannot be aimed. While the nib follows the
+        // stroke it is drawn at the last direction it was laid along, so it
+        // rotates as you draw rather than lying about being axis-aligned.
+        let angle = match (brush.follow, stroke_bearing) {
+            (true, Some(b)) => b,
+            (true, None) => 0.0,
+            _ => brush.angle,
+        };
+        let outline = |scale: f32| -> Vec<egui::Pos2> {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let turn = |ex: f32, ey: f32| {
+                p + egui::vec2(ex * cos - ey * sin, ex * sin + ey * cos) * scale
             };
-            let outline = |scale: f32| -> Vec<egui::Pos2> {
-                let (sin, cos) = angle.to_radians().sin_cos();
-                let turn = |ex: f32, ey: f32| {
-                    p + egui::vec2(ex * cos - ey * sin, ex * sin + ey * cos) * scale
+            match brush.nib {
+                raw_core::dodgeburn::Nib::Card => vec![
+                    turn(-r, -r * brush.aspect),
+                    turn(r, -r * brush.aspect),
+                    turn(r, r * brush.aspect),
+                    turn(-r, r * brush.aspect),
+                    turn(-r, -r * brush.aspect),
+                ],
+                _ => (0..=48)
+                    .map(|i| {
+                        let t = i as f32 / 48.0 * std::f32::consts::TAU;
+                        turn(r * t.cos(), r * brush.aspect * t.sin())
+                    })
+                    .collect(),
+            }
+        };
+        let ring = outline(1.0);
+        for (w, c) in [(2.0, halo), (1.0, ink)] {
+            painter.add(egui::Shape::line(ring.clone(), egui::Stroke::new(w, c)));
+        }
+
+        // **The feather, as where full strength ends.** The outer ring is where
+        // paint ends and this is where the fade begins, Lightroom's two circles,
+        // and both are exactly what a dab paints: the core falloff is full strength
+        // inside the one and nothing outside the other. At Feather 1.0 the fade
+        // starts in the middle and there is no inner circle to draw.
+        if let Some(core) = raw_core::dodgeburn::Dab::core_radius(brush.feather)
+            .filter(|core| *core * r >= 2.0)
+        {
+            painter.add(egui::Shape::dashed_line(
+                &outline(core),
+                egui::Stroke::new(1.0, theme::FEATHER_GUIDE),
+                4.0,
+                4.0,
+            ));
+        }
+        // A centre mark, because a soft brush at a large radius gives no clue
+        // where its middle is.
+        painter.circle_filled(p, 1.5, ink);
+    }
+
+    /// A Curve pass's mask on the picture: a gradient's handles and the drag that lays it
+    /// again, or the brush that paints a painted one.
+    ///
+    /// **A gradient** has Dodge & Burn's gradient gesture unchanged: a press on a handle
+    /// takes it, a press on empty canvas lays the shape again from there (keeping its
+    /// Transition and ellipse; see `curve_mask::relay`), and the drag that follows is the
+    /// same drag that moves a handle. The handles are `paint::handles` and the overlay is
+    /// `gradient_overlay`.
+    ///
+    /// **A painted mask** has Dodge & Burn's brush unchanged: a drag lays a pass of dabs
+    /// at the brush's spacing (`paint::extend_pass`), `⌥` erases, and `⇧`-click draws a
+    /// straight pass from where the last one ended. The cursor is `brush_cursor`. What
+    /// it does not have is a sign or an Intensity: a pass paints the mask or erases it,
+    /// and the curve says how far a tone moves.
+    ///
+    /// Either way the two modules cannot look or behave differently, because it is the
+    /// same code.
+    ///
+    /// **No keys of its own** beyond the brush's brackets, which is a decision and not
+    /// an omission: `Esc` and `Return` leave it as they leave every on-image tool, and
+    /// Space pans.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an on-canvas tool needs the painter's rect, the view transform and the frame it draws over, all from the caller's layout"
+    )]
+    fn curve_mask_tool(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        ppp: f32,
+        view_off: egui::Vec2,
+        view_scale: f32,
+        frame: &raw_core::Frame,
+    ) {
+        let brush_pan = self.brush_pan;
+        let brush = self.brush;
+        let adjusting = self.brush_adjusting;
+        let Some(tab) = self.tabs.active_mut() else {
+            return;
+        };
+        let Some(instance) = tab.mode.curve_mask_instance() else {
+            return;
+        };
+        let Some(luma) = tab.luma.as_ref() else {
+            return;
+        };
+        let (lw, lh) = (luma.output_dims.w as f32, luma.output_dims.h as f32);
+        let aspect = lh / lw;
+
+        // The pass or its mask can be gone under the tool — an undo across a deletion
+        // does it — and a tool with nothing to edit has nothing to draw.
+        let Some(shape) = tab
+            .params
+            .curve
+            .instances
+            .get_mut(instance)
+            .and_then(|i| i.mask.as_mut())
+            .and_then(|m| m.shape.as_mut())
+        else {
+            tab.mode = tabs::Mode::View;
+            return;
+        };
+
+        if brush_pan {
+            // A drag cannot stay live across a pan, for the reason a stroke cannot.
+            if let tabs::Mode::CurveMask { grab, .. } = &mut tab.mode {
+                *grab = None;
+            }
+            if ctx
+                .input(|i| i.pointer.latest_pos())
+                .is_some_and(|p| rect.contains(p))
+            {
+                let dragging = ctx.input(|i| i.pointer.primary_down());
+                ctx.set_cursor_icon(if dragging {
+                    egui::CursorIcon::Grabbing
+                } else {
+                    egui::CursorIcon::Grab
+                });
+            }
+            return;
+        }
+
+        let pointer = ctx
+            .input(|i| i.pointer.latest_pos())
+            .filter(|p| rect.contains(*p));
+        let (down, pressed) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_pressed()));
+
+        // Screen point -> the negative, normalized; `None` outside the stored image,
+        // which after a straighten is a real part of the frame: a press there would be
+        // recorded at a coordinate no pixel can ever read.
+        let to_negative = |p: egui::Pos2| -> Option<(f32, f32)> {
+            let f = view_off + (p - rect.min) * ppp / view_scale;
+            let (sx, sy) = frame.to_source(f.x, f.y);
+            (sx >= 0.0 && sy >= 0.0 && sx < lw && sy < lh).then(|| (sx / lw, sy / lh))
+        };
+        // And back: what puts a handle on the picture it describes.
+        let to_screen = |at: (f32, f32)| -> egui::Pos2 {
+            let (fx, fy) = frame.from_source(at.0 * lw, at.1 * lh);
+            rect.min + (egui::vec2(fx, fy) - view_off) * view_scale / ppp
+        };
+
+        // Hit-tested in SCREEN points, so a handle is the same size to grab however far
+        // you are zoomed out.
+        const HANDLE_HIT: f32 = 9.0;
+        let placed = paint::handles(shape, aspect);
+        let over_handle = |p: egui::Pos2| -> Option<paint::End> {
+            let (from, to) = placed?;
+            // `To` first: on a shape just laid the two coincide, and the far end is the
+            // one the drag is about.
+            [(paint::End::To, to), (paint::End::From, from)]
+                .into_iter()
+                .find(|(_, at)| to_screen(*at).distance(p) <= HANDLE_HIT)
+                .map(|(e, _)| e)
+        };
+
+        let (alt, shift) = ctx.input(|i| (i.modifiers.alt, i.modifiers.shift));
+        // A mask is painted in the positive direction: a pass that paints carries a
+        // positive `ev` and an eraser pass a negative one, which is all a mask reads.
+        const PAINTS: raw_core::Sign = raw_core::Sign::Dodge;
+        let painted = matches!(shape, raw_core::dodgeburn::Shape::Brush { .. });
+
+        let mut grab = tab.mode.curve_mask_grab();
+        if pressed && let Some(at) = pointer.and_then(to_negative) {
+            if painted {
+                let erasing = alt;
+                // `⇧`-click draws a straight pass from wherever the last one ended to
+                // here, as on a layer: from the last dab and not the last pointer
+                // position, which has been panning and zooming since.
+                let from = shift
+                    .then(|| shape.passes().last())
+                    .flatten()
+                    .and_then(|pass| pass.dabs.last())
+                    .map(|d| (d.x, d.y));
+                paint::begin_pass(shape, PAINTS, &brush, from.unwrap_or(at), erasing);
+                let (last, bearing) = match from {
+                    Some(from) => {
+                        paint::extend_pass(shape, PAINTS, &brush, from, at, aspect, erasing)
+                    }
+                    None => (at, None),
                 };
-                match brush.nib {
-                    raw_core::dodgeburn::Nib::Card => vec![
-                        turn(-r, -r * brush.aspect),
-                        turn(r, -r * brush.aspect),
-                        turn(r, r * brush.aspect),
-                        turn(-r, r * brush.aspect),
-                        turn(-r, -r * brush.aspect),
-                    ],
-                    _ => (0..=48)
-                        .map(|i| {
-                            let t = i as f32 / 48.0 * std::f32::consts::TAU;
-                            turn(r * t.cos(), r * brush.aspect * t.sin())
-                        })
-                        .collect(),
+                grab = Some(tabs::PaintGrab::Stroke {
+                    last,
+                    erasing,
+                    bearing,
+                });
+            } else {
+                match pointer.and_then(over_handle) {
+                    Some(end) => grab = Some(tabs::PaintGrab::Handle(end)),
+                    None => {
+                        // Placement and adjustment are one gesture: the press lays the
+                        // shape again under the cursor and grabs its far end.
+                        curve_mask::relay(shape, at);
+                        grab = Some(tabs::PaintGrab::Handle(paint::End::To));
+                    }
                 }
-            };
-            let ring = outline(1.0);
-            for (w, c) in [(2.0, halo), (1.0, ink)] {
-                painter.add(egui::Shape::line(ring.clone(), egui::Stroke::new(w, c)));
             }
+        } else if down
+            && let Some(held) = grab
+            && let Some(at) = pointer.and_then(to_negative)
+        {
+            match held {
+                tabs::PaintGrab::Handle(end) => paint::move_handle(shape, end, at, aspect),
+                tabs::PaintGrab::Stroke {
+                    last,
+                    erasing,
+                    bearing,
+                } => {
+                    let (last, laid) =
+                        paint::extend_pass(shape, PAINTS, &brush, last, at, aspect, erasing);
+                    // The last direction is kept when a frame lays no dabs, so a
+                    // following nib does not snap back every time the pointer pauses.
+                    grab = Some(tabs::PaintGrab::Stroke {
+                        last,
+                        erasing,
+                        bearing: laid.or(bearing),
+                    });
+                }
+            }
+        }
+        if !down {
+            // Released. Nothing to commit: every dab and every move went onto `params`
+            // as it happened, and history coalesces the drag into one entry.
+            grab = None;
+        }
 
-            // **The feather, as the actual half-strength contour.** Sigma is not
-            // that contour: at the default Feather 0.40 it lies almost on the solid
-            // outer ring, which made a very soft brush look hard and made 0–0.40
-            // appear to do nothing. The CPU solves the rendered profile itself, so
-            // this guide cannot drift away from what a dab paints.
-            if let Some(half) = raw_core::dodgeburn::Dab::half_strength_radius(brush.feather) {
-                painter.add(egui::Shape::dashed_line(
-                    &outline(half),
-                    egui::Stroke::new(1.0, theme::FEATHER_GUIDE),
-                    4.0,
-                    4.0,
-                ));
-            }
-            // A centre mark, because a soft brush at a large radius gives no clue
-            // where its middle is.
-            painter.circle_filled(p, 1.5, ink);
+        if let Some((from, to)) = paint::handles(shape, aspect) {
+            let radial = match &*shape {
+                raw_core::dodgeburn::Shape::Radial(r) => Some(*r),
+                _ => None,
+            };
+            Self::gradient_overlay(ui, &to_screen, from, to, radial, aspect);
+        }
+        let stroke_bearing = match grab {
+            Some(tabs::PaintGrab::Stroke { bearing, .. }) => bearing,
+            _ => None,
+        };
+        if let tabs::Mode::CurveMask { grab: slot, .. } = &mut tab.mode {
+            *slot = grab;
+        }
+        if painted {
+            // The brush's own cursor: light, as a dodge's is, and ruby while it erases.
+            let inks = if alt {
+                (theme::RUBY, theme::INK_DARK)
+            } else {
+                (theme::INK_LIGHT, theme::INK_DARK)
+            };
+            let r = brush.radius * lw * view_scale / ppp;
+            Self::brush_cursor(ui, ctx, rect, pointer, adjusting, &brush, r, inks, stroke_bearing);
+        } else if pointer.is_some() {
+            // A crosshair, not a ring: a gradient has no radius.
+            ctx.set_cursor_icon(match pointer.and_then(over_handle) {
+                Some(_) => egui::CursorIcon::Grab,
+                None => egui::CursorIcon::Crosshair,
+            });
         }
     }
 

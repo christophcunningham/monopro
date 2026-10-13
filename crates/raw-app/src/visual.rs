@@ -280,6 +280,269 @@ fn export() {
     scene_export(Ground::Dark);
 }
 
+/// One corpus raw, cloned into a folder of this scene's own, for a scene that edits
+/// the picture. **The app saves a sidecar beside whatever it opened** when the
+/// parameters differ from the saved ones, so a scene that moves a slider on the
+/// corpus file itself leaves a `.mono.xmp` in the photographer's own folder and
+/// changes how the file opens in their app. A copy takes the sidecar instead.
+fn raw_copy(file: &str, scene: &str) -> Option<PathBuf> {
+    let from = raw(file)?;
+    let dir = workspace().join("target/visual-fixtures").join(scene);
+    std::fs::create_dir_all(&dir).ok()?;
+    let to = dir.join(file);
+    if !to.exists() {
+        reflink_copy::reflink_or_copy(&from, &to).ok()?;
+    }
+    // **A scene starts from the photograph and nothing else.** The folder outlives the
+    // run and the app saves a sidecar into it, so without this the second run opens the
+    // first one's edits and draws a picture that depends on what ran before it.
+    let _ = std::fs::remove_file(raw_core::sidecar::path_for(&to));
+    Some(to)
+}
+
+/// Develop with CURVE open and a mask on the picture: the Mask flag on each row, the
+/// shapes of the selected one, the MASK group, and the tool's handles over the
+/// photograph. Tall, so the whole module is on screen.
+///
+/// The first pass is masked by a sky grad and left unselected, so its icon shows what a
+/// closed row says; the second is the selected one, with the tool open on a radial and a
+/// tone range inside it.
+fn scene_curve_mask(ground: Ground, look: Option<raw_gpu::MaskLook>) {
+    use crate::paint::Pick;
+    use raw_core::curve::CurveMask;
+
+    let _turn = one_at_a_time();
+    let name = format!(
+        "curve-mask{}{}",
+        match look {
+            None => "",
+            Some(raw_gpu::MaskLook::Overlay) => "-overlay",
+            Some(raw_gpu::MaskLook::Mask) => "-view",
+        },
+        ground.suffix()
+    );
+    let Some(path) = raw_copy("L1000016.DNG", &name) else {
+        eprintln!("{name}: skipped, no corpus raw L1000016.DNG");
+        return;
+    };
+    crate::widgets::open_for_a_test("CURVE");
+    ground
+        .settings()
+        .save()
+        .expect("write settings into the isolated test storage");
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(crate::device_descriptor);
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(SIZE.x, 1900.0))
+        .with_pixels_per_point(2.0)
+        .with_os(egui::os::OperatingSystem::Mac)
+        .with_max_steps(64)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(move |cc| App::new(cc, Some(path)));
+    settle(&mut h, &name, develop_ready);
+    assert!(
+        develop_ready(h.state()),
+        "{name}: the photograph never arrived"
+    );
+
+    {
+        let tab = h.state_mut().tabs.active_mut().expect("a tab");
+        let frame = tab.frame().expect("a frame");
+        let size = tab
+            .luma
+            .as_ref()
+            .map(|l| (l.output_dims.w as f32, l.output_dims.h as f32))
+            .expect("the working image");
+        let sky = crate::curve_mask::starting_shape(Pick::Linear, &frame, size);
+        let spot = crate::curve_mask::starting_shape(Pick::Radial, &frame, size);
+        let curve = &mut tab.params.curve;
+        curve.instances[0].curve.add(0.5, 0.68);
+        curve.instances[0].mask = Some(CurveMask::of_shape(sky));
+        let second = curve.add_instance().expect("room for a second curve");
+        curve.instances[second].curve.add(0.4, 0.3);
+        curve.instances[second].opacity = 0.7;
+        curve.instances[second].mask = Some(CurveMask::of_shape(spot));
+        // A tone range inside the radial, so the Tone section, its ruler and the Join chips
+        // are all on screen.
+        if let Some(mask) = &mut curve.instances[second].mask {
+            mask.tone = Some(raw_core::dodgeburn::ZoneMask {
+                enabled: true,
+                lo: -2.0,
+                hi: 1.0,
+                f_lo: 1.0,
+                f_hi: 1.25,
+                ..Default::default()
+            });
+        }
+        tab.curve_active = second;
+        tab.mask_pin = look.map(|look| (crate::tabs::MaskOwner::Curve, look));
+        // The tool's handles over the plain picture; a pinned look is drawn without
+        // them, as it is when the mask is looked at and not adjusted.
+        if look.is_none() {
+            tab.mode = crate::tabs::Mode::curve_mask(second, tab.params.curve.clone());
+        }
+    }
+    settle(&mut h, &name, |_| true);
+    save(&mut h, &name);
+}
+
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn curve_mask() {
+    scene_curve_mask(Ground::Dark, None);
+}
+
+/// The same scene with the mask kept on the picture, each way: red film over what the
+/// selected instance's mask protects, and the mask alone in the picture's place.
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn curve_mask_overlay() {
+    scene_curve_mask(Ground::Dark, Some(raw_gpu::MaskLook::Overlay));
+}
+
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn curve_mask_view() {
+    scene_curve_mask(Ground::Dark, Some(raw_gpu::MaskLook::Mask));
+}
+
+/// A tone island: a range set on the sea and limited to what is connected to its seed,
+/// so the cliff's rock of the same tones is left out. The eyedropper is armed, which is
+/// when the seed is drawn on the picture, and the film is up to show what the island
+/// kept.
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn curve_mask_island() {
+    use crate::tabs::ToneTarget;
+
+    let _turn = one_at_a_time();
+    let name = "curve-mask-island";
+    let Some(path) = raw_copy("L1000016.DNG", name) else {
+        eprintln!("{name}: skipped, no corpus raw L1000016.DNG");
+        return;
+    };
+    crate::widgets::open_for_a_test("CURVE");
+    Ground::Dark
+        .settings()
+        .save()
+        .expect("write settings into the isolated test storage");
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(crate::device_descriptor);
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(SIZE.x, 1900.0))
+        .with_pixels_per_point(2.0)
+        .with_os(egui::os::OperatingSystem::Mac)
+        .with_max_steps(64)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(move |cc| App::new(cc, Some(path)));
+    settle(&mut h, name, develop_ready);
+    assert!(develop_ready(h.state()), "{name}: the photograph never arrived");
+
+    {
+        let tab = h.state_mut().tabs.active_mut().expect("a tab");
+        tab.params.curve.instances[0].curve.add(0.45, 0.6);
+        crate::curve_mask::flip_tone(&mut tab.params.curve.instances[0]);
+        let tone = tab
+            .tone_range_mut(ToneTarget::Curve(0))
+            .expect("the tone part just switched on");
+        // The sea's tones, read per pixel, and one seed out on the water.
+        tone.lo = -1.4;
+        tone.hi = -0.4;
+        tone.edge_aware = false;
+        tone.island.enabled = true;
+        assert!(tone.island.set((0.4, 0.77)));
+        tab.mask_pin = Some((crate::tabs::MaskOwner::Curve, raw_gpu::MaskLook::Overlay));
+        tab.ask_tone_sampler(ToneTarget::Curve(0), crate::widgets::SamplerAsk::Arm);
+        // The section was drawn closed while the curve had no mask; open it, so the
+        // range and its Island switch are on screen.
+        tab.curve_mask_reveal = Some(0);
+    }
+    settle(&mut h, name, |_| true);
+    save(&mut h, name);
+}
+
+/// A painted mask: the brush open on a curve whose mask is strokes, with the film up so
+/// what has been painted shows. Two passes and an eraser pass through the first, so the
+/// MASK section's brush controls, the cursor's absence at rest and the histogram inside
+/// the paint are all on screen.
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn curve_mask_painted() {
+    use raw_core::curve::CurveMask;
+    use raw_core::dodgeburn::{Dab, Gesture, Nib, Shape};
+
+    let _turn = one_at_a_time();
+    let name = "curve-mask-painted";
+    let Some(path) = raw_copy("L1000016.DNG", name) else {
+        eprintln!("{name}: skipped, no corpus raw L1000016.DNG");
+        return;
+    };
+    crate::widgets::open_for_a_test("CURVE");
+    Ground::Dark
+        .settings()
+        .save()
+        .expect("write settings into the isolated test storage");
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(crate::device_descriptor);
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(SIZE.x, 1900.0))
+        .with_pixels_per_point(2.0)
+        .with_os(egui::os::OperatingSystem::Mac)
+        .with_max_steps(64)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(move |cc| App::new(cc, Some(path)));
+    settle(&mut h, name, develop_ready);
+    assert!(develop_ready(h.state()), "{name}: the photograph never arrived");
+
+    {
+        let stroke = |from: (f32, f32), to: (f32, f32), paint: bool| {
+            // As close together as the brush lays them, a quarter of the radius, so the
+            // pass reads as a stroke and not as beads.
+            Gesture::new(
+                (0..=40)
+                    .map(|i| {
+                        let t = i as f32 / 40.0;
+                        Dab {
+                            x: from.0 + (to.0 - from.0) * t,
+                            y: from.1 + (to.1 - from.1) * t,
+                            radius: 0.07,
+                            feather: 0.5,
+                            opacity: 1.0,
+                            ev: if paint { 1.0 } else { -1.0 },
+                            ..Dab::ROUND
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        let tab = h.state_mut().tabs.active_mut().expect("a tab");
+        let curve = &mut tab.params.curve;
+        curve.instances[0].curve.add(0.45, 0.6);
+        curve.instances[0].mask = Some(CurveMask::of_shape(Shape::Brush {
+            nib: Nib::Round,
+            passes: vec![
+                stroke((0.2, 0.35), (0.75, 0.3), true),
+                stroke((0.3, 0.7), (0.8, 0.75), true),
+                stroke((0.5, 0.2), (0.45, 0.5), false),
+            ],
+        }));
+        tab.curve_active = 0;
+        tab.mask_pin = Some((crate::tabs::MaskOwner::Curve, raw_gpu::MaskLook::Overlay));
+        // The section was drawn closed before the mask was put here; open it, as a pick
+        // would have found it.
+        tab.curve_mask_reveal = Some(0);
+        tab.mode = crate::tabs::Mode::curve_mask(0, tab.params.curve.clone()).with_brush(true);
+    }
+    settle(&mut h, name, |_| true);
+    save(&mut h, name);
+}
+
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn curve_mask_light() {
+    scene_curve_mask(Ground::Light, None);
+}
+
 #[test]
 #[ignore = "draws with the GPU and the private corpus; see the module note"]
 fn lightbox() {
@@ -342,11 +605,27 @@ fn lightbox_metadata() {
 #[test]
 #[ignore = "draws with the GPU and the private corpus; see the module note"]
 fn dodgeburn() {
+    scene_dodgeburn(None);
+}
+
+/// The same stack with the selected layer's mask kept on the picture as red film: the
+/// radial through its tone mask, drawn by the code that draws a Curve's.
+#[test]
+#[ignore = "draws with the GPU and the private corpus; see the module note"]
+fn dodgeburn_overlay() {
+    scene_dodgeburn(Some(raw_gpu::MaskLook::Overlay));
+}
+
+fn scene_dodgeburn(look: Option<raw_gpu::MaskLook>) {
     use raw_core::Sign;
     use raw_core::dodgeburn::{Instance, Linear, Nib, Radial, Shape, ZoneMask};
 
     let _turn = one_at_a_time();
-    let name = "dodgeburn";
+    let name = if look.is_some() {
+        "dodgeburn-overlay"
+    } else {
+        "dodgeburn"
+    };
     let Some(src) = raw("L1000016.DNG") else {
         eprintln!("{name}: skipped, no corpus raw L1000016.DNG");
         return;
@@ -414,8 +693,11 @@ fn dodgeburn() {
         );
         let db = &mut tab.params.dodgeburn;
         db.instances = vec![sky, face, edge];
-        // Newest is drawn first, so the open layer is the middle row.
-        tab.db_active = Some(1);
+        // Newest is drawn first, so the open layer is the middle row. With the film up it
+        // is the sky's instead: a grad through the highlights, which selects something
+        // to see, where the radial in the middle of the frame has no highlights in it.
+        tab.db_active = Some(if look.is_some() { 0 } else { 1 });
+        tab.mask_pin = look.map(|look| (crate::tabs::MaskOwner::Layer, look));
     }
     settle(&mut h, name, |_| true);
     save(&mut h, name);
