@@ -123,6 +123,9 @@ These are scope decisions, not gaps.
   monopro stays in front, such as tethered captures, appear on the next of those.
   A file watcher would not see changes another machine makes on a network volume,
   which is where it would matter most.
+- **Quick Look shows the camera's preview.** Space opens the camera's embedded JPEG
+  full-frame, not your edit, so a developed or toned picture looks as it was shot
+  there. The grid's developed previews are the place to see edits in Lightbox.
 
 ## Toning
 

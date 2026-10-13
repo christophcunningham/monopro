@@ -8,8 +8,9 @@ directly from the camera's sensor data. Every edit starts from the light your ca
 recorded, before any color rendering or tone curve is applied.
 
 Lightbox is where you review and organize your files. Develop handles global
-adjustments, Dodge / Burn handles local ones, and Toning adds color modeled on
-historical print processes and toners.
+adjustments, and any Curve in it can be limited to part of the picture by a gradient,
+a painted mask or a range of tones. Dodge / Burn handles local exposure, and Toning
+adds color modeled on historical print processes and toners.
 
 monopro is designed to feel familiar to photographers who use other RAW editors,
 while offering a keyboard-driven interface, panels you can arrange, dock and float,
@@ -22,26 +23,33 @@ In development. A website with further documentation and a manual is in progress
 
 ## Getting started
 
-[Download for macOS](https://github.com/christophcunningham/monopro/releases/download/v0.2.1/monopro-0.2.1.dmg)
-— version 0.2.1, Apple Silicon and Intel. Open the `.dmg`, drag **monopro.app** to
+[Download for macOS](https://github.com/christophcunningham/monopro/releases/download/v0.2.5/monopro-0.2.5.dmg)
+— version 0.2.5, Apple Silicon and Intel. Open the `.dmg`, drag **monopro.app** to
 **Applications**, eject the disk image, and launch the installed app.
 
 This build is not notarized by Apple. The first time you open it, macOS may say it
 cannot verify the developer; if you trust this download, open **System Settings →
 Privacy & Security** and click **Open Anyway**. Later updates install from inside
 the app. See the
-[release notes](https://github.com/christophcunningham/monopro/releases/tag/v0.2.1)
+[release notes](https://github.com/christophcunningham/monopro/releases/tag/v0.2.5)
 for what changed.
 
 Windows and Linux packages are in preparation. [Build from source](#build) to run
 the current source version.
 
-In Lightbox, select a folder of RAW images in the folder tree. Double-click an image
-to open it in Develop. Use the modules, Dodge / Burn brushes, and Toning to edit
-before exporting. Use Inspector to read values, snapshots to compare edits, and
-history to undo or redo changes.
+With nothing open, monopro shows a start page: your recent folders in Lightbox, your
+recent images in Develop. The Home button at the right of the title strip, or ⌥H,
+brings it back at any time without closing anything.
 
-Press `,` for Settings and `.` for the hotkey reference.
+In Lightbox, select a folder of RAW images in the folder tree. Double-click an image
+to open it in Develop. Use the modules, Curve masks, Dodge / Burn, and Toning to edit
+before exporting. Use Inspector to read values, snapshots to compare edits, and
+history to undo or redo changes. Ratings and color labels work in both modes:
+`⌘1`–`⌘5` and `⇧1`–`⇧5`.
+
+Press `,` for Settings and `.` for the keyboard shortcuts. On a trackpad, Settings →
+Controls → Scrolling decides whether two fingers pan the picture or zoom it; a pinch
+always zooms.
 
 The same program runs without its window, for scripts and batch work:
 
@@ -59,8 +67,8 @@ command line.
 On macOS the app checks the stable release feed once a day, quietly: nothing
 appears while it is current, a badge appears at the right of the title strip
 when an update exists, and clicking it offers *Update on quit* (default),
-*Restart now*, or *Skip this version*. Settings → About has the preference and
-the manual check.
+*Restart now*, or *Skip this version*. Settings → About has the preference, and a
+manual check that reports your version and the result in place.
 
 ## Lightbox
 
@@ -69,13 +77,49 @@ and manual ordering. Search covers filenames and IPTC metadata. Lightbox also su
 metadata editing and templates, copying develop settings, batch renaming, and PDF
 contact sheets.
 
+Its panels (Folders, Search, Metadata and Favorites) can be rearranged, tucked off
+the edge of the window, closed, or popped out into windows of their own, as
+Develop's can. The arrow keys move through the grid, or through the folder tree once
+a folder has been clicked; Space opens the selected picture full-frame. With
+Settings → Lightbox → Show developed previews, edited pictures appear as their
+developed render, toning included, rather than the camera's own preview.
+
 ## Develop modules
 
 Decode · Luminance · Exposure · Contrast Mask · Curve · Tonal Transform · Grain ·
 Sharpening · Composition · Output · Frame · Export
 
 Dodge / Burn and Toning have separate panels. Inspector pins, snapshots, comparison
-views, and the print loupe provide measurement and review tools.
+views, and the print loupe provide measurement and review tools; the loupe shows the
+export's grain, toning and sharpening at the print's own scale. Black Corr. reads as
+the L* that goes to black, as the picture shows it.
+
+## Local adjustments
+
+**Curve masks.** Any Curve instance can be limited to part of the picture from the
+MASK section inside it: a Linear or Radial gradient placed and adjusted on the
+picture, a mask painted with the Round or Card brush, a range of tones, or a shape
+and a tone range joined by Intersect, Subtract or Add. With a mask, the curve
+editor's histogram and Average are taken inside it, so the graph shows the tones the
+curve actually reaches. The point sampler places a point at the tone you click,
+shows where it will land as you move over the picture, and can limit the instance
+to that tone in the same click.
+
+**Dodge / Burn.** Layers of exposure change, each a brushed mask (Round or Card), a
+Linear gradient or a Radial one, with Strength, Contrast and opacity per layer. The
+brush paints at full strength inside its inner circle and fades to the outer one;
+Feather sets how much of it fades, as in Lightroom.
+
+**Tone masks**, the same in both: a range of tones set on a ruler of print values,
+with Shadows, Midtones and Highlights presets and eight softer ones after Tony
+Kuyper's Lights and Darks (L1–L4, D1–D4). A range can be sampled from the picture
+with the eyedropper, by clicking a tone or dragging a box over several, and can be
+an island: only the tones connected to the places you click, so a range set on the
+sea leaves out rock of the same gray. Edge and diffusion soften a range the way
+masks were printed unsharp, optionally stopping at strong edges.
+
+Any mask can be seen on the picture, either as red film over what it protects
+(*overlay*, or `/`) or on its own (*view mask*).
 
 ## Pipeline
 
@@ -104,10 +148,17 @@ wgpu. Inactive curve and masking stages are omitted; cached intermediates are re
 - **Exposure:** `Y′ = (Y − black_correction) × 2^EV`.
 - **Contrast mask:** Gaussian filtering in log₂ space. The blurred signal is subtracted
   around an 18% gray pivot to compress local tonal range.
-- **Dodge / burn:** layered exposure adjustments with brush masks, tonal-range masks,
-  and local contrast controls.
-- **Curves:** Fritsch–Carlson monotone cubic interpolation in a log₂ exposure domain.
-  The curve stack is composed into a 65,536-entry lookup table.
+- **Dodge / burn:** layered exposure adjustments, each confined by a brushed mask or a
+  linear or radial gradient and optionally by a tonal-range mask, with local contrast
+  controls.
+- **Curves:** Fritsch–Carlson monotone cubic interpolation in a log₂ exposure domain,
+  baked into a 65,536-entry lookup table. An instance with a mask `m` is applied as
+  `y = x + (f(x) − x) × opacity × m`, so the mask scales how far a tone moves, never
+  where it moves to.
+- **Tone masks:** prepared off the UI thread on a reduced proxy of the picture as it
+  stands before dodge and burn, with optional diffusion, edge-aware smoothing, and
+  island growth from up to eight seeds, then cut at every pixel as the picture is
+  rendered.
 - **Tonal transform:** clipping, an exponential soft shoulder, or a monochrome AgX
   sigmoid maps scene values into the output range.
 

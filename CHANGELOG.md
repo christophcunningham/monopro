@@ -16,6 +16,18 @@ changes belong in [docs/known-limitations.md](docs/known-limitations.md).
 
 ## Unreleased
 
+## 0.2.5 — 2026-10-13
+
+This release lets any Curve instance be limited to part of the picture, by a
+gradient, a painted mask, a range of tones or a tone island, and brings the same tone
+ranges, islands and eyedropper to Dodge & Burn, with Lightroom-style brush feathering
+and softer Lights and Darks presets. Around them: a start page with your recent
+folders and images, ratings and labels in Develop, Lightbox panels that close and pop
+out, the folder tree on the arrow keys, toning in the print loupe and in developed
+thumbnails, a clearer mask overlay, and quicker selection in Lightbox. Photographs
+that use the new masks are saved as sidecar version 19, which monopro 0.2.1 and
+earlier will not open; every other photograph stays at version 18.
+
 New
 - A Curve instance can be limited to part of the picture. Select an instance and open
   its MASK section, which sits inside the instance between its red rules, and pick
