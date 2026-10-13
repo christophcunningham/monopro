@@ -1151,7 +1151,7 @@ pub struct Instance {
 }
 
 impl Instance {
-    /// An empty brush instance — what `⌘D` and `⌘X` make.
+    /// An empty brush instance — what `⌘⇧D` and `⌘⇧X` make.
     pub fn new(sign: Sign, name: String) -> Self {
         Self::of(
             sign,

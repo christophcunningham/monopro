@@ -1501,6 +1501,15 @@ fn fitted_picture_view(frame: &raw_core::Frame, edge: u32) -> (u32, u32, ViewGeo
     )
 }
 
+/// What a rating or label key asks of the picture Develop is holding. See
+/// `App::mark_open_picture`.
+#[derive(Clone, Copy)]
+enum Mark {
+    Rating(i32),
+    /// A name from `theme::LABELS`.
+    Label(&'static str),
+}
+
 /// One developed frame, decoded off-thread and waiting for the GPU.
 struct DevelopedTile {
     path: PathBuf,
@@ -1683,6 +1692,62 @@ impl App {
         self.lightbox.reveal_pane(pane);
     }
 
+    /// Rate or label the picture in front of you in Develop: `⌘1`–`⌘5` and `⇧1`–`⇧5`.
+    ///
+    /// **One tile's rule**: the star count or label the picture already carries comes
+    /// off, anything else is set, so the key that put it on takes it off. Written to the
+    /// sidecar at once, by the same path Lightbox writes with, because the sidecar is
+    /// where a rating lives and closing the laptop must not lose it. Read from disk
+    /// first rather than from the tab, which Lightbox may have overtaken.
+    ///
+    /// A scratch duplicate has no sidecar of its own, and writing the original's would
+    /// rate a different picture. Its marks wait in the tab and go out with Save
+    /// Duplicate, as its edits do.
+    fn mark_open_picture(&mut self, mark: Mark) {
+        if self.home_showing() {
+            return;
+        }
+        let Some(tab) = self.tabs.active_mut() else {
+            return;
+        };
+        let Some(path) = tab.image.as_ref().map(|img| img.path.clone()) else {
+            return;
+        };
+        let (mut rating, mut label) = (
+            tab.metadata.rating.unwrap_or(0),
+            tab.metadata.label.clone(),
+        );
+        if !tab.scratch {
+            (rating, label) = match sidecar::read(&path) {
+                sidecar::Loaded::Ok(s) => (s.metadata.rating.unwrap_or(0), s.metadata.label),
+                sidecar::Loaded::Absent => (0, None),
+                // `write_metadata` refuses these too; saying so before deciding what
+                // to toggle keeps the note about the file rather than the key.
+                sidecar::Loaded::Corrupt(why) => {
+                    self.pending_note = Some(format!(
+                        "{}: sidecar will not parse, refusing to overwrite it — {why}",
+                        file_name(&path)
+                    ));
+                    return;
+                }
+            };
+        }
+        match mark {
+            Mark::Rating(n) => rating = if rating == n { 0 } else { n.clamp(0, 5) },
+            Mark::Label(name) => {
+                label = (label.as_deref() != Some(name)).then(|| name.to_owned());
+            }
+        }
+        if !tab.scratch
+            && let Err(why) = lightbox::write_metadata(&path, rating, label.as_deref())
+        {
+            self.pending_note = Some(format!("{}: {why}", file_name(&path)));
+            return;
+        }
+        tab.metadata.rating = (rating > 0).then_some(rating);
+        tab.metadata.label = label;
+    }
+
     /// Cross into Lightbox, or back out of it.
     ///
     /// **One route, two doors.** `l` and the footer's tab strip both come here, so
@@ -1709,6 +1774,20 @@ impl App {
         if active {
             self.lightbox.refresh_edited();
             self.lightbox.refresh(false);
+        }
+        // **Going back, re-read each tab's rating and label**, which the title strip
+        // shows from the tab's copy. A star set on the grid for a frame that is open
+        // here would otherwise read as the old one until the tab was reopened.
+        if !active {
+            for t in self.tabs.iter_mut().filter(|t| !t.scratch) {
+                let Some(img) = &t.image else { continue };
+                let (rating, label) = match sidecar::read(&img.path) {
+                    sidecar::Loaded::Ok(s) => (s.metadata.rating, s.metadata.label),
+                    sidecar::Loaded::Absent => (None, None),
+                    sidecar::Loaded::Corrupt(_) => continue,
+                };
+                (t.metadata.rating, t.metadata.label) = (rating, label);
+            }
         }
         // Compare and the loupe are viewport modes and the viewport is going away.
         // Closed rather than suspended, which is what `k` and the loupe's own key
@@ -3365,8 +3444,8 @@ impl eframe::App for App {
                         }
                     }
                 }
-                // Modal: only reachable while the brush is open, which is why `⌘D`
-                // can be this and Duplicate Tab at once. See `hotkeys::Binding::modal`.
+                // Modal: only reachable while the brush is open. `⌘⇧D` / `⌘⇧X`, so they
+                // take nothing back from Duplicate Tab. See `hotkeys::Binding::modal`.
                 hotkeys::Action::NewDodge | hotkeys::Action::NewBurn => {
                     let sign = if *a == hotkeys::Action::NewDodge {
                         raw_core::Sign::Dodge
@@ -3490,10 +3569,9 @@ impl eframe::App for App {
                     }
                     self.set_lightbox(!self.lightbox.active);
                 }
-                // **Ratings and labels are the grid's, and only the grid's.** They
-                // act on the selected tile, so outside Lightbox there is nothing for
-                // them to act on — `⌘1`-`⌘5` were kept off the tab strip for exactly
-                // this, back when there was no Lightbox to give them to.
+                // **In Lightbox they act on the selection; in Develop, on the picture
+                // in front of you**, and the title strip shows the result after the
+                // exposure. See `mark_open_picture`.
                 hotkeys::Action::Rating(n) if self.lightbox.active => {
                     if let Some(why) = self.lightbox.set_rating(*n as i32) {
                         self.pending_note = Some(why);
@@ -3506,6 +3584,12 @@ impl eframe::App for App {
                         .map(|(s, _)| *s);
                     if let Some(why) = self.lightbox.set_label(name) {
                         self.pending_note = Some(why);
+                    }
+                }
+                hotkeys::Action::Rating(n) => self.mark_open_picture(Mark::Rating(*n as i32)),
+                hotkeys::Action::ColourLabel(n) => {
+                    if let Some((name, _)) = theme::LABELS.get((*n as usize).saturating_sub(1)) {
+                        self.mark_open_picture(Mark::Label(name));
                     }
                 }
                 hotkeys::Action::CopySettings if self.lightbox.active => {
@@ -3529,6 +3613,9 @@ impl eframe::App for App {
                 }
                 // Not gated on Lightbox, unlike the rows above: these name a Lightbox pane,
                 // so from Develop they cross over to it, as the Window menu does.
+                hotkeys::Action::FoldersPane => {
+                    self.show_lightbox_pane(lightbox::Pane::Folders, &rs);
+                }
                 hotkeys::Action::SearchPane => {
                     self.show_lightbox_pane(lightbox::Pane::Search, &rs);
                     self.lightbox.focus_search();
@@ -3601,11 +3688,23 @@ impl eframe::App for App {
                         failed: b.failed,
                     });
                 let home_on = self.home_showing();
+                // Develop's picture's rating and label, after the exposure; in
+                // Lightbox the strip is silent about it for the reason above.
+                let marks = self
+                    .tabs
+                    .active()
+                    .filter(|t| !self.lightbox.active && t.has_image())
+                    .map(|t| widgets::Marks {
+                        stars: t.metadata.rating.unwrap_or(0),
+                        label: t.metadata.label.as_deref().and_then(theme::label_colour),
+                    })
+                    .unwrap_or_default();
                 let clicks = widgets::title_strip(
                     ui,
                     &self.icons,
                     platform::strip_title(self.lightbox.active),
                     &exposure,
+                    marks,
                     badge.as_ref(),
                     home_on,
                 );

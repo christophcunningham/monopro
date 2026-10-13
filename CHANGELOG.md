@@ -105,6 +105,10 @@ New
 - Each Dodge & Burn layer has a Mask button beside its opacity. It turns the
   layer's tone mask on and off, and shows red while it is on, so you can see which
   layers are limited to a tonal range without opening them.
+- Ratings and color labels work in Develop. Command-1 to Command-5 and Shift-1 to
+  Shift-5 rate and label the open picture, and the same key again takes it off. The
+  title strip shows the stars and the label's dot after the exposure.
+- Shift-F brings the Lightbox FOLDERS panel forward, from Develop as well.
 
 Faster
 - Dragging a point or an opacity in the Curve is several times faster, most of all
@@ -135,6 +139,10 @@ Changed
   gradient through its tone mask, where it used to show the tone mask alone. A
   brushed layer still shows its tone mask. It also works on a layer with no strokes
   yet, which it did not before.
+- A new dodge or burn instance is now Command-Shift-D or Command-Shift-X while the
+  brush is open, and Command-D duplicates the tab even then.
+- The keyboard shortcuts reference lists Shift-S and Shift-M under Navigation, with
+  the new Shift-F.
 
 Fixed
 - A tool open on the picture no longer blinks out, or misses a press, in the moment

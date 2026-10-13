@@ -2040,6 +2040,37 @@ pub enum BadgeClick {
     Dismiss,
 }
 
+/// A picture's star rating and label color, as the title strip shows them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Marks {
+    /// 0 is unrated.
+    pub stars: i32,
+    /// `None` for no label, and for a label word another application wrote, which
+    /// has no color here; see `theme::label_colour`.
+    pub label: Option<Color32>,
+}
+
+/// The stars, then the dot, from `left` along the strip's middle. Only what the
+/// picture carries — a readout, not the grid's control, so no hollow stars.
+fn paint_marks(painter: &egui::Painter, left: Pos2, marks: Marks) {
+    let mut x = left.x;
+    let stars = marks.stars.clamp(0, 5) as usize;
+    if stars > 0 {
+        let shown = painter.text(
+            pos2(x, left.y),
+            egui::Align2::LEFT_CENTER,
+            "★".repeat(stars),
+            egui::FontId::proportional(crate::theme::size::BODY),
+            crate::theme::AMBER,
+        );
+        x = shown.right() + 8.0;
+    }
+    if let Some(c) = marks.label {
+        // The grid's dot, at the grid's size.
+        painter.circle_filled(pos2(x + 5.0, left.y), 5.0, c);
+    }
+}
+
 /// Paint the window's app strip on macOS and its mode/status strip elsewhere.
 ///
 /// The window is created with `fullsize_content_view` and a hidden titlebar so the
@@ -2052,9 +2083,13 @@ pub enum BadgeClick {
 ///
 /// Its resting state is the exposure — ISO, aperture, shutter, focal length — set
 /// in ruby because it is the only text in the chrome that describes the photograph
-/// rather than the program. Star ratings (`⌘1`–`⌘5`) and colour labels (`⇧1`–`⇧5`)
-/// are specified to report through here too, transiently, when they exist; the
-/// hotkey table has them bound and pending.
+/// rather than the program.
+///
+/// `marks` is the picture's star rating and label color, drawn **after** the exposure
+/// rather than inside it: amber stars, as the grid draws them, then the label's dot.
+/// The maintainer's placement, and the exposure stays centered on the window
+/// whatever follows it — the marks hang off its right end, so rating a picture never
+/// moves the line you read it by. Nothing is drawn for an unrated, unlabeled picture.
 ///
 /// The undo/redo depth used to sit at the right of this strip. It came out because
 /// it is *state*, not identity — a number that changes as you work and tells you
@@ -2075,6 +2110,7 @@ pub fn title_strip(
     icons: &crate::icons::Icons,
     title: &str,
     centre: &str,
+    marks: Marks,
     update: Option<&UpdateBadge>,
     home_on: bool,
 ) -> StripClicks {
@@ -2089,18 +2125,22 @@ pub fn title_strip(
         egui::FontId::proportional(crate::theme::size::TITLE),
         Color32::from_gray(190),
     );
+    // Where the marks start: the readout's right end, or the middle if there is none.
+    let mut marks_x = rect.center().x;
     if !centre.is_empty() {
         // Centred on the *window*, not on the space left over after the title —
         // the traffic-light inset is asymmetric, so centring in the remainder
         // would put it visibly off-centre against the image below it.
-        painter.text(
+        let shown = painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             centre,
             egui::FontId::monospace(crate::theme::size::BODY),
             RUBY,
         );
+        marks_x = shown.right() + 14.0;
     }
+    paint_marks(&painter, pos2(marks_x, rect.center().y), marks);
 
     let home_box = crate::icons::BIG;
     let home_rect = Rect::from_min_size(

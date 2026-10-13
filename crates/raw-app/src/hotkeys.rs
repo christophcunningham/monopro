@@ -92,6 +92,8 @@ pub enum Action {
     ContactSheet,
     /// Re-read the open Lightbox folder for files that arrived or left.
     RefreshFolder,
+    /// Bring Lightbox's FOLDERS pane forward.
+    FoldersPane,
     /// Bring Lightbox's SEARCH pane forward with the cursor in its field, ready to type.
     SearchPane,
     /// Bring Lightbox's METADATA pane forward.
@@ -317,10 +319,11 @@ pub struct Binding {
     ///
     /// Milestone 10 is what made this a concept rather than a special case. The
     /// prototype's brush wants `⌘[` and `⌘]` for intensity, and 9a had already
-    /// given them to Rotate left and right; it wants `⌘D` for a new dodge instance,
-    /// and `⌘D` duplicates a tab. Three chords, all genuinely wanted by both sides,
-    /// and none of them a collision in practice — you do not rotate the picture or
-    /// duplicate the tab in the middle of a brush stroke.
+    /// given them to Rotate left and right. Two chords, genuinely wanted by both
+    /// sides, and not a collision in practice — you do not rotate the picture in the
+    /// middle of a brush stroke. (A new dodge or burn instance used to take `⌘D` back
+    /// from Duplicate Tab the same way; the maintainer moved the pair to `⌘⇧D` / `⌘⇧X`,
+    /// which nothing else holds, so `⌘D` means one thing everywhere.)
     ///
     /// So the resolution is stated once, here, rather than discovered when a rotate
     /// fires mid-stroke: **a modal binding shadows a global one while its mode is
@@ -514,6 +517,38 @@ pub const TABLE: &[Binding] = &[
         None,
         "e",
         "Bring the Develop panel forward",
+        Navigation,
+        true,
+    ),
+    // **Shift-only, so a focused text field keeps them**: `is_typing` stands the table
+    // down while one has focus, and `⇧S` typed into the search field is a capital S.
+    // Each reveals its Lightbox pane the way the Window menu does, crossing from
+    // Develop if need be — which is why they are Navigation and not Lightbox: they
+    // are a way *to* Lightbox as much as keys used inside it.
+    b(
+        Action::FoldersPane,
+        Key::F,
+        Shift,
+        "f",
+        "Folders panel",
+        Navigation,
+        true,
+    ),
+    b(
+        Action::SearchPane,
+        Key::S,
+        Shift,
+        "s",
+        "Search — cursor in the search field",
+        Navigation,
+        true,
+    ),
+    b(
+        Action::MetadataPane,
+        Key::M,
+        Shift,
+        "m",
+        "Metadata panel",
         Navigation,
         true,
     ),
@@ -728,12 +763,16 @@ pub const TABLE: &[Binding] = &[
         DodgeBurn,
         true,
     ),
-    // Modal: these six live only while the brush is open. Three of them are chords
-    // something else holds the rest of the time — see `Binding::modal`.
+    // Modal: these live only while the brush is open. Two of them, `⌘[` and `⌘]`,
+    // are chords something else holds the rest of the time — see `Binding::modal`.
+    //
+    // **`⌘⇧D` / `⌘⇧X`, the maintainer's chords**, so `⌘D` is Duplicate Tab even with the
+    // brush open: the pair keeps `d` and `x` for dodge and burn, and the shift says
+    // "another one" the way `⌘⇧E` is the other export.
     m(
         Action::NewDodge,
         Key::D,
-        Cmd,
+        CmdShift,
         "d",
         "New dodge instance",
         DodgeBurn,
@@ -741,7 +780,7 @@ pub const TABLE: &[Binding] = &[
     m(
         Action::NewBurn,
         Key::X,
-        Cmd,
+        CmdShift,
         "x",
         "New burn instance",
         DodgeBurn,
@@ -811,8 +850,9 @@ pub const TABLE: &[Binding] = &[
         DodgeBurn,
     ),
     // -- Lightbox
-    // Ratings and color labels operate on the Lightbox selection, never on an open
-    // Develop tab. Keeping them with file commands made the reference imply otherwise.
+    // Ratings and color labels operate on the Lightbox selection there, and on the
+    // picture in front of you in Develop, where the title strip shows them after the
+    // exposure. Listed here because judging a folder is what they are mostly for.
     b(
         Action::CopySettings,
         Key::C,
@@ -857,28 +897,6 @@ pub const TABLE: &[Binding] = &[
         Cmd,
         "r",
         "Refresh folder",
-        Lightbox,
-        true,
-    ),
-    // **Shift-only, so a focused text field keeps them**: `is_typing` stands the table
-    // down while one has focus, and `⇧S` typed into the search field is a capital S.
-    // Both reveal their pane the way the Window menu does, crossing from Develop if
-    // need be.
-    b(
-        Action::SearchPane,
-        Key::S,
-        Shift,
-        "s",
-        "Search — cursor in the search field",
-        Lightbox,
-        true,
-    ),
-    b(
-        Action::MetadataPane,
-        Key::M,
-        Shift,
-        "m",
-        "Metadata panel",
         Lightbox,
         true,
     ),
@@ -1597,9 +1615,10 @@ mod tests {
 
     #[test]
     fn the_shadowed_chords_are_exactly_these() {
-        // Every chord a mode takes back from the rest of the app, listed. Three of
-        // them, all wanted by both sides and none of them a collision in use: you
-        // do not rotate the picture or duplicate the tab mid-stroke.
+        // Every chord a mode takes back from the rest of the app, listed. Two of
+        // them, both wanted by both sides and neither a collision in use: you do
+        // not rotate the picture mid-stroke. `⌘D` left this list when new brush
+        // instances moved to `⌘⇧D` / `⌘⇧X`.
         //
         // A list rather than a rule, because the cost of one more is that a key
         // silently changes meaning — which is exactly the thing worth having to
@@ -1612,7 +1631,7 @@ mod tests {
         shadowing.sort();
         assert_eq!(
             shadowing,
-            ["⌘[ (RotateLeft)", "⌘] (RotateRight)", "⌘d (DuplicateTab)",]
+            ["⌘[ (RotateLeft)", "⌘] (RotateRight)"]
         );
     }
 
@@ -1643,9 +1662,11 @@ mod tests {
         );
 
         assert!(open.contains(&Action::NewDodge) && open.contains(&Action::BrushRadius(true)));
+        // `⌘D` is Duplicate Tab with the brush open too, now that a new instance is
+        // `⌘⇧D`: one chord, one meaning.
         assert!(
-            !open.contains(&Action::DuplicateTab),
-            "⌘D duplicated a tab mid-stroke"
+            open.contains(&Action::DuplicateTab),
+            "the brush took ⌘D back from Duplicate Tab"
         );
         assert!(
             !open.contains(&Action::RotateLeft),
@@ -1992,6 +2013,18 @@ mod tests {
             .filter(|binding| matches!(binding.action, Action::Rating(_) | Action::ColourLabel(_)))
         {
             assert_eq!(binding.group, Group::Lightbox);
+        }
+
+        // The three keys that bring a Lightbox pane forward from anywhere are listed
+        // with the other ways of getting somewhere, and are Shift so typing keeps them.
+        for (action, key) in [
+            (Action::FoldersPane, Key::F),
+            (Action::SearchPane, Key::S),
+            (Action::MetadataPane, Key::M),
+        ] {
+            let binding = TABLE.iter().find(|b| b.action == action).unwrap();
+            assert_eq!(binding.group, Group::Navigation, "{action:?}");
+            assert_eq!((binding.key, binding.mods), (key, Mods::Shift), "{action:?}");
         }
 
         let contact_sheet = TABLE

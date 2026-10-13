@@ -1202,7 +1202,17 @@ impl Lightbox {
                 continue;
             }
             e.developed = when;
-            e.edited = developed(&raw_core::sidecar::read(&e.path));
+            let side = raw_core::sidecar::read(&e.path);
+            e.edited = developed(&side);
+            // The rating and label come from the same file, and Develop can set them
+            // on the picture it is holding. Read as `entry_for` reads them.
+            let meta = side.ok().map(|s| s.metadata);
+            e.rating = meta
+                .as_ref()
+                .and_then(|m| m.rating)
+                .unwrap_or(0)
+                .clamp(0, 5);
+            e.label = meta.and_then(|m| m.label);
             stale.push(i as u32);
         }
         if !stale.is_empty() {
@@ -4402,7 +4412,11 @@ fn write_order(dir: &Path, order: &[String]) {
 /// another application put in the standard blocks; a rating is a small change to a
 /// large document, and treating it as the whole document would silently discard
 /// somebody's work. This is the same promise `Metadata`'s own note makes.
-fn write_metadata(image: &Path, rating: i32, label: Option<&str>) -> std::io::Result<()> {
+pub(crate) fn write_metadata(
+    image: &Path,
+    rating: i32,
+    label: Option<&str>,
+) -> std::io::Result<()> {
     use raw_core::sidecar::Loaded;
 
     let (params, mut metadata) = match raw_core::sidecar::read(image) {
@@ -9251,6 +9265,32 @@ mod tests {
         let e = &later.entries[0];
         assert_eq!(e.rating, 4);
         assert_eq!(e.label.as_deref(), Some("green"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rating_set_in_develop_reaches_the_grid_on_the_way_back() {
+        // Develop rates the picture it holds by writing the sidecar, which is all the
+        // grid hears of it. `refresh_edited` is what runs on the way back.
+        let (dir, raw) = scratch("develop-rating");
+        let mut lb = Lightbox::new();
+        lb.open_folder(&dir);
+        assert_eq!(lb.entries[0].rating, 0);
+
+        // Past the mtime granularity of any filesystem the tests run on.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_metadata(&raw, 3, Some("blue")).unwrap();
+        lb.refresh_edited();
+        assert_eq!(lb.entries[0].rating, 3);
+        assert_eq!(lb.entries[0].label.as_deref(), Some("blue"));
+
+        // And taken back off, which writes the absence rather than a nought.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_metadata(&raw, 0, None).unwrap();
+        lb.refresh_edited();
+        assert_eq!(lb.entries[0].rating, 0);
+        assert_eq!(lb.entries[0].label, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
