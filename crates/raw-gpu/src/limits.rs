@@ -5,13 +5,14 @@ use raw_graph::Plan;
 
 const WORKING_BYTES: u64 = 512 * 1024 * 1024;
 
-/// The most zone masks there can be at once: one per Dodge & Burn layer and one per Curve
-/// pass, each of which can have a tone mask, and one more for the tone of the mask the
-/// mask view is showing. The array that holds them has this many layers at most, and
-/// WebGPU guarantees 256, so this is checked against the floor and not against the
+/// The most zone-mask layers there can be at once: one per Dodge & Burn layer and one per
+/// Curve pass, each of which can have a tone mask, and one more for the tone of the mask
+/// the mask view is showing, each twice over, since a range with an island has a second
+/// layer for the island's weight. The array that holds them has this many layers at most,
+/// and WebGPU guarantees 256, so this is checked against the floor and not against the
 /// adapter: no device can be asked for more than it must offer.
 pub(crate) const MAX_MASK_LAYERS: usize =
-    raw_core::DodgeBurnParams::MAX_INSTANCES + raw_core::CurveStack::MAX_INSTANCES + 1;
+    2 * (raw_core::DodgeBurnParams::MAX_INSTANCES + raw_core::CurveStack::MAX_INSTANCES + 1);
 
 pub(crate) fn validate_plan(plan: &Plan, max_edge: u32) -> Result<u64, String> {
     let mut bytes = 0u64;

@@ -2,7 +2,9 @@
 //! requests are not queued behind obsolete slider positions. Results are keyed
 //! by source generation and only the parameters actually consumed here.
 use raw_core::{
-    Basis, ContrastMaskParams, ExposureParams, Params, dodgeburn::ZoneMask, zone::Proxy,
+    Basis, ContrastMaskParams, ExposureParams, Params,
+    dodgeburn::ZoneMask,
+    zone::{PreparedMask, Proxy},
 };
 use std::{
     collections::VecDeque,
@@ -25,7 +27,9 @@ struct Key {
 }
 
 pub(crate) struct Prepared {
-    pub masks: Vec<Option<Vec<f32>>>,
+    /// One per range asked for, in the order asked. What the shader is given for each is
+    /// its [`upload`](raw_core::zone::PreparedMask::upload).
+    pub masks: Vec<PreparedMask>,
     pub histogram: Vec<f32>,
     /// What the masks and the histogram were made from, shared by every entry with the
     /// same exposure and Contrast Mask, and what a tone sampled from the picture reads.
@@ -139,7 +143,7 @@ impl Zones {
                     Arc::new(proxy.basis(&task.basis.exposure, &task.basis.mask))
                 });
                 let data = Arc::new(Prepared {
-                    masks: task.masks.iter().map(|m| basis.evaluate(m)).collect(),
+                    masks: task.masks.iter().map(|m| basis.prepare(m)).collect(),
                     histogram: basis.histogram(crate::Viewport::ZONE_BINS),
                     basis,
                 });
@@ -201,7 +205,7 @@ mod tests {
             ..Default::default()
         };
         let b = zones.request(&proxy, &p, false, None, true).unwrap();
-        assert!(b.masks[0].is_some());
+        assert!(b.masks[0].upload().is_some());
         assert!(Arc::ptr_eq(&a.basis, &b.basis));
         assert_eq!(zones.rebuilds, 1);
         p.exposure.ev = 1.0;
@@ -247,9 +251,13 @@ mod tests {
                 rule: raw_core::curve::Rule::default(),
             });
             let ready = zones.request(&proxy, &p, false, None, true).unwrap();
-            ready.masks[0].clone().expect("a bounded range has a mask")
+            let mask = ready.masks[0].clone();
+            assert!(mask.upload().is_some(), "a bounded range has a mask");
+            mask
         };
-        let at = |mask: &[f32], x: usize, y: usize| mask[y * w + x];
+        let at = |mask: &PreparedMask, x: usize, y: usize| {
+            mask.at((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32)
+        };
         let plain = prepared(tone, &mut zones);
         assert_eq!((at(&plain, 16, 24), at(&plain, 48, 24)), (1.0, 1.0));
 

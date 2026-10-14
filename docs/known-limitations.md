@@ -67,6 +67,12 @@ These are scope decisions, not gaps.
 - **`⇧`-click with the tone eyedropper does nothing on a range that is still open.**
   A range open at both ends already includes every tone, so there is nothing to add to
   it. Click without `⇧` to start a range, then `⇧`-click to widen it.
+- **Where a tone range's edge falls is worked out at the proxy's resolution, 480 pixels
+  on the long edge.** The range is cut at every pixel, so its edge is smooth at any
+  zoom, but the tones it is cut from are averaged over a proxy pixel. Against a hard
+  edge in the picture, the mask's edge can sit up to one proxy pixel away from it,
+  about 16 pixels on a 40 MP negative, and shows as a soft rim of the adjustment along
+  that edge. Lifting this needs the edge placed from the full-resolution picture.
 - **The tone eyedropper samples at the proxy's resolution, 480 pixels on the long
   edge.** That is the image a tone range reads, so the sample is what the mask will be
   compared against, but a subject only a few pixels across in a large frame is averaged

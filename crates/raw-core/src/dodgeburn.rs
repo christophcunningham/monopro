@@ -571,8 +571,19 @@ impl ZoneMask {
     /// Whether this mask has no effect at all, and the whole evaluation can be
     /// skipped rather than computed and multiplied by one.
     pub fn is_identity(&self) -> bool {
-        !self.enabled
-            || (self.lo <= Self::MIN_EV + 1e-6 && self.hi >= Self::MAX_EV - 1e-6 && !self.invert)
+        !self.enabled || (self.opens_below() && self.opens_above() && !self.invert)
+    }
+
+    /// Whether the range has no lower bound: its low end is on Zone 0, so every tone
+    /// below the top of the range is selected. One test, shared by [`select`](Self::select)
+    /// and the shader's copy of it, which is handed the answer rather than the ruler's ends.
+    pub fn opens_below(&self) -> bool {
+        self.lo <= Self::MIN_EV + 1e-6
+    }
+
+    /// Whether the range has no upper bound: its high end is on Zone X.
+    pub fn opens_above(&self) -> bool {
+        self.hi >= Self::MAX_EV - 1e-6
     }
 
     /// The mask at one point, given the EV there.
@@ -593,13 +604,16 @@ impl ZoneMask {
     /// How strongly the range selects a tone, in `[0, 1]`, **before `Inv`**: the
     /// trapezoid alone. What an island grows through, since `Inv` turns over the
     /// finished selection and not the tones it was grown from.
+    ///
+    /// **The shader has a copy**, `tone_select` in `raw-gpu/src/zone_mask.wgsl`, which
+    /// cuts every rendered pixel with it. The two change together.
     pub fn select(&self, ev: f32) -> f32 {
         let ss = |t: f32| {
             let t = t.clamp(0.0, 1.0);
             t * t * (3.0 - 2.0 * t)
         };
 
-        let mut m = if self.lo <= Self::MIN_EV + 1e-6 {
+        let mut m = if self.opens_below() {
             1.0
         } else if self.f_lo > 1e-6 {
             ss((ev - (self.lo - self.f_lo)) / self.f_lo)
@@ -607,7 +621,7 @@ impl ZoneMask {
             f32::from(ev >= self.lo)
         };
 
-        if self.hi < Self::MAX_EV - 1e-6 {
+        if !self.opens_above() {
             m *= if self.f_hi > 1e-6 {
                 1.0 - ss((ev - self.hi) / self.f_hi)
             } else {

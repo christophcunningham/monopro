@@ -63,7 +63,7 @@ Three rules hold the path together:
 | `composition.rs` | 2390 | Orientation, straighten, keystone, crop, and `Frame` (which pixels become the picture) |
 | `curve.rs` | 2060 | Monotone cubic curve in log₂ EV, baked into a lookup table; a pass's mask and the CPU reference the shader must match (`apply_at`) |
 | `dodgeburn.rs` | 2740 | Dodge & Burn layers as parametric records: the brush's dabs and passes, the two gradients, the tone mask with its island's seeds, and a painted shape's coverage as a mask |
-| `zone.rs` | 1610 | Zone masks: the proxy they are computed on, tonal selection, growing a tone island from its seeds, and reading a tone back from the picture for the eyedropper (`Basis::sample_into`) |
+| `zone.rs` | 1820 | Zone masks: the proxy they are prepared on, tonal selection, growing a tone island from its seeds, what the shader is given for a mask and the CPU's copy of what it does with it (`PreparedMask`), and reading a tone back from the picture for the eyedropper (`Basis::sample_into`) |
 | `display.rs` | 780 | The display transform and L\*: the reference `display.wgsl` mirrors, and what the histogram calls |
 | `output.rs` | 620 | Print size, resolution and the pixel limits (`MAX_EDGE`, `MAX_PIXELS`) |
 | `resample.rs` | 520 | Resizing to output size, at the start of the export tail |
@@ -97,7 +97,7 @@ Examples in `examples/` are measurement tools (`inspect`, `sharpen-sweep`,
 | `pool.rs` | 210 | The shared intermediate texture pool |
 | `limits.rs` | 90 | Checking allocations before wgpu sees them, and `limits(adapter)` |
 | `zones.rs` | 290 | Bounded off-thread zone preparation |
-| `*.wgsl` | — | One file per pass: `sample`, `exposure`, `log2`/`exp2`, `blur`, `contrast_mask`, `mask_input`, `dodge_burn`, `curve`, `display`; `gradients.wgsl` and `zone_mask.wgsl` are prepended to `dodge_burn`, `curve` and `display`, so a layer and a mask share one definition of Linear and Radial and one lookup into the zone-mask array; `dabs.wgsl` is the brush (a dab's record, its coverage and the cull), prepended to the same three, since a layer and a Curve mask are painted with one brush; `curve_mask.wgsl` is a Curve mask's record and its weight at a point, shared by `curve`, which applies it, and `display`, which draws the mask view |
+| `*.wgsl` | — | One file per pass: `sample`, `exposure`, `log2`/`exp2`, `blur`, `contrast_mask`, `mask_input`, `dodge_burn`, `curve`, `display`; `gradients.wgsl` and `zone_mask.wgsl` are prepended to `dodge_burn`, `curve` and `display`, so a layer and a mask share one definition of Linear and Radial and one lookup into the zone-mask array, which cuts a tone range at each pixel; `dabs.wgsl` is the brush (a dab's record, its coverage and the cull), prepended to the same three, since a layer and a Curve mask are painted with one brush; `curve_mask.wgsl` is a Curve mask's record and its weight at a point, shared by `curve`, which applies it, and `display`, which draws the mask view |
 
 GPU integration tests in `tests/render.rs` need a real adapter; CI compiles them
 but runs only `--lib`.

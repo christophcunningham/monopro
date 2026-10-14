@@ -4199,6 +4199,116 @@ fn dodge_and_burn_and_the_curve_share_the_zone_mask_array() {
 }
 
 #[test]
+fn a_tone_mask_is_cut_at_every_pixel_and_not_on_the_proxys_grid() {
+    // Every other tone-mask test renders a negative the proxy's own size, where each pixel
+    // is a proxy pixel's center. This one is four times wider, so nearly every pixel falls
+    // between centers, which is where a mask cut at the centers and blended up drew its
+    // boundary as stairs. A slanted hard edge, a dark disk on the bright side, and a burn
+    // over the whole frame through a steep edge-aware range, through the same range
+    // inverted and limited to an island, and through it diffused: each must agree on every
+    // pixel with `PreparedMask::at`, which blends the tone and then cuts it.
+    let Some(_) = headless_device() else { return };
+    let proxy = raw_core::zone::PROXY_WIDTH;
+    let (w, h) = (proxy * 4, proxy * 8 / 3);
+    let (dark, bright) = (0.03f32, 0.5f32);
+    let data = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            let disk = (x - 0.8 * w as f32).hypot(y - 0.5 * h as f32) < 0.08 * w as f32;
+            if x < 0.4 * w as f32 + 0.37 * y || disk {
+                dark
+            } else {
+                bright
+            }
+        })
+        .collect();
+    let luma = LumaImage {
+        data,
+        output_dims: Dims { w, h },
+        source_dims: Dims { w, h },
+        clipped: Vec::new(),
+    };
+    let steep = ZoneMask {
+        enabled: true,
+        hi: 0.5 * ((dark / 0.18).log2() + (bright / 0.18).log2()),
+        f_hi: 0.25,
+        ..ZoneMask::default()
+    };
+    let mut island = ZoneMask {
+        invert: true,
+        ..steep
+    };
+    island.island.enabled = true;
+    assert!(island.island.set((0.1, 0.5)), "a seed on the dark ground");
+    let diffused = ZoneMask {
+        blur: 0.01,
+        ..steep
+    };
+
+    let basis = raw_core::zone::Basis::build(&luma, &Default::default(), &Default::default());
+    assert_eq!(
+        basis.w * 4,
+        w,
+        "four pixels of the negative to one of the proxy"
+    );
+    let aspect = h as f32 / w as f32;
+    for (name, tone) in [("steep", steep), ("island", island), ("diffused", diffused)] {
+        let p = Params {
+            dodgeburn: DodgeBurnParams {
+                enabled: true,
+                instances: vec![Instance {
+                    mask: tone,
+                    ..instance(
+                        Sign::Burn,
+                        vec![Gesture::new(vec![dab(0.5, 0.5, 0.9, 0.0, -1.0)])],
+                    )
+                }],
+            },
+            ..Default::default()
+        };
+        let (_, _, out) = exported(&luma, &p);
+        let prepared = basis.prepare(&tone);
+        // The old way, for contrast: the mask at the centers, blended as it came.
+        let centers = basis.evaluate(&tone).expect("a bounded range");
+        let blended = |u: f32, v: f32| {
+            let (bw, bh) = (basis.w, basis.h);
+            let fx = (u * bw as f32 - 0.5).clamp(0.0, (bw - 1) as f32);
+            let fy = (v * bh as f32 - 0.5).clamp(0.0, (bh - 1) as f32);
+            let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+            let (x1, y1) = ((x0 + 1).min(bw - 1), (y0 + 1).min(bh - 1));
+            let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+            let at = |x: usize, y: usize| centers[y * bw + x];
+            let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
+            let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
+            top + (bottom - top) * ty
+        };
+        let (mut worst, mut worst_old) = (0.0f32, 0.0f32);
+        for y in 0..h {
+            for x in 0..w {
+                let (nx, ny) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+                let scene = luma.data[y * w + x];
+                let burnt = |m: f32| scene * p.dodgeburn.ev_at(nx, ny, aspect, &[m]).exp2();
+                let got = out[y * w + x];
+                let want = burnt(prepared.at(nx, ny));
+                worst = worst.max((got - want).abs() / want.max(1e-6));
+                let old = burnt(blended(nx, ny));
+                worst_old = worst_old.max((got - old).abs() / old.max(1e-6));
+            }
+        }
+        assert!(
+            worst < 1e-3,
+            "{name}: worst disagreement with the cut reference: {worst}"
+        );
+        if name != "diffused" {
+            assert!(
+                worst_old > 0.05,
+                "{name}: the render cannot be told from a mask blended up: {worst_old}"
+            );
+        }
+    }
+}
+
+#[test]
 fn contrast_mask_zone_basis_matches_gpu_and_selects_middle_grey() {
     let (device, queue) = gpu!(headless_device());
     let mut ctx = GpuContext::new(&device);
@@ -4293,8 +4403,8 @@ fn contrast_mask_zone_basis_matches_gpu_across_dark_and_bright_regions() {
 
 #[test]
 fn a_zone_mask_holds_a_burn_to_its_own_tones() {
-    // The mask, end to end: proxy, guided filter, trapezoid, strip upload,
-    // bilinear read in the shader. A frame that is dark on the left and bright on
+    // The mask, end to end: proxy, guided filter, upload, and the shader's
+    // bilinear read and trapezoid. A frame that is dark on the left and bright on
     // the right, one burn covering the whole width, and a Shadows mask on it. The
     // dark half must darken and the bright half must not.
     let Some(_) = headless_device() else { return };

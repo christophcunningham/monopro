@@ -76,9 +76,10 @@ struct Spec {
     /// masks for the curve pass, the viewed mask's for the display pass. No instance
     /// buffer goes with them, since a mask's dabs belong to a segment and not a layer.
     painted: Option<Painted>,
-    /// Binds the zone-mask array. Its own flag because three passes read it: Dodge & Burn,
-    /// whose layers can have a tone mask, the Curve, whose masks can have a tone part, and
-    /// Display, which shows a Curve mask and so reads that tone part too.
+    /// Binds the zone-mask array and its layers' records. Its own flag because three passes
+    /// read them: Dodge & Burn, whose layers can have a tone mask, the Curve, whose masks
+    /// can have a tone part, and Display, which shows a Curve mask and so reads that tone
+    /// part too.
     masks: bool,
     /// Binds the curve's segments and their tables, for a stack with a masked pass.
     /// One flag for two buffers, for the reason `strokes` is: the segments say which
@@ -170,6 +171,7 @@ impl Spec {
 /// - 8: zone-mask array
 /// - 11: curve segments, and 12: their tables
 /// - 13: the mask view's record
+/// - 14: the zone-mask array's layer records
 const B_IN0: u32 = 0;
 const B_WORK_OUT: u32 = 1;
 const B_DISPLAY_OUT: u32 = 2;
@@ -191,6 +193,9 @@ const B_SEGMENTS: u32 = 11;
 const B_TABLES: u32 = 12;
 /// The mask the mask view draws, one record. A uniform: it is one struct of fixed size.
 const B_MASK_VIEW: u32 = 13;
+/// One record per layer of the zone-mask array, saying how the layer is read: the range
+/// a layer of tones is cut with, or that it is finished. Bound with the array.
+const B_ZONE_TONES: u32 = 14;
 
 pub struct Pass {
     pipeline: wgpu::ComputePipeline,
@@ -221,6 +226,8 @@ pub struct Resources<'a> {
     pub instances: &'a wgpu::Buffer,
     /// Zone masks, one array layer each. A 1x1 single-layer array when nothing is masked.
     pub masks: &'a wgpu::TextureView,
+    /// One record per layer of `masks`. Never empty, for the reason `dabs` is not.
+    pub zone_tones: &'a wgpu::Buffer,
     /// The curve's segments, and the tables they index. Never empty, for the reason
     /// `dabs` is not: an unmasked curve carries inert ones and never reads them.
     pub segments: &'a wgpu::Buffer,
@@ -566,6 +573,16 @@ impl Pass {
                 },
                 count: None,
             });
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: B_ZONE_TONES,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
         }
         if spec.segments {
             for binding in [B_SEGMENTS, B_TABLES] {
@@ -707,6 +724,10 @@ impl Pass {
             entries.push(wgpu::BindGroupEntry {
                 binding: B_MASKS,
                 resource: wgpu::BindingResource::TextureView(res.masks),
+            });
+            entries.push(wgpu::BindGroupEntry {
+                binding: B_ZONE_TONES,
+                resource: res.zone_tones.as_entire_binding(),
             });
         }
         if self.spec.segments {

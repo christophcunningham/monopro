@@ -37,10 +37,10 @@
 //
 // # The zone masks
 //
-// Zone masks arrive as a texture array, one layer per mask, each mask_w x mask_h, computed
+// Zone masks arrive as a texture array, one layer per mask, each mask_w x mask_h, prepared
 // on the CPU at proxy resolution — `raw_core::zone` says why that is the resolution the
-// signal has. `zone_mask.wgsl` is where they are read, shared with the Curve pass, whose
-// masks can have a tone part too.
+// signal has. `zone_mask.wgsl` is where they are read and a range is cut at the pixel,
+// shared with the Curve pass, whose masks can have a tone part too.
 
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var dst: texture_storage_2d<rg32float, write>;

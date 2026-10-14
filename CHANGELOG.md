@@ -197,6 +197,12 @@ Changed
   nothing.
 
 Fixed
+- Tone masks no longer have stair-stepped edges. A tone range in Dodge & Burn or in a
+  Curve mask was cut on a 480-pixel copy of the picture and then enlarged, so its edge
+  followed that copy's pixels, in steps about 16 pixels high on a 40 MP photograph, on
+  screen and in exports, most of all where an Edge-aware range meets a hard edge. The
+  range is now cut at every pixel, so its edge runs smoothly at any zoom, and what it
+  selects is unchanged.
 - A tool open on the picture no longer blinks out, or misses a press, in the moment
   tone masks are being prepared after a change.
 - A popped-out panel stays above the main window while monopro is in front, instead

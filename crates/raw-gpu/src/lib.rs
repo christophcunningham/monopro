@@ -185,8 +185,8 @@ pub struct NodeParams {
     /// ([`Viewport::set_mask_view`]); this block is exactly one stride, and that was
     /// the last free word in it.
     curve_dabs: u32,
-    /// The zone-mask strip: one mask's dimensions, not the whole texture's. The
-    /// strip is `mask_h` per masked instance tall and rows are addressed by offset.
+    /// One layer of the zone-mask array's dimensions, which are the proxy's: every
+    /// layer is this size, and a mask is addressed by its layer.
     mask_w: u32,
     mask_h: u32,
     /// Non-zero when chemical toning is live, so the display pass reads its table
@@ -325,6 +325,60 @@ impl GpuInstance {
         invert: 0,
         contrast: 0.0,
     };
+}
+
+/// One layer of the zone-mask array's record, as `zone_mask.wgsl` reads it: how the layer
+/// is read, and for a layer of tones, the range it is cut with.
+///
+/// **A record per layer rather than fields on the instance or the segment** that owns the
+/// mask, because a layer is read by `mask_at` alone, which is given the layer and nothing
+/// else, and a Dodge & Burn layer, a Curve pass and the mask view all reach it that way.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuTone {
+    lo: f32,
+    hi: f32,
+    f_lo: f32,
+    f_hi: f32,
+    /// `OPEN_BELOW`, `OPEN_ABOVE`, `INVERT` and `FINISHED`.
+    flags: u32,
+    /// The layer holding the range's island weight, or -1.
+    island: i32,
+    pad: [u32; 2],
+}
+
+impl GpuTone {
+    const OPEN_BELOW: u32 = 1;
+    const OPEN_ABOVE: u32 = 2;
+    const INVERT: u32 = 4;
+    const FINISHED: u32 = 8;
+
+    /// A layer that is blended and not cut: a diffused mask, or an island's weight.
+    const FINISHED_LAYER: Self = Self {
+        lo: 0.0,
+        hi: 0.0,
+        f_lo: 0.0,
+        f_hi: 0.0,
+        flags: Self::FINISHED,
+        island: -1,
+        pad: [0; 2],
+    };
+
+    /// A layer of tones, cut with `tone`, and limited by the island weight in `island`.
+    fn cut(tone: &raw_core::ZoneMask, island: i32) -> Self {
+        let flag = |on: bool, bit: u32| if on { bit } else { 0 };
+        Self {
+            lo: tone.lo,
+            hi: tone.hi,
+            f_lo: tone.f_lo,
+            f_hi: tone.f_hi,
+            flags: flag(tone.opens_below(), Self::OPEN_BELOW)
+                | flag(tone.opens_above(), Self::OPEN_ABOVE)
+                | flag(tone.invert, Self::INVERT),
+            island,
+            pad: [0; 2],
+        }
+    }
 }
 
 /// One stretch of a masked curve, as the shader reads it: where its table starts and how
@@ -899,6 +953,9 @@ pub struct Viewport {
     /// tone ranges. See [`MaskLayout`].
     masks: wgpu::Texture,
     masks_view: wgpu::TextureView,
+    /// One record per layer of `masks`, saying how the layer is read. Grown, never shrunk,
+    /// and never empty.
+    zone_tones: wgpu::Buffer,
     /// One mask's size, and how many layers the array is allocated for.
     /// Grown, never shrunk: the count changes a handful of times in a session and
     /// only ever by the user adding a masked instance.
@@ -1084,7 +1141,8 @@ impl PendingPatch {
 /// tone range in [`raw_core::CurveStack::tone_masks`] order. The zone worker prepares them
 /// in that same order (`Zones::request`), so a mask is found by position. A mask with
 /// nothing to prepare, because it is fully open, is given no layer: -1, which the shaders
-/// read as "selects everything".
+/// read as "selects everything". A range with an island takes a second layer, straight
+/// after its own, for the island's weight; its record names it.
 struct MaskLayout<'a> {
     /// Per active Dodge & Burn layer: its layer, or -1.
     db: Vec<i32>,
@@ -1093,8 +1151,10 @@ struct MaskLayout<'a> {
     /// The layer of the tone the mask view is showing, or -1 when it shows none or the
     /// tone is fully open.
     view: i32,
-    /// The masks to upload, in layer order. Borrowed, not copied: assigning is index work.
+    /// The layers to upload, in order. Borrowed, not copied: assigning is index work.
     masks: Vec<&'a [f32]>,
+    /// Each layer's record, one per entry of `masks`.
+    tones: Vec<GpuTone>,
 }
 
 impl<'a> MaskLayout<'a> {
@@ -1103,17 +1163,26 @@ impl<'a> MaskLayout<'a> {
         let db_count = params.dodgeburn.active().count();
         let tone_count = params.curve.tone_masks().len();
         let mut masks: Vec<&'a [f32]> = Vec::new();
+        let mut tones: Vec<GpuTone> = Vec::new();
         let mut take = |index: usize| -> i32 {
-            match prepared
+            let Some(upload) = prepared
                 .and_then(|p| p.masks.get(index))
-                .and_then(|m| m.as_deref())
-            {
-                Some(mask) => {
-                    masks.push(mask);
+                .and_then(|m| m.upload())
+            else {
+                return -1;
+            };
+            let layer = masks.len();
+            masks.push(upload.values);
+            tones.push(GpuTone::FINISHED_LAYER);
+            if let Some(tone) = upload.cut {
+                let island = upload.island.map_or(-1, |weight| {
+                    masks.push(weight);
+                    tones.push(GpuTone::FINISHED_LAYER);
                     (masks.len() - 1) as i32
-                }
-                None => -1,
+                });
+                tones[layer] = GpuTone::cut(tone, island);
             }
+            layer as i32
         };
         let db = (0..db_count).map(&mut take).collect();
         let curve = (0..tone_count).map(|t| take(db_count + t)).collect();
@@ -1123,6 +1192,7 @@ impl<'a> MaskLayout<'a> {
             curve,
             view,
             masks,
+            tones,
         }
     }
 }
@@ -1178,6 +1248,7 @@ impl Viewport {
         let dabs = Self::stroke_buffer(device, "db dabs", 0);
         let instances = Self::stroke_buffer(device, "db instances", 0);
         let (masks, masks_view) = Self::make_masks(device, 1, 1, 1);
+        let zone_tones = Self::stroke_buffer(device, "zone tones", 0);
         let segments = Self::stroke_buffer(device, "curve segments", 0);
         let tables = Self::stroke_buffer(device, "curve tables", 0);
         let curve_dabs = Self::stroke_buffer(device, "curve mask dabs", 0);
@@ -1200,6 +1271,7 @@ impl Viewport {
             view_dabs,
             masks,
             masks_view,
+            zone_tones,
             mask_dims: (1, 1),
             mask_layers: 1,
             live_dabs: 0,
@@ -1494,14 +1566,27 @@ impl Viewport {
         }
     }
 
-    /// Upload the zone masks, one array layer each, in the order [`MaskLayout`] gave.
+    /// Upload the zone masks, one array layer each, and their records, in the order
+    /// [`MaskLayout`] gave.
     ///
     /// Nothing to write leaves the array as it is, and every layer index is then -1, so
     /// the shaders read none of it.
-    fn write_mask_array(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, masks: &[&[f32]]) {
+    fn write_mask_array(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &MaskLayout,
+    ) {
+        let (masks, tones) = (&layout.masks, &layout.tones);
         if masks.is_empty() {
             return;
         }
+        debug_assert_eq!(masks.len(), tones.len(), "a record for every layer");
+        let need = std::mem::size_of_val(&tones[..]) as u64;
+        if self.zone_tones.size() < need {
+            self.zone_tones = Self::stroke_buffer(device, "zone tones", need.next_power_of_two());
+        }
+        queue.write_buffer(&self.zone_tones, 0, bytemuck::cast_slice(tones));
         debug_assert!(
             masks.len() <= limits::MAX_MASK_LAYERS,
             "more zone masks than there can be layers for"
@@ -2301,7 +2386,7 @@ impl Viewport {
         if masks_changed || curve_changed || self.mask_view_dirty {
             let layout = MaskLayout::assign(params, prepared.as_deref(), view_tone.is_some());
             if masks_changed {
-                self.write_mask_array(device, queue, &layout.masks);
+                self.write_mask_array(device, queue, &layout);
                 self.write_strokes(device, queue, params, &layout.db);
                 self.mask_view_tone = view_tone;
             }
@@ -2377,6 +2462,7 @@ impl Viewport {
             dabs: &self.dabs,
             instances: &self.instances,
             masks: &self.masks_view,
+            zone_tones: &self.zone_tones,
             segments: &self.segments,
             tables: &self.tables,
             mask_view: &self.mask_view_record,

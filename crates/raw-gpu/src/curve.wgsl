@@ -40,7 +40,7 @@
 // alone is the whole mask. **A tone that is fully open still counts as there**: its `T` is
 // one everywhere, which Subtracts away everything, and having no tone at all does not.
 // `T` is read from the zone-mask array, one layer per tone, prepared on the CPU from the
-// edge-aware basis; `zone_mask.wgsl` is where it is looked up.
+// edge-aware basis; `zone_mask.wgsl` is where it is looked up and cut at the pixel.
 // The record a segment is and the weight it has at a point are in `curve_mask.wgsl`,
 // shared with the display pass, which shows the selected pass's mask.
 //

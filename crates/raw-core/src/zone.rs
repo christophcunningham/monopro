@@ -26,6 +26,21 @@
 //! passes, and a brush stroke — which cannot change a mask, because a mask is
 //! feed-forward — never touches any of it.
 //!
+//! # The range is cut at every pixel, not here
+//!
+//! What has the proxy's resolution is **the tone a region reads, and not the mask**.
+//! The trapezoid is a cut, and a steep one turns a change of tone into a step from
+//! nothing to everything, which has detail at every scale. Cut here and then blended
+//! up, each proxy pixel became a block of the picture, sixteen pixels across on a
+//! 40 MP file, and an edge-aware range, which keeps a hard edge as a jump inside one
+//! proxy pixel, drew its boundary in stairs on screen and in the print.
+//!
+//! So a range is [prepared](Basis::prepare) as the tones it reads, the shader blends
+//! them to the pixel it is rendering and cuts there, and the boundary runs smoothly
+//! between proxy pixels. At a proxy pixel's center the two orders agree exactly, so
+//! what a range selects is unchanged. Where a boundary falls is still the proxy's to
+//! say, to within one of its pixels; `docs/known-limitations.md` records that.
+//!
 //! # The proxy is in SOURCE space
 //!
 //! Not the composed frame. The mask is computed on the stored luminance image with
@@ -161,36 +176,22 @@ impl Basis {
         std::borrow::Cow::Owned(guided(&self.ev, self.w, self.h, r, m.eps()))
     }
 
-    /// The mask itself, at proxy resolution, in `[0, 1]`.
+    /// The mask at each proxy pixel's center, in `[0, 1]`: what [`PreparedMask::at`]
+    /// reads there, whole, for anything that wants the picture of a mask rather than its
+    /// value at points.
     ///
     /// `None` when the mask is the identity — there is no such thing as a mask of
     /// all ones worth allocating, and the caller has to distinguish the two cases
     /// anyway to skip binding a texture.
+    ///
+    /// **Not the mask blended up.** Between centers the range is cut on the blended
+    /// tone, which is what keeps its edge off the proxy's grid; see the module note.
     pub fn evaluate(&self, m: &ZoneMask) -> Option<Vec<f32>> {
-        if m.is_identity() {
-            return None;
+        match self.prepare(m).form {
+            Form::Open => None,
+            Form::Finished(mask) => Some(mask),
+            Form::Cut { ev, island, tone } => Some(cut_centers(&ev, island.as_deref(), &tone)),
         }
-        let ev = self.read(m);
-        let mut out: Vec<f32> = ev.iter().map(|&e| m.select(e)).collect();
-        // The island, before `Inv`: it limits what the range selects, and `Inv` then
-        // turns over the selection it leaves, so inverted it is everything but the
-        // island.
-        if m.island.is_live() {
-            island(&mut out, self.w, self.h, m.island.seeds());
-        }
-        if m.invert {
-            for v in &mut out {
-                *v = 1.0 - *v;
-            }
-        }
-        // The diffusion spacer. Masks were printed unsharp on purpose; without
-        // this the mask carries whatever granularity the trapezoid's edges cut
-        // into the proxy.
-        let sigma = m.blur * self.w as f32;
-        if sigma >= 0.5 {
-            out = gaussian(&out, self.w, self.h, sigma);
-        }
-        Some(out)
     }
 
     /// The image a range with `m`'s settings reads, held so the eyedropper can ask it
@@ -247,15 +248,50 @@ impl Basis {
         self.prepare(m).at(x, y)
     }
 
-    /// The mask of a range, prepared once and held to be read at many points: what the
-    /// zone worker uploads for the shader, kept on the CPU for a caller that weighs
+    /// The mask of a range, prepared once and read at any point of the negative: what the
+    /// zone worker uploads for the shader, and kept on the CPU for a caller that weighs
     /// samples of the picture by it, such as the curve editor's histogram.
+    ///
+    /// Everything that needs the whole picture is done here: the regional read, the
+    /// island's growing and the diffusion. What is left for a point is to blend and cut,
+    /// which [`PreparedMask::at`] does as the shader does.
     pub fn prepare(&self, m: &ZoneMask) -> PreparedMask {
-        PreparedMask {
-            w: self.w,
-            h: self.h,
-            mask: self.evaluate(m),
+        let (w, h) = (self.w, self.h);
+        if m.is_identity() {
+            return PreparedMask {
+                w,
+                h,
+                form: Form::Open,
+            };
         }
+        let ev = self.read(m).into_owned();
+        // The island is grown from what the range selects at the proxy's pixels, and
+        // leaves a weight for each that the cut is multiplied by.
+        let island = m.island.is_live().then(|| {
+            let selected: Vec<f32> = ev.iter().map(|&e| m.select(e)).collect();
+            island(&selected, w, h, m.island.seeds())
+        });
+        // The diffusion spacer. Masks were printed unsharp on purpose; without
+        // this the mask carries whatever granularity the trapezoid's edges cut
+        // into the proxy. A blur needs the whole image, so a diffused mask is finished
+        // here and blended up as it is: from half a proxy pixel the blur leaves no step
+        // for the blending to show.
+        let sigma = m.blur * w as f32;
+        let form = if sigma >= 0.5 {
+            Form::Finished(gaussian(
+                &cut_centers(&ev, island.as_deref(), m),
+                w,
+                h,
+                sigma,
+            ))
+        } else {
+            Form::Cut {
+                ev,
+                island,
+                tone: *m,
+            }
+        };
+        PreparedMask { w, h, form }
     }
 
     /// The EV distribution, normalised so the tallest bin is 1.0, for the ghost
@@ -301,24 +337,96 @@ impl Basis {
     }
 }
 
-/// One tonal range's mask at proxy resolution, for reading at points: see
+/// One tonal range's mask, prepared to be read at any point of the negative: see
 /// [`Basis::prepare`].
+///
+/// **The shader's `mask_at`, on the CPU** (`raw-gpu/src/zone_mask.wgsl`).
+/// [`upload`](Self::upload) is what the shader is given and [`at`](Self::at) is what it
+/// does with it, so the two change together, or the histogram and the point sampler
+/// stop reading what the picture shows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedMask {
     w: usize,
     h: usize,
-    /// `None` for a range that masks nothing, which weighs one everywhere.
-    mask: Option<Vec<f32>>,
+    form: Form,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Form {
+    /// A range that masks nothing, which weighs one everywhere.
+    Open,
+    /// Cut at each point: the tone the range reads there, blended from the proxy's
+    /// pixels, through the trapezoid, times the island's weight, then `Inv`.
+    Cut {
+        ev: Vec<f32>,
+        island: Option<Vec<f32>>,
+        tone: ZoneMask,
+    },
+    /// Diffused, and so finished at the proxy's pixels and blended as it is.
+    Finished(Vec<f32>),
+}
+
+/// What the shader is given for one mask: see [`PreparedMask::upload`].
+#[derive(Debug, Clone, Copy)]
+pub struct Upload<'a> {
+    /// One value per proxy pixel, blended to the point: the tone a range reads, which is
+    /// then cut, or the finished mask when there is no cut.
+    pub values: &'a [f32],
+    /// The island's weight per proxy pixel, blended to the point and multiplied into
+    /// the cut.
+    pub island: Option<&'a [f32]>,
+    /// The range `values` is cut with, or `None` when they are a finished mask.
+    pub cut: Option<&'a ZoneMask>,
 }
 
 impl PreparedMask {
-    /// The mask at a source-normalized point, blended as the shader blends it.
+    /// The mask at a source-normalized point, worked out as the shader works it out.
     pub fn at(&self, x: f32, y: f32) -> f32 {
-        match &self.mask {
-            Some(mask) => bilinear(mask, self.w, self.h, x, y),
-            None => 1.0,
+        let blend = |a: &[f32]| bilinear(a, self.w, self.h, x, y);
+        match &self.form {
+            Form::Open => 1.0,
+            Form::Finished(mask) => blend(mask),
+            Form::Cut { ev, island, tone } => {
+                cut(tone, blend(ev), island.as_deref().map_or(1.0, blend))
+            }
         }
     }
+
+    /// What the shader is given for this mask, or `None` for a range that masks nothing,
+    /// which is given no layer.
+    pub fn upload(&self) -> Option<Upload<'_>> {
+        match &self.form {
+            Form::Open => None,
+            Form::Finished(mask) => Some(Upload {
+                values: mask,
+                island: None,
+                cut: None,
+            }),
+            Form::Cut { ev, island, tone } => Some(Upload {
+                values: ev,
+                island: island.as_deref(),
+                cut: Some(tone),
+            }),
+        }
+    }
+}
+
+/// A range's weight where it reads `ev` and the island weighs `island`.
+///
+/// The island before `Inv`: it limits what the range selects, and `Inv` then turns
+/// over the selection it leaves, so inverted it is everything but the island.
+fn cut(tone: &ZoneMask, ev: f32, island: f32) -> f32 {
+    let m = tone.select(ev) * island;
+    if tone.invert { 1.0 - m } else { m }
+}
+
+/// A cut range at each proxy pixel's center: [`PreparedMask::at`] there, with nothing
+/// to blend.
+fn cut_centers(ev: &[f32], island: Option<&[f32]>, tone: &ZoneMask) -> Vec<f32> {
+    ev.iter()
+        .enumerate()
+        .map(|(i, &e)| cut(tone, e, island.map_or(1.0, |weight| weight[i])))
+        .collect()
 }
 
 /// The EV image one tonal range reads, for sampling: see [`Basis::reading`].
@@ -377,7 +485,7 @@ impl Reading<'_> {
 /// One value of a proxy-sized image at a source-normalized point, blended from the four
 /// pixels around it.
 ///
-/// **The shader's `mask_at`, on the CPU** (`raw-gpu/src/zone_mask.wgsl`): pixel centers,
+/// **The shader's `zone_blend`, on the CPU** (`raw-gpu/src/zone_mask.wgsl`): pixel centers,
 /// clamped at the border. The two change together, or a sample stops reading what the
 /// picture shows.
 fn bilinear(a: &[f32], w: usize, h: usize, u: f32, v: f32) -> f32 {
@@ -430,7 +538,11 @@ const ISLAND_NECK: f32 = 0.004;
 
 /// Limit a range's selection to what is connected to its seeds.
 ///
-/// `weights` is the range's selection at each proxy pixel, before `Inv`. Each seed
+/// `selected` is the range's selection at each proxy pixel, before `Inv`, and what
+/// comes back is **a weight for each pixel that the selection is multiplied by**: one
+/// across the island, nothing on another subject, and a fade between. A weight and not
+/// the limited selection, so that the shader can cut the range at every pixel it renders
+/// and still end where the island does. Each seed
 /// grows through its neighbors, diagonals included, wherever the range selects by at
 /// least [`ISLAND_GROWS_THROUGH`]; what none of them reaches is taken out. A seed on a
 /// pixel the range does not select that strongly grows nothing, which is what a seed
@@ -455,8 +567,8 @@ const ISLAND_NECK: f32 = 0.004;
 /// full strength on both sides. There the selection fades out over the same
 /// [`ISLAND_EDGE`], on the island's side of the cut, or the cut would be a step with
 /// the proxy's pixels for its outline.
-fn island(weights: &mut [f32], w: usize, h: usize, seeds: &[(f32, f32)]) {
-    let strong: Vec<bool> = weights
+fn island(selected: &[f32], w: usize, h: usize, seeds: &[(f32, f32)]) -> Vec<f32> {
+    let strong: Vec<bool> = selected
         .iter()
         .map(|&weight| weight >= ISLAND_GROWS_THROUGH)
         .collect();
@@ -517,6 +629,7 @@ fn island(weights: &mut [f32], w: usize, h: usize, seeds: &[(f32, f32)]) {
     let band = ((ISLAND_EDGE * w.max(h) as f32).round() as usize).max(1);
     let ease = |t: f32| t * t * (3.0 - 2.0 * t);
     let all = || 0..w * h;
+    let mut weights = vec![1.0f32; w * h];
 
     // The cuts: what was reached and touches something as strongly selected that was
     // not, which only a neck leaves. The island fades toward them from `band` pixels
@@ -534,21 +647,25 @@ fn island(weights: &mut [f32], w: usize, h: usize, seeds: &[(f32, f32)]) {
     if !cut.is_empty() {
         let back = steps(&cut, |p| reached[p], w, h, band);
         for at in all().filter(|&at| reached[at] && back[at] < band) {
-            weights[at] *= ease((back[at] + 1) as f32 / (band + 1) as f32);
+            weights[at] = ease((back[at] + 1) as f32 / (band + 1) as f32);
         }
     }
 
     // Outside it: another subject is out, and the range's shoulder fades to nothing
-    // over the band, by how many pixels it is from the island.
+    // over the band, by how many pixels it is from the island. The fade is given to
+    // every pixel the island did not reach and not only to those the range selects
+    // there, since between two proxy pixels the range can select what it did not at
+    // either.
     let edge: Vec<usize> = all().filter(|&at| reached[at]).collect();
     let out = steps(&edge, |p| !reached[p], w, h, band);
     for at in all().filter(|&at| !reached[at]) {
-        if strong[at] {
-            weights[at] = 0.0;
-        } else if weights[at] > 0.0 {
-            weights[at] *= ease(1.0 - out[at] as f32 / (band + 1) as f32);
-        }
+        weights[at] = if strong[at] {
+            0.0
+        } else {
+            ease(1.0 - out[at] as f32 / (band + 1) as f32)
+        };
     }
+    weights
 }
 
 /// How many steps each pixel is from the nearest of `from`, neighbor to neighbor with
@@ -1542,13 +1659,92 @@ mod tests {
             blur: 0.05,
             ..ZoneMask::default()
         };
-        let mask = b.evaluate(&m).expect("a bounded range");
-        for (px, py) in [(4, 4), (31, 16), (32, 16), (60, 28)] {
-            let (x, y) = center(&b, px, py);
-            assert!((b.weight_at(&m, x, y) - mask[py * b.w + px]).abs() < 1e-6);
+        // Diffused, which is finished at the proxy's pixels, and then not, which is cut
+        // at the point: both are the whole mask at a pixel's center.
+        for blur in [0.05, 0.0] {
+            let m = ZoneMask { blur, ..m };
+            let mask = b.evaluate(&m).expect("a bounded range");
+            for (px, py) in [(4, 4), (31, 16), (32, 16), (60, 28)] {
+                let (x, y) = center(&b, px, py);
+                assert!((b.weight_at(&m, x, y) - mask[py * b.w + px]).abs() < 1e-6);
+            }
         }
         // A range that masks nothing weighs one, everywhere.
         assert_eq!(b.weight_at(&ZoneMask::default(), 0.3, 0.3), 1.0);
+    }
+
+    /// Where a straight edge crosses each row of a mask read at every pixel of a negative
+    /// eight times the proxy, and how far the crossings stray from the best straight line
+    /// through them, in the negative's pixels.
+    fn stray(w: usize, h: usize, at: impl Fn(f32, f32) -> f32) -> f32 {
+        let rows: Vec<(f32, f32)> = (h / 10..h - h / 10)
+            .step_by(3)
+            .map(|y| {
+                let v = (y as f32 + 0.5) / h as f32;
+                let weight = |x: usize| at((x as f32 + 0.5) / w as f32, v);
+                // Selected on the left, so the crossing is the first pixel under half.
+                let x = (1..w).find(|&x| weight(x) < 0.5).expect("the edge crosses");
+                let (a, b) = (weight(x - 1), weight(x));
+                (y as f32, x as f32 - 1.0 + (a - 0.5) / (a - b))
+            })
+            .collect();
+        let n = rows.len() as f32;
+        let (my, mx) = rows
+            .iter()
+            .fold((0.0, 0.0), |(sy, sx), (y, x)| (sy + y / n, sx + x / n));
+        let slope = rows.iter().map(|(y, x)| (y - my) * (x - mx)).sum::<f32>()
+            / rows.iter().map(|(y, _)| (y - my) * (y - my)).sum::<f32>();
+        rows.iter()
+            .map(|(y, x)| (x - mx - slope * (y - my)).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn a_range_cut_between_proxy_pixels_follows_an_edge_without_stairs() {
+        // A dark ground and a bright one meeting along a slanted straight line, eight
+        // times the proxy's width, and a steep range that takes the dark side. Blending a
+        // mask finished at the proxy's pixels drew the line as stairs a proxy pixel high;
+        // cutting the blended tone at each pixel follows it.
+        let (w, h) = (PROXY_WIDTH * 8, PROXY_WIDTH * 16 / 3);
+        let data = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as f32, (i / w) as f32);
+                if x < 0.4 * w as f32 + 0.37 * y {
+                    0.03
+                } else {
+                    0.5
+                }
+            })
+            .collect();
+        let b = Basis::build(&luma(w, h, data), &Default::default(), &Default::default());
+        assert_eq!(
+            b.w * 8,
+            w,
+            "eight pixels of the negative to one of the proxy"
+        );
+        for edge_aware in [true, false] {
+            let m = ZoneMask {
+                enabled: true,
+                hi: 0.5 * ((0.03f32 / MID_GREY).log2() + (0.5f32 / MID_GREY).log2()),
+                f_hi: 0.25,
+                edge_aware,
+                ..ZoneMask::default()
+            };
+            let finished = b.evaluate(&m).expect("a bounded range");
+            let stairs = stray(w, h, |x, y| bilinear(&finished, b.w, b.h, x, y));
+            let prepared = b.prepare(&m);
+            let straight = stray(w, h, |x, y| prepared.at(x, y));
+            // Eight pixels to one of the proxy: the old blend strayed by nearly half a
+            // proxy pixel, and the cut stays within a quarter of one.
+            assert!(
+                stairs > 3.0,
+                "the old blend drew stairs (edge-aware {edge_aware}): {stairs}"
+            );
+            assert!(
+                straight < 2.0,
+                "the line strays {straight} px from straight (edge-aware {edge_aware})"
+            );
+        }
     }
 
     #[test]

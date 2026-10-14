@@ -17,9 +17,10 @@
 //!   bytes of segments; dragging a curve point or an opacity re-bakes the tables. The two
 //!   columns are why `CurveStack::same_luts` is split from `same_render`.
 //! - **What a tone range adds.** A tone part is one more bilinear fetch per masked pixel
-//!   and a mask for the CPU worker to prepare once per change to the range, the exposure
-//!   or Contrast Mask. Dragging a shape's handle under a tone must cost what it does
-//!   without one, because it asks the worker for nothing.
+//!   and the range's cut there (a second fetch with an island), and a mask for the CPU
+//!   worker to prepare once per change to the range, the exposure or Contrast Mask.
+//!   Dragging a shape's handle under a tone must cost what it does without one, because
+//!   it asks the worker for nothing.
 //!
 //! - **What a painted mask costs.** Its strokes are scanned by the curve pass with the
 //!   cull Dodge & Burn's layers use, so the cost should stay roughly flat as a mask
