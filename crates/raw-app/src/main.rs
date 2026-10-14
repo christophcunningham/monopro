@@ -2222,6 +2222,10 @@ pub(crate) fn take_bare_tab(ctx: &egui::Context) -> bool {
 /// Gap after a tab, before the next one. Small, because a tab and its close are one
 /// object and the duplicate belongs to the tab it sits against.
 const GAP_TAB: f32 = 6.0;
+/// The front tab's duplicate: a square of the tab's own height, and the seam that
+/// parts it from the name.
+const DUP_W: f32 = TAB_H;
+const DUP_SEAM: f32 = 1.0;
 /// Gap before `+`, which belongs to no tab.
 const GAP_ICONS: f32 = 14.0;
 
@@ -2239,6 +2243,7 @@ enum TabClick {
     None,
     Focus,
     Close,
+    Duplicate,
 }
 
 /// One tab in the file strip: a fill, a close on the left, and the filename.
@@ -2266,6 +2271,15 @@ enum TabClick {
 /// Which is Photoshop's placement and, less obviously, the safer one: the close no
 /// longer moves as the name gets longer or shorter, so the target under your cursor does
 /// not change when you switch to a file with a different name length.
+///
+/// # The duplicate is the front tab's other end
+///
+/// `duplicate` is `Some(enabled)` for the tab in front, which alone has one: a square of
+/// the tab's height and fill at its right end, parted from the name by a one-point seam,
+/// so the tab reads as a split button. It used to be a bare icon after the tab, smaller
+/// than the tab and boxed by nothing, and the maintainer saw that it did not look like
+/// it belonged to anything. It belongs to this tab, since it copies the file in front,
+/// so it is drawn as a part of it.
 fn file_tab(
     ui: &mut egui::Ui,
     icons: &icons::Icons,
@@ -2273,6 +2287,7 @@ fn file_tab(
     active: bool,
     name_cap: f32,
     hint: &str,
+    duplicate: Option<bool>,
 ) -> TabClick {
     // The readout face, because a tab name is a filename — data the app read, not a name
     // it chose. It is also the only face that sets an underscore correctly; see the note
@@ -2303,6 +2318,21 @@ fn file_tab(
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(theme::tip("close  ⌘W"));
 
+    // The duplicate's square, past the seam, when this tab has one.
+    let dup = duplicate.map(|enabled| {
+        ui.add_space(DUP_SEAM);
+        let (dup_rect, response) =
+            ui.allocate_exact_size(egui::vec2(DUP_W, TAB_H), egui::Sense::click());
+        let response = if enabled {
+            response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(theme::tip("duplicate tab — same file, settings copied  ⌘D"))
+        } else {
+            response
+        };
+        (dup_rect, response, enabled)
+    });
+
     if ui.is_rect_visible(rect) {
         // Inactive tabs sit *below* the strip's own grey and the active one above it, so
         // the front tab reads as nearer without any colour being spent.
@@ -2311,7 +2341,49 @@ fn file_tab(
             (false, false) => theme::CHROME_DEEP,
             (false, true) => egui::Color32::from_gray(44),
         };
-        ui.painter().rect_filled(rect, 2.0, fill);
+        // With a duplicate, the two meet square at the seam and round only the outer
+        // corners, so the pair has one outline.
+        let (name_corners, dup_corners) = if dup.is_some() {
+            (
+                egui::CornerRadius {
+                    nw: 2,
+                    sw: 2,
+                    ne: 0,
+                    se: 0,
+                },
+                egui::CornerRadius {
+                    nw: 0,
+                    sw: 0,
+                    ne: 2,
+                    se: 2,
+                },
+            )
+        } else {
+            (egui::CornerRadius::same(2), egui::CornerRadius::same(2))
+        };
+        ui.painter().rect_filled(rect, name_corners, fill);
+        if let Some((dup_rect, response, enabled)) = &dup {
+            let hot = *enabled && response.hovered();
+            let dup_fill = if hot {
+                egui::Color32::from_gray(66)
+            } else {
+                fill
+            };
+            ui.painter().rect_filled(*dup_rect, dup_corners, dup_fill);
+            let ink = match (enabled, hot) {
+                (false, _) => theme::DIM.gamma_multiply(0.35),
+                (true, true) => egui::Color32::from_gray(245),
+                (true, false) => theme::DIM,
+            };
+            icons::paint(
+                ui,
+                icons,
+                "duplicate",
+                "▣",
+                egui::Rect::from_center_size(dup_rect.center(), egui::Vec2::splat(icons::BOX)),
+                ink,
+            );
+        }
         let text = match (active, tab.hovered()) {
             // Plain text: what a bare label is set in.
             (true, _) => ui.visuals().widgets.noninteractive.text_color(),
@@ -2345,7 +2417,9 @@ fn file_tab(
         );
     }
 
-    if close.clicked() {
+    if dup.is_some_and(|(_, response, enabled)| enabled && response.clicked()) {
+        TabClick::Duplicate
+    } else if close.clicked() {
         TabClick::Close
     } else if tab.clicked() {
         TabClick::Focus
@@ -4586,7 +4660,7 @@ impl App {
             // cannot read in full — the full name is a hover away.
             let n = self.tabs.len().max(1) as f32;
             let per_tab = TAB_PAD * 2.0 + icons::BOX + CLOSE_GAP + GAP_TAB;
-            let fixed = 6.0 + n * per_tab + icons::BOX + GAP_ICONS + icons::BOX;
+            let fixed = 6.0 + n * per_tab + DUP_SEAM + DUP_W + GAP_ICONS + icons::BOX;
             let cap = ((ui.available_width() - fixed) / n).clamp(NAME_MIN, NAME_MAX);
 
             for (i, tab) in self.tabs.iter().enumerate() {
@@ -4604,21 +4678,15 @@ impl App {
                 } else {
                     format!("{label}\nclick to switch · ` flicks back to the previous tab")
                 };
-                match file_tab(ui, &self.icons, &label, i == active, cap, &hint) {
-                    TabClick::Focus => action = StripAction::Focus(i),
-                    TabClick::Close => action = StripAction::Close(i),
-                    TabClick::None => {}
-                }
-
                 // The duplicate sits against the tab it acts on, and only that one.
                 // After the whole row it looked like a control over the strip, which is
                 // not what it does — it copies the file in front.
-                if i == active
-                    && icons::button(ui, &self.icons, "duplicate", "▣", can_duplicate)
-                        .on_hover_text(theme::tip("duplicate tab — same file, settings copied  ⌘D"))
-                        .clicked()
-                {
-                    action = StripAction::Duplicate;
+                let duplicate = (i == active).then_some(can_duplicate);
+                match file_tab(ui, &self.icons, &label, i == active, cap, &hint, duplicate) {
+                    TabClick::Focus => action = StripAction::Focus(i),
+                    TabClick::Close => action = StripAction::Close(i),
+                    TabClick::Duplicate => action = StripAction::Duplicate,
+                    TabClick::None => {}
                 }
                 ui.add_space(GAP_TAB);
             }

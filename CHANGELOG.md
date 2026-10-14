@@ -186,6 +186,9 @@ Changed
   the same bar in both modes: its name, then the pop-out and the x.
 - A new dodge or burn instance is now Command-Shift-D or Command-Shift-X while the
   brush is open, and Command-D duplicates the tab even then.
+- The duplicate button is part of the tab in front: a square at its right end, the
+  tab's own height and shade, parted from the name by a thin seam, where it used to be
+  a loose icon beside it.
 - The keyboard shortcuts reference lists Shift-S and Shift-M under Navigation, with
   the new Shift-F.
 - "Use the folder tree to start" on the Lightbox start page is plain text now rather

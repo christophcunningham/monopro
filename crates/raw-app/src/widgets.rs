@@ -2215,24 +2215,36 @@ pub struct Marks {
     pub label: Option<Color32>,
 }
 
+/// The title strip's stars: a little under the readout's size, since they hang off the
+/// end of a line of type and are not the grid's control.
+const MARK_STAR: f32 = crate::theme::size::BODY - 2.0;
+/// The room between two stars. Set as one string the face packs them point to point,
+/// and five read as one jagged bar rather than a count.
+const MARK_STAR_GAP: f32 = 2.0;
+/// The label dot's radius, a point under the grid's, to sit with the smaller stars.
+const MARK_DOT: f32 = 4.0;
+
 /// The stars, then the dot, from `left` along the strip's middle. Only what the
 /// picture carries — a readout, not the grid's control, so no hollow stars.
 fn paint_marks(painter: &egui::Painter, left: Pos2, marks: Marks) {
     let mut x = left.x;
     let stars = marks.stars.clamp(0, 5) as usize;
     if stars > 0 {
-        let shown = painter.text(
-            pos2(x, left.y),
-            egui::Align2::LEFT_CENTER,
-            "★".repeat(stars),
-            egui::FontId::proportional(crate::theme::size::BODY),
-            crate::theme::AMBER,
-        );
-        x = shown.right() + 8.0;
+        let font = egui::FontId::proportional(MARK_STAR);
+        for _ in 0..stars {
+            let shown = painter.text(
+                pos2(x, left.y),
+                egui::Align2::LEFT_CENTER,
+                "★",
+                font.clone(),
+                crate::theme::AMBER,
+            );
+            x = shown.right() + MARK_STAR_GAP;
+        }
+        x += 8.0 - MARK_STAR_GAP;
     }
     if let Some(c) = marks.label {
-        // The grid's dot, at the grid's size.
-        painter.circle_filled(pos2(x + 5.0, left.y), 5.0, c);
+        painter.circle_filled(pos2(x + MARK_DOT, left.y), MARK_DOT, c);
     }
 }
 
@@ -3186,7 +3198,12 @@ mod tests {
     fn strip_width(tabs: usize, available: f32, name: f32) -> f32 {
         let n = tabs.max(1) as f32;
         let per_tab = crate::TAB_PAD * 2.0 + crate::icons::BOX + crate::CLOSE_GAP + crate::GAP_TAB;
-        let fixed = 6.0 + n * per_tab + crate::icons::BOX + crate::GAP_ICONS + crate::icons::BOX;
+        let fixed = 6.0
+            + n * per_tab
+            + crate::DUP_SEAM
+            + crate::DUP_W
+            + crate::GAP_ICONS
+            + crate::icons::BOX;
         let cap = ((available - fixed) / n).clamp(crate::NAME_MIN, crate::NAME_MAX);
         fixed + n * name.min(cap)
     }
