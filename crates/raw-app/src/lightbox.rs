@@ -9788,11 +9788,18 @@ mod tests {
         lb.focus = Focus::Tree;
         assert!(lb.tree_has_keys());
 
+        // The folder in front, relative to the root, its parts joined with `/` on every
+        // platform: Windows writes `a\a1`, and the walk is the same either way.
         let here = |lb: &Lightbox| {
             lb.folder
                 .as_ref()
                 .and_then(|f| f.strip_prefix(&root).ok())
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| {
+                    p.components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
         };
         lb.tree_key(egui::Key::ArrowDown);
         assert_eq!(here(&lb).as_deref(), Some("a"));
