@@ -40,7 +40,7 @@
 //!
 //! # Schema versions
 //!
-//! [`SCHEMA_VERSION`] is 18. Versions 1 and 2 are **prototype** sidecars, and this
+//! [`SCHEMA_VERSION`] is 19. Versions 1 and 2 are **prototype** sidecars, and this
 //! app is a different pipeline: it reads the CFA mosaic where the prototype read
 //! LibRaw's demosaiced tristimulus, so almost nothing in a v2 file means the same
 //! thing here. Pretending otherwise would open an image with settings that look
@@ -75,6 +75,12 @@
 //! captioned sidecar to change the exposure would silently erase the keywords, the
 //! alt text and the rest of the IPTC it could not see. The version is what makes that
 //! build refuse the file instead — see `future_sidecars_are_not_loaded_or_overwritten`.
+//!
+//! **19 is the first version only some files are written at.** A field that a small
+//! share of pictures will ever carry should not make every picture unreadable to the
+//! builds already out there, so [`written_schema`] says 19 only for a file with a curve
+//! mask and keeps saying 18 for the rest. [`SCHEMA_VERSION`] is then the newest this
+//! build *reads*, which is what the refusal above compares against.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -115,12 +121,61 @@ use crate::sharpen;
 /// | 16 | retires highlight reconstruction and TCA | — (attributes ignored) |
 /// | 17 | manual keystone | ignores the projective map |
 /// | 18 | the Metadata pane's IPTC fields | refuses the file rather than saving it without them |
+/// | 19 | a mask on a Curve pass; an island on a tone mask; a dab's core falloff | refuses the file rather than saving it without them |
 ///
 /// **9 is the one to reason from.** It is the harshest since 5, and the first whose
 /// *order* is load-bearing: the Chemistry stack is an `rdf:Seq` because gold after
 /// sulphide is red and gold before it is blue-black, so a reader treating it as a bag
 /// produces a plausible picture that is not the one that was made.
-pub const SCHEMA_VERSION: u32 = 18;
+///
+/// **19 is the newest this build reads, and it is written only for a file that needs it.**
+/// A curve mask is the first field since 5 that an older reader would not merely
+/// misrender but *drop on save*: a build that does not know `monopro:Mask` writes the
+/// curve back without it, silently, so the version is what makes it refuse the file
+/// instead. Every picture without a curve mask keeps saying 18, so the great majority
+/// of files stay readable by the builds already on people's machines. See
+/// [`written_schema`], which is the one place that decision is made.
+///
+/// A tone mask's island is the same case on a Dodge & Burn layer, whose tone mask an
+/// 18 reader does know: it would read the range, skip the seeds it has no word for,
+/// burn every part of the frame with those tones, and write the layer back without
+/// them. So a layer with an island makes the file a 19 as a curve mask does.
+///
+/// So does a stroke painted with the core falloff, which is every stroke painted since
+/// it. An 18 reader would drop its dabs as tuples of a length it does not know, and the
+/// layer would come back empty; were it to read them, it would draw them with the bell.
+pub const SCHEMA_VERSION: u32 = 19;
+
+/// The version a file for `params` is written at: [`SCHEMA_VERSION`] when a curve pass
+/// has a mask, a Dodge & Burn layer's tone mask has an island, or a layer has a stroke
+/// painted with the core falloff, and 18 when none of them is so.
+///
+/// **A mask that is switched off still counts**, and so does an island that is. The
+/// bypass keeps the shape, or the seeds, so that switching it back on returns to the
+/// edit, which means the file carries them, and a reader that dropped them on save
+/// would lose them.
+pub fn written_schema(params: &Params) -> u32 {
+    let curve_mask = params.curve.instances.iter().any(|i| i.mask.is_some());
+    let layer_island = params
+        .dodgeburn
+        .instances
+        .iter()
+        .any(|layer| layer.mask.island != crate::dodgeburn::Island::default());
+    // A stroke with the core falloff: an older build would draw it with the bell and
+    // save it back without the number that says otherwise.
+    let core_falloff = params.dodgeburn.instances.iter().any(|layer| {
+        layer.shape.passes().iter().any(|pass| {
+            pass.dabs
+                .iter()
+                .any(|d| d.falloff == crate::dodgeburn::Falloff::Core)
+        })
+    });
+    if curve_mask || layer_island || core_falloff {
+        SCHEMA_VERSION
+    } else {
+        SCHEMA_VERSION - 1
+    }
+}
 
 /// The oldest version whose develop parameters mean exactly what this build's do.
 ///
@@ -131,7 +186,8 @@ pub const SCHEMA_VERSION: u32 = 18;
 /// edited-tile cache, for a version change it plays no part in.
 ///
 /// **Moves with `SCHEMA_VERSION` whenever a version changes what the parameters
-/// mean**, which is every version before 18.
+/// mean**, which is every version before 18. 19 adds a mask to a curve pass and changes
+/// nothing a file without one says, so it stayed.
 pub const PARAMS_SCHEMA: u32 = 17;
 const _: () = assert!(
     PARAMS_SCHEMA <= SCHEMA_VERSION,
@@ -1117,13 +1173,210 @@ fn read_toning(desc: &roxmltree::Node) -> crate::toning::ToningParams {
     out
 }
 
+/// A `monopro:Mask*` tonal range as three lines of attributes, indented by `indent`.
+///
+/// Shared by Dodge & Burn's layers and by a curve pass's mask, whose tone part is the
+/// same `ZoneMask`: one writer, so the two files cannot spell the range differently.
+fn write_zone_mask(o: &mut String, m: &crate::dodgeburn::ZoneMask, indent: &str) {
+    o.push_str(&format!(
+        "{indent}monopro:MaskEnabled=\"{}\" monopro:MaskLo=\"{}\" monopro:MaskHi=\"{}\"\n",
+        m.enabled,
+        num(m.lo),
+        num(m.hi)
+    ));
+    o.push_str(&format!(
+        "{indent}monopro:MaskFeatherLo=\"{}\" monopro:MaskFeatherHi=\"{}\" monopro:MaskInvert=\"{}\"\n",
+        num(m.f_lo),
+        num(m.f_hi),
+        m.invert
+    ));
+    o.push_str(&format!(
+        "{indent}monopro:MaskBlur=\"{}\" monopro:MaskEdgeAware=\"{}\" monopro:MaskRegion=\"{}\" monopro:MaskEdge=\"{}\"\n",
+        num(m.blur),
+        m.edge_aware,
+        num(m.region),
+        num(m.edge)
+    ));
+    // The island, **only for a range that has one**: its switch, and its seeds as
+    // `x,y` pairs on the negative. A range without one writes the three lines it
+    // always did, so a file that does not use an island is the file it was.
+    if m.island != crate::dodgeburn::Island::default() {
+        let seeds: Vec<String> = m
+            .island
+            .seeds()
+            .iter()
+            .map(|(x, y)| format!("{},{}", dab_num(*x), dab_num(*y)))
+            .collect();
+        o.push_str(&format!(
+            "{indent}monopro:MaskIsland=\"{}\" monopro:MaskSeeds=\"{}\"\n",
+            m.island.enabled,
+            seeds.join(" ")
+        ));
+    }
+}
+
+/// The inverse of [`write_zone_mask`]. Every field that is absent or unreadable takes
+/// the default, so a file from before a field existed opens as it always did.
+fn read_zone_mask(node: &roxmltree::Node) -> crate::dodgeburn::ZoneMask {
+    let default = crate::dodgeburn::ZoneMask::default();
+    let get = |n: &str| node.attribute((MONOPRO_NS, n));
+    let f = |n: &str, d: f32| get(n).and_then(finite).unwrap_or(d);
+    let b = |n: &str, d: bool| get(n).map(|v| v == "true").unwrap_or(d);
+    // A seed that is not two finite numbers on the negative is dropped, as a bad dab
+    // is: the others still say where the island is, and a seed moved onto the frame's
+    // edge would grow from somewhere nobody clicked.
+    let mut island = crate::dodgeburn::Island::new(b("MaskIsland", false));
+    for seed in get("MaskSeeds").unwrap_or_default().split_ascii_whitespace() {
+        if let Some((x, y)) = seed.split_once(',')
+            && let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>())
+        {
+            island.add((x, y));
+        }
+    }
+    crate::dodgeburn::ZoneMask {
+        enabled: b("MaskEnabled", false),
+        lo: f("MaskLo", default.lo),
+        hi: f("MaskHi", default.hi),
+        f_lo: f("MaskFeatherLo", default.f_lo),
+        f_hi: f("MaskFeatherHi", default.f_hi),
+        invert: b("MaskInvert", false),
+        blur: f("MaskBlur", default.blur),
+        edge_aware: b("MaskEdgeAware", default.edge_aware),
+        region: f("MaskRegion", default.region),
+        edge: f("MaskEdge", default.edge),
+        island,
+    }
+}
+
+/// An attribute holding `x,y`, both finite.
+fn attr_pair(node: &roxmltree::Node, name: &str) -> Option<(f32, f32)> {
+    let v = node.attribute((MONOPRO_NS, name))?;
+    let (a, b) = v.split_once(',')?;
+    let (a, b) = (a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?);
+    (a.is_finite() && b.is_finite()).then_some((a, b))
+}
+
+/// A painted shape's passes, as a `<monopro:Passes>` element indented by `indent`: one
+/// `rdf:li` a pass, its dabs as comma-separated tuples.
+///
+/// Shared by a Dodge & Burn layer and a curve pass's painted mask, which are painted
+/// with the same brush: one writer, so the two cannot spell a dab differently.
+fn write_passes(o: &mut String, passes: &[crate::dodgeburn::Gesture], indent: &str) {
+    o.push_str(&format!("{indent}<monopro:Passes>\n{indent} <rdf:Seq>\n"));
+    for g in passes {
+        o.push_str(&format!("{indent}  <rdf:li>"));
+        for (i, d) in g.dabs.iter().enumerate() {
+            if i > 0 {
+                o.push(' ');
+            }
+            o.push_str(&format!(
+                "{},{},{},{},{},{}",
+                dab_num(d.x),
+                dab_num(d.y),
+                dab_num(d.radius),
+                dab_num(d.feather),
+                dab_num(d.opacity),
+                dab_num(d.ev)
+            ));
+            // **Six numbers for a round dab, nine for a shaped one.** The common
+            // case does not grow the file, and a reader tells the two apart by
+            // counting rather than by a flag — which is what makes a v5 file's
+            // six-tuples still mean exactly what they meant.
+            if d.nib != crate::dodgeburn::Nib::Round
+                || (d.aspect - 1.0).abs() > 1e-5
+                || d.angle != 0.0
+            {
+                o.push_str(&format!(
+                    ",{},{},{}",
+                    dab_num(d.aspect),
+                    dab_num(d.angle),
+                    u8::from(d.nib == crate::dodgeburn::Nib::Card)
+                ));
+            }
+            // **One more number for the edge a dab has now**, seven or ten: a dab
+            // with none is one painted before it, and keeps the bell it was painted
+            // with. Counted again, for the reason the nib is.
+            if d.falloff == crate::dodgeburn::Falloff::Core {
+                o.push_str(",1");
+            }
+        }
+        o.push_str("</rdf:li>\n");
+    }
+    o.push_str(&format!("{indent} </rdf:Seq>\n{indent}</monopro:Passes>\n"));
+}
+
+/// The inverse of [`write_passes`]: the passes under `node`'s `<monopro:Passes>`, in
+/// order, or none when it has no such child.
+fn read_passes(node: &roxmltree::Node) -> Vec<crate::dodgeburn::Gesture> {
+    use crate::dodgeburn::{Dab, Gesture};
+    let mut out = Vec::new();
+    let Some(passes) = node
+        .children()
+        .find(|n| n.has_tag_name((MONOPRO_NS, "Passes")))
+        .and_then(|p| p.children().find(|n| n.has_tag_name((RDF_NS, "Seq"))))
+    else {
+        return out;
+    };
+    for pass in passes.children().filter(|n| n.has_tag_name((RDF_NS, "li"))) {
+        let dabs: Vec<Dab> = pass
+            .text()
+            .unwrap_or_default()
+            .split_ascii_whitespace()
+            .filter_map(|tuple| {
+                let n: Vec<f32> = tuple
+                    .split(',')
+                    .map(str::parse::<f32>)
+                    .map_while(|v| v.ok().filter(|v| v.is_finite()))
+                    .collect();
+                // **Six is a round dab and nine is a shaped one**, each with
+                // one more when it has the core falloff. Anything else is not a
+                // dab this version understands, and guessing at it would place
+                // a mark nobody asked for — the same rule `parse4` applies to
+                // the crop rectangle. It is also what makes the format
+                // extensible: a v5 reader handed a nine drops it visibly rather
+                // than misreading six of it.
+                let (shape, falloff) = match n.len() {
+                    6 | 9 => (n.len(), crate::dodgeburn::Falloff::Bell),
+                    7 | 10 if n[n.len() - 1] == 1.0 => {
+                        (n.len() - 1, crate::dodgeburn::Falloff::Core)
+                    }
+                    _ => return None,
+                };
+                let n = &n[..shape];
+                Some(Dab {
+                    x: n[0],
+                    y: n[1],
+                    radius: n[2],
+                    feather: n[3],
+                    opacity: n[4],
+                    ev: n[5],
+                    aspect: if n.len() == 9 { n[6] } else { 1.0 },
+                    angle: if n.len() == 9 { n[7] } else { 0.0 },
+                    nib: if n.len() == 9 && n[8] != 0.0 {
+                        crate::dodgeburn::Nib::Card
+                    } else {
+                        crate::dodgeburn::Nib::Round
+                    },
+                    falloff,
+                })
+            })
+            .collect();
+        // An empty pass is dropped rather than kept: it renders nothing,
+        // and carrying it would make `⌘Z` undo a stroke that was never
+        // visible.
+        if !dabs.is_empty() {
+            out.push(Gesture::new(dabs));
+        }
+    }
+    out
+}
+
 fn write_dodgeburn(o: &mut String, db: &crate::dodgeburn::DodgeBurnParams) {
     if db.instances.is_empty() {
         return;
     }
     o.push_str("   <monopro:DodgeBurn>\n    <rdf:Seq>\n");
     for inst in &db.instances {
-        let m = &inst.mask;
         o.push_str("     <rdf:li rdf:parseType=\"Resource\"\n");
         o.push_str(&format!("       monopro:Name=\"{}\"\n", escape(&inst.name)));
         o.push_str(&format!(
@@ -1136,25 +1389,7 @@ fn write_dodgeburn(o: &mut String, db: &crate::dodgeburn::DodgeBurnParams) {
             num(inst.contrast),
             inst.enabled
         ));
-        o.push_str(&format!(
-            "       monopro:MaskEnabled=\"{}\" monopro:MaskLo=\"{}\" monopro:MaskHi=\"{}\"\n",
-            m.enabled,
-            num(m.lo),
-            num(m.hi)
-        ));
-        o.push_str(&format!(
-            "       monopro:MaskFeatherLo=\"{}\" monopro:MaskFeatherHi=\"{}\" monopro:MaskInvert=\"{}\"\n",
-            num(m.f_lo),
-            num(m.f_hi),
-            m.invert
-        ));
-        o.push_str(&format!(
-            "       monopro:MaskBlur=\"{}\" monopro:MaskEdgeAware=\"{}\" monopro:MaskRegion=\"{}\" monopro:MaskEdge=\"{}\"\n",
-            num(m.blur),
-            m.edge_aware,
-            num(m.region),
-            num(m.edge)
-        ));
+        write_zone_mask(o, &inst.mask, "       ");
         // The shape, and its geometry. Written for every instance including a
         // brush, so the discriminant is always present and a reader never has to
         // infer the kind from which optional group happens to be there — the same
@@ -1200,41 +1435,7 @@ fn write_dodgeburn(o: &mut String, db: &crate::dodgeburn::DodgeBurnParams) {
         // Only a brush has passes, and an empty `<Passes>` on a gradient would be
         // a claim that it is a brush with none.
         if matches!(inst.shape, crate::dodgeburn::Shape::Brush { .. }) {
-            o.push_str("      <monopro:Passes>\n       <rdf:Seq>\n");
-            for g in inst.gestures() {
-                o.push_str("        <rdf:li>");
-                for (i, d) in g.dabs.iter().enumerate() {
-                    if i > 0 {
-                        o.push(' ');
-                    }
-                    o.push_str(&format!(
-                        "{},{},{},{},{},{}",
-                        dab_num(d.x),
-                        dab_num(d.y),
-                        dab_num(d.radius),
-                        dab_num(d.feather),
-                        dab_num(d.opacity),
-                        dab_num(d.ev)
-                    ));
-                    // **Six numbers for a round dab, nine for a shaped one.** The common
-                    // case does not grow the file, and a reader tells the two apart by
-                    // counting rather than by a flag — which is what makes a v5 file's
-                    // six-tuples still mean exactly what they meant.
-                    if d.nib != crate::dodgeburn::Nib::Round
-                        || (d.aspect - 1.0).abs() > 1e-5
-                        || d.angle != 0.0
-                    {
-                        o.push_str(&format!(
-                            ",{},{},{}",
-                            dab_num(d.aspect),
-                            dab_num(d.angle),
-                            u8::from(d.nib == crate::dodgeburn::Nib::Card)
-                        ));
-                    }
-                }
-                o.push_str("</rdf:li>\n");
-            }
-            o.push_str("       </rdf:Seq>\n      </monopro:Passes>\n");
+            write_passes(o, inst.gestures(), "      ");
         }
         o.push_str("     </rdf:li>\n");
     }
@@ -1242,9 +1443,7 @@ fn write_dodgeburn(o: &mut String, db: &crate::dodgeburn::DodgeBurnParams) {
 }
 
 fn read_dodgeburn(desc: &roxmltree::Node, enabled: bool) -> crate::dodgeburn::DodgeBurnParams {
-    use crate::dodgeburn::{
-        Dab, DodgeBurnParams, Gesture, Instance, Linear, Radial, Shape, Sign, ZoneMask,
-    };
+    use crate::dodgeburn::{DodgeBurnParams, Instance, Linear, Radial, Shape, Sign};
 
     let mut out = DodgeBurnParams {
         enabled,
@@ -1270,7 +1469,6 @@ fn read_dodgeburn(desc: &roxmltree::Node, enabled: bool) -> crate::dodgeburn::Do
         } else {
             Sign::Burn
         };
-        let default = ZoneMask::default();
         let mut inst = Instance {
             name: get("Name").unwrap_or("Burn").to_owned(),
             opacity: f("Opacity", 1.0),
@@ -1279,29 +1477,13 @@ fn read_dodgeburn(desc: &roxmltree::Node, enabled: bool) -> crate::dodgeburn::Do
                 *DodgeBurnParams::CONTRAST_RANGE.end(),
             ),
             enabled: b("Enabled", true),
-            mask: ZoneMask {
-                enabled: b("MaskEnabled", false),
-                lo: f("MaskLo", default.lo),
-                hi: f("MaskHi", default.hi),
-                f_lo: f("MaskFeatherLo", default.f_lo),
-                f_hi: f("MaskFeatherHi", default.f_hi),
-                invert: b("MaskInvert", false),
-                blur: f("MaskBlur", default.blur),
-                edge_aware: b("MaskEdgeAware", default.edge_aware),
-                region: f("MaskRegion", default.region),
-                edge: f("MaskEdge", default.edge),
-            },
+            mask: read_zone_mask(&li),
             ..Instance::new(sign, String::new())
         };
 
         // The shape. An unrecognised or absent discriminant reads as a brush, which
         // is what a v5 file means — it had no shapes but the one.
-        let pair = |n: &str| -> Option<(f32, f32)> {
-            let v = get(n)?;
-            let (a, b) = v.split_once(',')?;
-            let (a, b) = (a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?);
-            (a.is_finite() && b.is_finite()).then_some((a, b))
-        };
+        let pair = |n: &str| attr_pair(&li, n);
         match get("Shape") {
             // A gradient with no geometry is not a gradient. Rather than invent one
             // in the middle of the frame, the instance stays a brush with nothing on
@@ -1337,57 +1519,8 @@ fn read_dodgeburn(desc: &roxmltree::Node, enabled: bool) -> crate::dodgeburn::Do
             _ => {}
         }
 
-        let passes = li
-            .children()
-            .find(|n| n.has_tag_name((MONOPRO_NS, "Passes")))
-            .and_then(|p| p.children().find(|n| n.has_tag_name((RDF_NS, "Seq"))));
-        if let Some(passes) = passes {
-            for pass in passes.children().filter(|n| n.has_tag_name((RDF_NS, "li"))) {
-                let dabs: Vec<Dab> = pass
-                    .text()
-                    .unwrap_or_default()
-                    .split_ascii_whitespace()
-                    .filter_map(|tuple| {
-                        let n: Vec<f32> = tuple
-                            .split(',')
-                            .map(str::parse::<f32>)
-                            .map_while(|v| v.ok().filter(|v| v.is_finite()))
-                            .collect();
-                        // **Six is a round dab and nine is a shaped one.** Anything
-                        // else is not a dab this version understands, and guessing
-                        // at it would place a mark nobody asked for — the same rule
-                        // `parse4` applies to the crop rectangle. It is also what
-                        // makes the format extensible: a v5 reader handed a nine
-                        // drops it visibly rather than misreading six of it.
-                        if n.len() != 6 && n.len() != 9 {
-                            return None;
-                        }
-                        Some(Dab {
-                            x: n[0],
-                            y: n[1],
-                            radius: n[2],
-                            feather: n[3],
-                            opacity: n[4],
-                            ev: n[5],
-                            aspect: if n.len() == 9 { n[6] } else { 1.0 },
-                            angle: if n.len() == 9 { n[7] } else { 0.0 },
-                            nib: if n.len() == 9 && n[8] != 0.0 {
-                                crate::dodgeburn::Nib::Card
-                            } else {
-                                crate::dodgeburn::Nib::Round
-                            },
-                        })
-                    })
-                    .collect();
-                // An empty pass is dropped rather than kept: it renders nothing,
-                // and carrying it would make `⌘Z` undo a stroke that was never
-                // visible.
-                if !dabs.is_empty()
-                    && let Some(g) = inst.gestures_mut()
-                {
-                    g.push(Gesture::new(dabs));
-                }
-            }
+        if let Some(passes) = inst.gestures_mut() {
+            *passes = read_passes(&li);
         }
 
         // **The layer's nib, and where it comes from for a file that predates it.**
@@ -1444,7 +1577,7 @@ pub fn to_xml(params: &Params, metadata: &Metadata, source_name: &str) -> String
         o.push_str(&format!("   monopro:{name}=\"{value}\"\n"));
     };
 
-    attr("SchemaVersion", SCHEMA_VERSION.to_string());
+    attr("SchemaVersion", written_schema(p).to_string());
     attr("SourceFile", escape(source_name));
 
     // Decode.
@@ -2269,6 +2402,7 @@ pub fn from_xml(text: &str) -> Loaded<Sidecar> {
                 name: "Curve 1".into(),
                 curve: c,
                 opacity: 1.0,
+                mask: None,
             }],
         }
     } else {
@@ -2372,9 +2506,171 @@ fn write_curves(o: &mut String, curves: &CurveStack) {
                 num(pt[1])
             ));
         }
-        o.push_str("       </rdf:Seq>\n      </monopro:CurvePoints>\n     </rdf:li>\n");
+        o.push_str("       </rdf:Seq>\n      </monopro:CurvePoints>\n");
+        if let Some(mask) = &instance.mask {
+            write_curve_mask(o, mask);
+        }
+        o.push_str("     </rdf:li>\n");
     }
     o.push_str("    </rdf:Seq>\n   </monopro:Curves>\n");
+}
+
+/// A curve pass's mask, as one element beside its `CurvePoints`.
+///
+/// The attribute names are Dodge & Burn's, because the parts are Dodge & Burn's: the
+/// shape's `Shape` and `Grad*` and the tone's `Mask*`. A mask adds `Enabled`, `Invert`
+/// and `Rule`, and leaves out the two things a gradient has there and a mask does not,
+/// `GradEV` (the curve says how far to move a tone) and `GradInvert` (the mask has its
+/// own). A part that is absent is simply not written, so a reader never infers one.
+///
+/// A painted mask writes `Shape="brush"` and its `Nib`, as a brushed layer does, and its
+/// passes as the element's child, in the layer's own form.
+fn write_curve_mask(o: &mut String, mask: &crate::curve::CurveMask) {
+    o.push_str("      <monopro:Mask rdf:parseType=\"Resource\"\n");
+    o.push_str(&format!(
+        "        monopro:Enabled=\"{}\" monopro:Invert=\"{}\" monopro:Rule=\"{}\"",
+        mask.enabled,
+        mask.invert,
+        mask.rule.key()
+    ));
+    if let Some(shape) = &mask.shape {
+        o.push_str(&format!("\n        monopro:Shape=\"{}\"", shape.label()));
+        match shape {
+            crate::dodgeburn::Shape::Linear(l) => o.push_str(&format!(
+                "\n        monopro:GradFrom=\"{},{}\" monopro:GradTo=\"{},{}\" \
+                 monopro:GradFeather=\"{}\"",
+                dab_num(l.x0),
+                dab_num(l.y0),
+                dab_num(l.x1),
+                dab_num(l.y1),
+                num(l.feather)
+            )),
+            crate::dodgeburn::Shape::Radial(r) => o.push_str(&format!(
+                "\n        monopro:GradCentre=\"{},{}\" monopro:GradInner=\"{}\" \
+                 monopro:GradOuter=\"{}\"\n        monopro:GradAspect=\"{}\" \
+                 monopro:GradAngle=\"{}\" monopro:GradFeather=\"{}\"",
+                dab_num(r.cx),
+                dab_num(r.cy),
+                num(r.inner),
+                num(r.outer),
+                num(r.aspect),
+                num(r.angle),
+                num(r.feather)
+            )),
+            // The nib beside the discriminant, as a layer writes it, so a painted mask
+            // with no strokes yet is still a Card mask. Its passes follow as a child.
+            crate::dodgeburn::Shape::Brush { nib, .. } => {
+                o.push_str(&format!(" monopro:Nib=\"{}\"", nib.key()));
+            }
+        }
+    }
+    if let Some(tone) = &mask.tone {
+        o.push('\n');
+        // `write_zone_mask` ends each line with a newline, and this is an attribute
+        // list, so the last one is trimmed to let the element close on its own line.
+        let mut lines = String::new();
+        write_zone_mask(&mut lines, tone, "        ");
+        o.push_str(lines.trim_end_matches('\n'));
+    }
+    // A painted mask's passes are the element's one child; every other mask is
+    // attributes alone and closes where it opened.
+    match &mask.shape {
+        Some(crate::dodgeburn::Shape::Brush { passes, .. }) => {
+            o.push_str(">\n");
+            write_passes(o, passes, "       ");
+            o.push_str("      </monopro:Mask>\n");
+        }
+        _ => o.push_str("/>\n"),
+    }
+}
+
+/// A curve pass's mask, if it has one this build can read.
+///
+/// **A malformed mask is dropped and the curve is kept.** The mask is a refinement of
+/// the pass, so a file whose mask is unreadable still has a curve worth opening, and the
+/// alternative -- refusing the pass, or inventing a mask in the middle of the frame --
+/// loses the edit or changes the picture. Malformed is: a shape this build does not
+/// know, a gradient with no geometry, or a mask with neither a shape nor a tone to limit
+/// by. A painted mask's unreadable dabs are dropped one by one, as a layer's are.
+fn read_curve_mask(li: &roxmltree::Node) -> Option<crate::curve::CurveMask> {
+    use crate::curve::{CurveMask, Rule};
+    use crate::dodgeburn::{Linear, Radial, Shape};
+
+    let node = li
+        .children()
+        .find(|n| n.has_tag_name((MONOPRO_NS, "Mask")))?;
+    let get = |n: &str| node.attribute((MONOPRO_NS, n));
+    let f = |n: &str, d: f32| get(n).and_then(finite).unwrap_or(d);
+    let b = |n: &str, d: bool| get(n).map(|v| v == "true").unwrap_or(d);
+    // A coordinate can be any finite number in a hand-edited file, and a huge one makes
+    // the gradient's own arithmetic overflow into NaN, which is a pixel nobody can see.
+    let coord = |(x, y): (f32, f32)| (x.clamp(-2.0, 3.0), y.clamp(-2.0, 3.0));
+
+    let shape = match get("Shape") {
+        None => None,
+        Some("linear") => {
+            let (x0, y0) = coord(attr_pair(&node, "GradFrom")?);
+            let (x1, y1) = coord(attr_pair(&node, "GradTo")?);
+            Some(Shape::Linear(Linear {
+                x0,
+                y0,
+                x1,
+                y1,
+                feather: f("GradFeather", 1.0)
+                    .clamp(*Linear::FEATHER_RANGE.start(), *Linear::FEATHER_RANGE.end()),
+                ev: 0.0,
+            }))
+        }
+        Some("radial") => {
+            let (cx, cy) = coord(attr_pair(&node, "GradCentre")?);
+            let outer = f("GradOuter", 0.25)
+                .clamp(*Radial::OUTER_RANGE.start(), *Radial::OUTER_RANGE.end());
+            Some(Shape::Radial(Radial {
+                cx,
+                cy,
+                inner: f("GradInner", 0.0)
+                    .clamp(*Radial::INNER_RANGE.start(), *Radial::INNER_RANGE.end())
+                    .min(outer * 0.95),
+                outer,
+                aspect: f("GradAspect", 1.0)
+                    .clamp(*Radial::ASPECT_RANGE.start(), *Radial::ASPECT_RANGE.end()),
+                angle: f("GradAngle", 0.0)
+                    .clamp(*Radial::ANGLE_RANGE.start(), *Radial::ANGLE_RANGE.end()),
+                feather: f("GradFeather", 1.0)
+                    .clamp(*Radial::FEATHER_RANGE.start(), *Radial::FEATHER_RANGE.end()),
+                invert: false,
+                ev: 0.0,
+            }))
+        }
+        // Painted: the nib from its attribute, or from the first dab for a file that
+        // has strokes and no word for them, or round. A painted mask with no strokes is
+        // a real mask, one that has been made and not yet painted on.
+        Some("brush") => {
+            let passes = read_passes(&node);
+            let painted = passes.iter().flat_map(|g| g.dabs.iter()).next().map(|d| d.nib);
+            Some(Shape::Brush {
+                nib: get("Nib")
+                    .and_then(crate::dodgeburn::Nib::from_key)
+                    .or(painted)
+                    .unwrap_or_default(),
+                passes,
+            })
+        }
+        // A word from a newer build: not a shape this one knows.
+        Some(_) => return None,
+    };
+    // The tone is there when its group is: `MaskEnabled` leads it and is always written.
+    let tone = get("MaskEnabled").is_some().then(|| read_zone_mask(&node));
+    if shape.is_none() && tone.is_none() {
+        return None;
+    }
+    Some(CurveMask {
+        enabled: b("Enabled", true),
+        shape,
+        invert: b("Invert", false),
+        tone,
+        rule: get("Rule").and_then(Rule::from_key).unwrap_or_default(),
+    })
 }
 
 fn read_curves(desc: &roxmltree::Node) -> Option<Vec<CurveInstance>> {
@@ -2408,6 +2704,7 @@ fn read_curves(desc: &roxmltree::Node) -> Option<Vec<CurveInstance>> {
                 name,
                 curve,
                 opacity,
+                mask: read_curve_mask(&li),
             })
         })
         .take(CurveStack::MAX_INSTANCES)
@@ -2554,10 +2851,15 @@ mod tests {
     #[test]
     fn future_sidecars_are_not_loaded_or_overwritten() {
         let image = std::env::temp_dir().join(format!("monopro-future-{}.dng", std::process::id()));
-        let xml = to_xml(&Params::default(), &Metadata::default(), "future.dng").replace(
-            &format!("SchemaVersion=\"{SCHEMA_VERSION}\""),
+        // Replacing the version the file *wrote*, not the newest this build reads: the
+        // two differ for any file without a curve mask, and a replacement that found
+        // nothing would leave a current file and a test that passed by accident.
+        let params = Params::default();
+        let xml = to_xml(&params, &Metadata::default(), "future.dng").replace(
+            &format!("SchemaVersion=\"{}\"", written_schema(&params)),
             "SchemaVersion=\"999\"",
         );
+        assert!(xml.contains("SchemaVersion=\"999\""), "the version was not found");
         std::fs::write(path_for(&image), &xml).unwrap();
         let result = write(&image, &Params::default(), &Metadata::default());
         let preserved = std::fs::read_to_string(path_for(&image)).unwrap();
@@ -2606,7 +2908,7 @@ mod tests {
         // remaining edits survive, and neither removed rendering path can return.
         let legacy = xml
             .replace(
-                &format!("SchemaVersion=\"{SCHEMA_VERSION}\""),
+                &format!("SchemaVersion=\"{}\"", written_schema(&p)),
                 "SchemaVersion=\"15\"",
             )
             .replace(
@@ -2764,6 +3066,7 @@ mod tests {
                     edge_aware: false,
                     region: 0.075,
                     edge: 1.25,
+                    island: Default::default(),
                 },
                 ..Instance::of(
                     Sign::Burn,
@@ -3183,7 +3486,7 @@ mod tests {
             // *every* future bump, and a hardcoded "4" would have made the test
             // stop exercising it the first time one landed. It did, at 5.
             .replace(
-                &format!("SchemaVersion=\"{SCHEMA_VERSION}\""),
+                &format!("SchemaVersion=\"{}\"", written_schema(&p)),
                 "SchemaVersion=\"3\"",
             );
 
@@ -3979,7 +4282,7 @@ mod tests {
         p.exposure.ev = 1.25;
         let current = to_xml(&p, &Metadata::default(), "t.dng");
         let older = current.replace(
-            &format!("monopro:SchemaVersion=\"{SCHEMA_VERSION}\""),
+            &format!("monopro:SchemaVersion=\"{}\"", written_schema(&p)),
             &format!("monopro:SchemaVersion=\"{PARAMS_SCHEMA}\""),
         );
         assert_ne!(
@@ -4115,7 +4418,7 @@ mod tests {
             Loaded::Ok(s) => {
                 assert_eq!(s.params, p);
                 assert_eq!(s.metadata, meta);
-                assert_eq!(s.schema, SCHEMA_VERSION);
+                assert_eq!(s.schema, written_schema(&p));
             }
             other => panic!("did not read back: {other:?}"),
         }
@@ -4300,8 +4603,531 @@ mod toning_persistence {
         };
         let xml = to_xml(&p, &Metadata::default(), "test.dng");
         assert!(
-            xml.contains(&format!("monopro:SchemaVersion=\"{SCHEMA_VERSION}\"")),
+            xml.contains(&format!("monopro:SchemaVersion=\"{}\"", written_schema(&p))),
             "{xml}"
         );
+    }
+}
+
+/// What a curve pass's mask keeps in the file, and what a file without one still says.
+#[cfg(test)]
+mod curve_mask_persistence {
+    use super::*;
+    use crate::curve::{CurveMask, Rule};
+    use crate::dodgeburn::{Dab, Gesture, Linear, Nib, Radial, Shape, ZoneMask};
+
+    fn sky_grad() -> Shape {
+        Shape::Linear(Linear {
+            x0: 0.5,
+            y0: 0.0,
+            x1: 0.5,
+            y1: 0.5,
+            feather: 0.8,
+            ev: 0.0,
+        })
+    }
+
+    fn spot() -> Shape {
+        Shape::Radial(Radial {
+            cx: 0.4,
+            cy: 0.6,
+            inner: 0.05,
+            outer: 0.3,
+            aspect: 1.6,
+            angle: 25.0,
+            feather: 0.7,
+            invert: false,
+            ev: 0.0,
+        })
+    }
+
+    fn with_mask(mask: Option<CurveMask>) -> Params {
+        let mut p = Params::default();
+        p.curve.instances[0].curve.add(0.4, 0.6);
+        p.curve.instances[0].mask = mask;
+        p
+    }
+
+    fn trip(p: &Params) -> Params {
+        let xml = to_xml(p, &Metadata::default(), "t.dng");
+        match from_xml(&xml) {
+            Loaded::Ok(s) => s.params,
+            other => panic!("did not read back: {other:?}\n{xml}"),
+        }
+    }
+
+    /// The first mask element's tag, rewritten with `edit`, to make a bad file from a
+    /// good one.
+    fn damaged(p: &Params, edit: impl Fn(&str) -> String) -> Params {
+        let xml = to_xml(p, &Metadata::default(), "t.dng");
+        let start = xml.find("<monopro:Mask ").expect("a mask was written");
+        let end = start + xml[start..].find("/>").expect("the element closes") + 2;
+        let bad = format!("{}{}{}", &xml[..start], edit(&xml[start..end]), &xml[end..]);
+        match from_xml(&bad) {
+            Loaded::Ok(s) => s.params,
+            other => panic!("a bad mask must not stop the file opening: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_shape_mask_round_trips() {
+        for shape in [sky_grad(), spot()] {
+            let mut mask = CurveMask::of_shape(shape);
+            mask.invert = true;
+            let p = with_mask(Some(mask));
+            assert_eq!(trip(&p), p);
+        }
+    }
+
+    /// One dab, round and at full opacity unless `card` says otherwise; `paint` is
+    /// whether its pass adds to the mask or erases from it.
+    fn mask_dab(x: f32, y: f32, paint: bool, card: Option<(f32, f32)>) -> Dab {
+        Dab {
+            x,
+            y,
+            radius: 0.125,
+            feather: 0.5,
+            opacity: 0.75,
+            ev: if paint { 1.0 } else { -1.0 },
+            aspect: card.map_or(1.0, |c| c.0),
+            angle: card.map_or(0.0, |c| c.1),
+            nib: if card.is_some() { Nib::Card } else { Nib::Round },
+            falloff: crate::dodgeburn::Falloff::Core,
+        }
+    }
+
+    #[test]
+    fn a_painted_mask_round_trips_with_every_pass() {
+        // Two passes that paint and one that erases, round and then card, where a card's
+        // dabs carry their own aspect and angle. The mask comes back stroke for stroke.
+        for card in [None, Some((0.5, 30.0))] {
+            let passes = vec![
+                Gesture::new(vec![
+                    mask_dab(0.25, 0.25, true, card),
+                    mask_dab(0.375, 0.25, true, card),
+                ]),
+                Gesture::new(vec![mask_dab(0.5, 0.75, true, card)]),
+                Gesture::new(vec![mask_dab(0.375, 0.25, false, card)]),
+            ];
+            let mut mask = CurveMask::of_shape(Shape::Brush {
+                nib: if card.is_some() { Nib::Card } else { Nib::Round },
+                passes,
+            });
+            mask.invert = true;
+            mask.tone = Some(ZoneMask {
+                enabled: true,
+                hi: 1.5,
+                ..ZoneMask::default()
+            });
+            mask.rule = Rule::Add;
+            let p = with_mask(Some(mask));
+            let back = trip(&p);
+            assert_eq!(back, p);
+            let Some(Shape::Brush { passes, .. }) =
+                &back.curve.instances[0].mask.as_ref().unwrap().shape
+            else {
+                panic!("the mask is no longer painted");
+            };
+            assert_eq!(passes.len(), 3);
+            assert_eq!(passes[2].sign(), -1.0, "the eraser pass still erases");
+        }
+    }
+
+    #[test]
+    fn a_painted_mask_with_no_strokes_is_still_a_mask_and_keeps_its_nib() {
+        // A painted mask exists from the moment it is picked, before the first stroke,
+        // and a Card mask is a Card mask before it has a dab to say so.
+        for nib in [Nib::Round, Nib::Card] {
+            let p = with_mask(Some(CurveMask::of_shape(Shape::Brush {
+                nib,
+                passes: Vec::new(),
+            })));
+            let back = trip(&p);
+            assert_eq!(back, p);
+            assert_eq!(written_schema(&p), SCHEMA_VERSION, "a mask, so the newer version");
+        }
+    }
+
+    #[test]
+    fn a_painted_masks_bad_dab_is_dropped_and_the_rest_kept() {
+        let p = with_mask(Some(CurveMask::of_shape(Shape::Brush {
+            nib: Nib::Round,
+            passes: vec![Gesture::new(vec![
+                mask_dab(0.25, 0.25, true, None),
+                mask_dab(0.5, 0.5, true, None),
+            ])],
+        })));
+        let xml = to_xml(&p, &Metadata::default(), "t.dng");
+        // The first dab loses two numbers: five is not a dab this build understands.
+        let first = "0.25,0.25,0.125,0.5,0.75,1,1";
+        assert!(xml.contains(first), "the dab was not written as expected:\n{xml}");
+        let bad = xml.replace(first, "0.25,0.25,0.125,0.5,0.75");
+        let Loaded::Ok(back) = from_xml(&bad) else {
+            panic!("a bad dab must not stop the file opening");
+        };
+        let mask = back.params.curve.instances[0].mask.as_ref().expect("still a mask");
+        let Some(Shape::Brush { passes, .. }) = &mask.shape else {
+            panic!("the mask is no longer painted");
+        };
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].dabs.len(), 1, "the unreadable dab was not dropped");
+        assert_eq!(passes[0].dabs[0].x, 0.5);
+    }
+
+    #[test]
+    fn a_stroke_keeps_its_falloff_and_a_new_one_makes_the_file_a_nineteen() {
+        use crate::dodgeburn::{Falloff, Instance, Sign};
+        let layer = |falloff: Falloff| {
+            let mut p = Params::default();
+            p.dodgeburn.enabled = true;
+            p.dodgeburn.instances.push(Instance::of(
+                Sign::Burn,
+                "Burn 1".into(),
+                Shape::brush(vec![Gesture::new(vec![
+                    Dab {
+                        falloff,
+                        ..mask_dab(0.25, 0.25, false, None)
+                    },
+                    Dab {
+                        falloff,
+                        ..mask_dab(0.5, 0.5, false, Some((0.5, 30.0)))
+                    },
+                ])]),
+            ));
+            p
+        };
+        // A stroke painted before the core falloff: six and nine numbers, as an 18
+        // wrote them, read back with the bell, and the file stays an 18.
+        let old = layer(Falloff::Bell);
+        assert_eq!(written_schema(&old), SCHEMA_VERSION - 1);
+        let xml = to_xml(&old, &Metadata::default(), "t.dng");
+        assert!(xml.contains("0.25,0.25,0.125,0.5,0.75,-1 "), "{xml}");
+        assert_eq!(trip(&old), old);
+        // A stroke painted now: one more number each, and a 19.
+        let new = layer(Falloff::Core);
+        assert_eq!(written_schema(&new), SCHEMA_VERSION);
+        let xml = to_xml(&new, &Metadata::default(), "t.dng");
+        assert!(xml.contains("0.25,0.25,0.125,0.5,0.75,-1,1 "), "{xml}");
+        assert!(xml.contains(",0.5,30,1,1<"), "{xml}");
+        assert_eq!(trip(&new), new);
+        // A seventh number that is not the core falloff is not a dab this build knows.
+        let bad = xml.replace("0.25,0.25,0.125,0.5,0.75,-1,1 ", "0.25,0.25,0.125,0.5,0.75,-1,7 ");
+        let Loaded::Ok(back) = from_xml(&bad) else {
+            panic!("a bad dab must not stop the file opening");
+        };
+        assert_eq!(back.params.dodgeburn.instances[0].shape.passes()[0].dabs.len(), 1);
+    }
+
+    #[test]
+    fn an_island_round_trips_on_a_layer_and_makes_the_file_a_nineteen() {
+        // A Dodge & Burn layer's tone mask is in every file since 5, and an 18 reader
+        // knows it. It does not know seeds: it would burn every part of the frame with
+        // those tones and write the layer back without them. So a layer with an island
+        // is written as the version that reader refuses, and one without is not.
+        use crate::dodgeburn::{DodgeBurnParams, Instance, Island, Sign};
+        let layers = |island: Island| {
+            let mut layer = Instance::of(Sign::Burn, "Sky".into(), sky_grad());
+            layer.mask = ZoneMask {
+                enabled: true,
+                lo: 1.0,
+                island,
+                ..ZoneMask::default()
+            };
+            Params {
+                dodgeburn: DodgeBurnParams {
+                    enabled: true,
+                    instances: vec![layer],
+                },
+                ..Params::default()
+            }
+        };
+        let plain = layers(Island::default());
+        assert_eq!(written_schema(&plain), SCHEMA_VERSION - 1);
+        let xml = to_xml(&plain, &Metadata::default(), "t.dng");
+        assert!(
+            !xml.contains("MaskIsland") && !xml.contains("MaskSeeds"),
+            "a range with no island wrote one"
+        );
+
+        let mut island = Island::new(true);
+        island.add((0.3, 0.25));
+        island.add((0.7, 0.2));
+        let seeded = layers(island);
+        assert_eq!(written_schema(&seeded), SCHEMA_VERSION);
+        assert_eq!(trip(&seeded), seeded);
+
+        // Switched off, its seeds are still in the file, and the file is still a 19.
+        let mut off = island;
+        off.enabled = false;
+        let kept = layers(off);
+        assert_eq!(written_schema(&kept), SCHEMA_VERSION);
+        let back = trip(&kept);
+        assert_eq!(back.dodgeburn.instances[0].mask.island.seeds().len(), 2);
+        assert!(!back.dodgeburn.instances[0].mask.island.enabled);
+    }
+
+    #[test]
+    fn an_islands_bad_seed_is_dropped_and_the_others_kept() {
+        let mut tone = ZoneMask {
+            enabled: true,
+            lo: 1.0,
+            ..ZoneMask::default()
+        };
+        tone.island.enabled = true;
+        tone.island.add((0.25, 0.5));
+        tone.island.add((0.75, 0.5));
+        let p = with_mask(Some(CurveMask {
+            enabled: true,
+            shape: None,
+            invert: false,
+            tone: Some(tone),
+            rule: Rule::Intersect,
+        }));
+        let back = damaged(&p, |m| {
+            assert!(m.contains("MaskSeeds=\"0.25,0.5 0.75,0.5\""), "{m}");
+            m.replace("0.25,0.5 0.75,0.5", "0.25,nan 7,0.5 0.75,0.5 oops 0.5")
+        });
+        let island = back.curve.instances[0].mask.as_ref().unwrap().tone.unwrap().island;
+        assert!(island.enabled);
+        assert_eq!(island.seeds(), &[(0.75, 0.5)], "only the seed that is a point");
+    }
+
+    #[test]
+    fn a_mask_that_is_off_keeps_its_shape() {
+        let mut mask = CurveMask::of_shape(sky_grad());
+        mask.enabled = false;
+        let p = with_mask(Some(mask));
+        let back = trip(&p);
+        assert_eq!(back, p);
+        assert!(!back.curve.instances[0].mask.as_ref().unwrap().enabled);
+    }
+
+    #[test]
+    fn every_tone_field_and_the_rule_round_trip() {
+        let tone = ZoneMask {
+            enabled: true,
+            lo: -3.5,
+            hi: 1.25,
+            f_lo: 0.75,
+            f_hi: 2.0,
+            invert: true,
+            blur: 0.02,
+            edge_aware: false,
+            region: 0.08,
+            edge: 0.9,
+            island: {
+                let mut island = crate::dodgeburn::Island::new(true);
+                island.add((0.25, 0.5));
+                island.add((0.75, 0.125));
+                island
+            },
+        };
+        for rule in Rule::ALL {
+            let p = with_mask(Some(CurveMask {
+                enabled: true,
+                shape: Some(spot()),
+                invert: true,
+                tone: Some(tone),
+                rule,
+            }));
+            assert_eq!(trip(&p), p, "{rule:?}");
+        }
+        // A tone alone is a whole mask, and keeps no shape it was never given.
+        let alone = with_mask(Some(CurveMask {
+            enabled: true,
+            shape: None,
+            invert: false,
+            tone: Some(tone),
+            rule: Rule::Intersect,
+        }));
+        assert_eq!(trip(&alone), alone);
+        let xml = to_xml(&alone, &Metadata::default(), "t.dng");
+        assert!(!xml.contains("monopro:Shape="), "{xml}");
+    }
+
+    #[test]
+    fn the_mask_uses_dodge_and_burns_names_and_leaves_out_what_a_curve_does_not_need() {
+        let mut mask = CurveMask::of_shape(spot());
+        mask.tone = Some(ZoneMask::default());
+        let xml = to_xml(&with_mask(Some(mask)), &Metadata::default(), "t.dng");
+        for name in [
+            "Shape=\"radial\"",
+            "GradCentre=",
+            "GradInner=",
+            "GradOuter=",
+            "GradAspect=",
+            "GradAngle=",
+            "GradFeather=",
+            "MaskLo=",
+            "MaskEdgeAware=",
+            "Rule=\"intersect\"",
+        ] {
+            assert!(
+                xml.contains(&format!("monopro:{name}")),
+                "{name} missing from\n{xml}"
+            );
+        }
+        assert!(
+            !xml.contains("GradEV") && !xml.contains("GradInvert"),
+            "a mask carries neither a strength nor a second invert:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn a_file_says_19_only_when_a_curve_has_a_mask() {
+        let plain = with_mask(None);
+        assert_eq!(written_schema(&plain), 18);
+        let xml = to_xml(&plain, &Metadata::default(), "t.dng");
+        assert!(xml.contains("monopro:SchemaVersion=\"18\""), "{xml}");
+        assert!(!xml.contains("<monopro:Mask "), "an unmasked file carries none");
+
+        let masked = with_mask(Some(CurveMask::of_shape(sky_grad())));
+        assert_eq!(written_schema(&masked), SCHEMA_VERSION);
+        let xml = to_xml(&masked, &Metadata::default(), "t.dng");
+        assert!(xml.contains("monopro:SchemaVersion=\"19\""), "{xml}");
+
+        // A bypassed mask still counts: the file carries it, so a reader that would
+        // drop it on save has to be told to stay away.
+        let mut off = CurveMask::of_shape(sky_grad());
+        off.enabled = false;
+        assert_eq!(written_schema(&with_mask(Some(off))), SCHEMA_VERSION);
+
+        // And so does a mask on a pass in a bypassed module.
+        let mut module_off = with_mask(Some(CurveMask::of_shape(sky_grad())));
+        module_off.curve.enabled = false;
+        assert_eq!(written_schema(&module_off), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_mask_on_any_pass_counts() {
+        let mut p = with_mask(None);
+        let second = p.curve.add_instance().expect("room");
+        assert_eq!(written_schema(&p), 18);
+        p.curve.instances[second].mask = Some(CurveMask::of_shape(spot()));
+        assert_eq!(written_schema(&p), SCHEMA_VERSION);
+        assert_eq!(trip(&p), p);
+    }
+
+    #[test]
+    fn a_newer_file_than_this_build_still_will_not_open() {
+        // 19 is readable and 20 is not: the check moved with the constant.
+        let p = with_mask(Some(CurveMask::of_shape(sky_grad())));
+        let xml = to_xml(&p, &Metadata::default(), "t.dng");
+        assert!(matches!(from_xml(&xml), Loaded::Ok(_)));
+        let future = xml.replace(
+            "monopro:SchemaVersion=\"19\"",
+            &format!("monopro:SchemaVersion=\"{}\"", SCHEMA_VERSION + 1),
+        );
+        assert!(matches!(from_xml(&future), Loaded::Corrupt(_)));
+    }
+
+    #[test]
+    fn a_malformed_mask_drops_the_mask_and_keeps_the_curve() {
+        let good = with_mask(Some(CurveMask::of_shape(sky_grad())));
+        let curve = good.curve.instances[0].curve.clone();
+        // What is wrong, the text to find, and what to put there.
+        let edits = [
+            (
+                "an unknown shape",
+                "Shape=\"linear\"",
+                "Shape=\"spiral\"",
+            ),
+            (
+                "a gradient with no geometry",
+                "GradFrom",
+                "GradFromX",
+            ),
+            (
+                "a coordinate that is not a number",
+                "GradTo=\"0.5,0.5\"",
+                "GradTo=\"0.5,nan\"",
+            ),
+            (
+                "a coordinate with one number",
+                "GradTo=\"0.5,0.5\"",
+                "GradTo=\"0.5\"",
+            ),
+            (
+                "neither a shape nor a tone",
+                "monopro:Shape=\"linear\"",
+                "",
+            ),
+        ];
+        for (what, find, put) in edits {
+            let back = damaged(&good, |m| {
+                assert!(m.contains(find), "{what}: {find} not in {m}");
+                m.replace(find, put)
+            });
+            assert_eq!(back.curve.instances.len(), 1, "{what}");
+            assert!(back.curve.instances[0].mask.is_none(), "{what}: mask kept");
+            assert_eq!(back.curve.instances[0].curve, curve, "{what}: curve lost");
+        }
+    }
+
+    #[test]
+    fn a_mask_read_from_a_hand_edited_file_stays_inside_what_the_math_can_hold() {
+        let good = with_mask(Some(CurveMask::of_shape(spot())));
+        let back = damaged(&good, |m| {
+            m.replace("GradCentre=\"0.4,0.6\"", "GradCentre=\"1e30,-1e30\"")
+                .replace("GradOuter=\"0.3\"", "GradOuter=\"90\"")
+                .replace("GradAspect=\"1.6\"", "GradAspect=\"0\"")
+                .replace("GradFeather=\"0.7\"", "GradFeather=\"7\"")
+        });
+        let mask = back.curve.instances[0].mask.as_ref().expect("still a mask");
+        let Some(Shape::Radial(r)) = &mask.shape else {
+            panic!("the shape changed kind");
+        };
+        assert!((-2.0..=3.0).contains(&r.cx) && (-2.0..=3.0).contains(&r.cy));
+        assert!(Radial::OUTER_RANGE.contains(&r.outer));
+        assert!(Radial::ASPECT_RANGE.contains(&r.aspect));
+        assert!(Radial::FEATHER_RANGE.contains(&r.feather));
+        let w = mask.weight_at(0.5, 0.5, 0.667, 0.0);
+        assert!(w.is_finite() && (0.0..=1.0).contains(&w), "{w}");
+    }
+
+    #[test]
+    fn an_unknown_rule_reads_as_the_default() {
+        let mut mask = CurveMask::of_shape(sky_grad());
+        mask.rule = Rule::Add;
+        let back = damaged(&with_mask(Some(mask)), |m| {
+            m.replace("Rule=\"add\"", "Rule=\"xor\"")
+        });
+        assert_eq!(
+            back.curve.instances[0].mask.as_ref().map(|m| m.rule),
+            Some(Rule::Intersect)
+        );
+    }
+
+    #[test]
+    fn dodge_and_burns_file_reads_as_it_did() {
+        // The tone fields moved into helpers shared with the curve mask. A layer's
+        // range must still be written and read exactly as before.
+        use crate::dodgeburn::{DodgeBurnParams, Instance, Sign};
+        let mut layer = Instance::of(Sign::Burn, "Linear Burn 1".into(), sky_grad());
+        layer.mask = ZoneMask {
+            enabled: true,
+            lo: -2.0,
+            hi: 1.5,
+            f_lo: 0.5,
+            f_hi: 1.25,
+            invert: true,
+            blur: 0.01,
+            edge_aware: false,
+            region: 0.06,
+            edge: 0.7,
+            island: Default::default(),
+        };
+        let p = Params {
+            dodgeburn: DodgeBurnParams {
+                enabled: true,
+                instances: vec![layer],
+            },
+            ..Params::default()
+        };
+        assert_eq!(trip(&p), p);
+        let xml = to_xml(&p, &Metadata::default(), "t.dng");
+        assert!(xml.contains(
+            "       monopro:MaskEnabled=\"true\" monopro:MaskLo=\"-2\" monopro:MaskHi=\"1.5\"\n"
+        ));
     }
 }

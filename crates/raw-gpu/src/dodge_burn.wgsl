@@ -29,13 +29,18 @@
 // rather than an ellipse that changes shape with the negative's aspect. Backwards, it
 // looks right on a square test image and wrong on every real one.
 //
-// # The mask strip
+// The two gradients, `linear_gradient` and `radial_gradient`, are not here: they are in
+// `gradients.wgsl`, which the executor prepends, because a curve's mask lays the same
+// shapes on the same negative and the two must not drift. Neither is the dab: its
+// record, its coverage and the cull are in `dabs.wgsl`, because a curve's mask can be
+// painted with the same brush. What is here is what a *layer* makes of its dabs.
 //
-// Zone masks arrive as one texture of up to MAX_INSTANCES masks stacked vertically,
-// each mask_w x mask_h, computed on the CPU at proxy resolution — `raw_core::zone` says
-// why that is the resolution the signal has. A strip rather than a 2D array because it
-// is one plain texture_2d either way and the intermediates are not float32-filterable,
-// so nothing here uses a sampler.
+// # The zone masks
+//
+// Zone masks arrive as a texture array, one layer per mask, each mask_w x mask_h, prepared
+// on the CPU at proxy resolution — `raw_core::zone` says why that is the resolution the
+// signal has. `zone_mask.wgsl` is where they are read and a range is cut at the pixel,
+// shared with the Curve pass, whose masks can have a tone part too.
 
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var dst: texture_storage_2d<rg32float, write>;
@@ -43,34 +48,12 @@
 // when every layer's Contrast is zero, avoiding the spatial analysis entirely.
 @group(0) @binding(5) var detail_base: texture_2d<f32>;
 
-struct Dab {
-    x: f32,
-    y: f32,
-    radius: f32,
-    feather: f32,
-    opacity: f32,
-    ev: f32,
-    // The nib: its own height/width ratio, its rotation in RADIANS (converted on the
-    // CPU), 0 for round and 1 for a card, and the radius of the circle enclosing it.
-    aspect: f32,
-    angle: f32,
-    nib: u32,
-    bound: f32,
-    // Which instance and which pass. Only ever compared for equality with the
-    // neighbouring dab's, which is what makes the sorted scan work.
-    //
-    // `gesture` and not `pass`, which is the word the rest of the app uses for it:
-    // `pass` is a WGSL reserved keyword and naga rejects it outright.
-    inst: u32,
-    gesture: u32,
-};
-
 struct Instance {
     // +1 dodge, -1 burn. The half of the number line an eraser cannot cross.
     sign: f32,
     opacity: f32,
-    // Row offset of this instance's mask in the strip, or -1 for no mask.
-    mask_row: i32,
+    // Layer of this instance's mask in the zone-mask array, or -1 for no mask.
+    mask_layer: i32,
     // 0 brush, 1 linear, 2 radial.
     kind: u32,
     // Linear: from (g0, g1) to (g2, g3). Radial: centre in (g0, g1).
@@ -100,170 +83,7 @@ fn visible_map_value(ev: f32, ev_max: f32) -> f32 {
     return 1.0 - exp2(-8.0 * normalized);
 }
 
-@group(0) @binding(6) var<storage, read> dabs: array<Dab>;
 @group(0) @binding(7) var<storage, read> instances: array<Instance>;
-@group(0) @binding(8) var masks: texture_2d<f32>;
-
-// # Culling, and why the loop has this shape
-//
-// The naive form — one thread per pixel over every dab — is linear in dab count:
-// measured at 2.3 ms for one dab, 9.6 ms at 200 and **44 ms at a thousand** on a
-// 2560x1600 viewport. A thousand dabs is an afternoon on one print, so that form does
-// not get slow, it stops working the more you use it. With the cull it is roughly flat:
-// 3.0 ms at a thousand. `tests/dodgeburn_cost.rs` re-takes both columns.
-//
-// Each workgroup culls the stroke list to the dabs that can reach its 8x8 tile, into a
-// workgroup **bitmask** — not a compacted list, because order is load-bearing. The
-// three-level composite is recovered by comparing each dab's (inst, gesture) with its
-// neighbour's, which only works walking the survivors in their original order; an
-// atomic append would give the right set in the wrong order.
-//
-// So the composite is a state machine over a possibly-gappy sequence rather than three
-// nested loops. A gesture whose dabs are all culled is never seen and contributes zero,
-// which is what it would have contributed anyway. A pass's sign comes from the first
-// *surviving* dab — every dab in a pass shares a sign, so that is the same value.
-//
-// # There is no early return in this shader
-//
-// `workgroupBarrier` must be reached by every invocation in the workgroup. The
-// usual `if (gid.x >= p.out_w) { return; }` guard would leave the threads past the
-// edge of a partial tile sitting outside the barrier, which is undefined behaviour
-// and, on some drivers, a hang. Out-of-range threads do the work and skip only the
-// store.
-
-// 32 bits per word. 4096 dabs per chunk is 512 bytes of workgroup memory, and
-// stroke lists longer than that are walked in several chunks — the state machine
-// carries across the boundary, so a chunk is invisible to the composite.
-const CULL_WORDS: u32 = 128u;
-const CULL_CHUNK: u32 = 4096u;
-const THREADS: u32 = 64u;
-
-var<workgroup> keep: array<atomic<u32>, 128>;
-
-// Below this feather the profile is a hard disc. Matches raw_core Dab::HARD; the
-// sigma below diverges as feather goes to zero, and the disc describes that shape
-// exactly anyway.
-const HARD: f32 = 0.01;
-
-// One dab's unsigned contribution, in stops.
-//
-// **Two aspects, and they are not the same thing.** `frame` is the negative's h/w and
-// undoes the mixed normalisation so that a nib at ratio 1 is round IN PIXELS;
-// `d.aspect` is the nib's own ratio and makes it deliberately not round. Into width
-// units first, THEN rotate, then scale by the nib's ratio — rotating in normalised
-// space shears the shape. Same order as raw_core::dodgeburn::Dab::distance, which is
-// the reference this must agree with.
-//
-// Returns zero at and beyond the boundary whatever the shape, which is what the cull
-// below depends on.
-fn dab_coverage(d: Dab, x: f32, y: f32, frame: f32) -> f32 {
-    let dx = x - d.x;
-    let dy = (y - d.y) * frame;
-    let c = cos(d.angle);
-    let s = sin(d.angle);
-    let lx = dx * c + dy * s;
-    let ly = -dx * s + dy * c;
-    let r = max(d.radius, 1e-6);
-    let nx = lx / r;
-    let ny = ly / (r * max(d.aspect, 0.01));
-    // Euclidean is an ellipse; Chebyshev is a rectangle — the boundary is where
-    // EITHER axis reaches one rather than where they reach it together, which is
-    // what gives a card its straight edge and its corners.
-    var dist = sqrt(nx * nx + ny * ny);
-    if (d.nib != 0u) {
-        dist = max(abs(nx), abs(ny));
-    }
-    if (dist >= 1.0) {
-        return 0.0;
-    }
-    var profile = 1.0;
-    if (d.feather >= HARD) {
-        let f = clamp(d.feather, HARD, 0.999);
-        // In the nib's own normalised space, so the feather stays the same fraction
-        // of the brush whatever shape or aspect it has.
-        let sigma = 1.0 / sqrt(-2.0 * log(1.0 - f));
-        let t = clamp(1.0 - dist, 0.0, 1.0);
-        profile = exp(-0.5 * (dist / sigma) * (dist / sigma)) * t * t * (3.0 - 2.0 * t);
-    }
-    return profile * d.opacity;
-}
-
-// A linear gradient's strength: full at the press, zero at the release, unbounded
-// perpendicular to the drag. See raw_core::dodgeburn::Linear, which is the
-// reference this must agree with.
-//
-// Aspect-corrected, which the prototype's is not — its iso-lines are not
-// perpendicular to a diagonal drag on a non-square frame.
-fn linear_weight(s: Instance, x: f32, y: f32, aspect: f32) -> f32 {
-    let dx = s.g2 - s.g0;
-    let dy = (s.g3 - s.g1) * aspect;
-    let len2 = dx * dx + dy * dy;
-    // Every frame between the press and the first movement.
-    if (len2 < 1e-10) {
-        return 1.0;
-    }
-    let t = ((x - s.g0) * dx + ((y - s.g1) * aspect) * dy) / len2;
-    let f = clamp(s.feather, 0.001, 1.0);
-    let lo = 0.5 - f * 0.5;
-    let hi = 0.5 + f * 0.5;
-    let u = clamp((t - lo) / (hi - lo), 0.0, 1.0);
-    return 1.0 - u * u * (3.0 - 2.0 * u);
-}
-
-// A radial gradient's strength: a spotlight, or a vignette when inverted.
-//
-// Into width units BEFORE the rotation, so the ellipse turns without shearing —
-// and so `aspect = 1.0` is a real circle rather than the frame's shape.
-fn radial_weight(s: Instance, x: f32, y: f32, aspect: f32) -> f32 {
-    let a = s.g7;
-    let c = cos(a);
-    let si = sin(a);
-    let qx = x - s.g0;
-    let qy = (y - s.g1) * aspect;
-    let lx = qx * c + qy * si;
-    let ly = -qx * si + qy * c;
-
-    let r = max(s.g5, 1e-4);
-    let nx = lx / r;
-    let ny = ly / (r * max(s.g6, 0.01));
-    let dist = sqrt(nx * nx + ny * ny);
-
-    let inner = clamp(s.g4 / r, 0.0, 0.999);
-    let u = clamp((dist - inner) / max(1.0 - inner, 1e-6), 0.0, 1.0);
-    let f = clamp(s.feather, 0.0, 1.0);
-    // Blended rather than switched, so the feather control is continuous.
-    let ramp = (1.0 - f) * u + f * (u * u * (3.0 - 2.0 * u));
-    let w = 1.0 - ramp;
-    if (s.invert != 0u) {
-        return 1.0 - w;
-    }
-    return w;
-}
-
-// One mask value, bilinear over the strip row for `row`.
-//
-// Bilinear and not nearest, and the prototype learned this the hard way: nearest
-// turns the proxy's pixels into hard blocks, which the guided filter then
-// faithfully preserves as "edges" — a mask that reads as visibly pixelated at 100%
-// while the Region slider appears to do nothing.
-fn mask_at(row: i32, u: f32, v: f32) -> f32 {
-    let mw = i32(p.mask_w);
-    let mh = i32(p.mask_h);
-    // Texel centres, so the corners of the mask are not half a texel adrift.
-    let fx = clamp(u * f32(mw) - 0.5, 0.0, f32(mw - 1));
-    let fy = clamp(v * f32(mh) - 0.5, 0.0, f32(mh - 1));
-    let x0 = i32(floor(fx));
-    let y0 = i32(floor(fy));
-    let x1 = min(x0 + 1, mw - 1);
-    let y1 = min(y0 + 1, mh - 1);
-    let tx = fx - f32(x0);
-    let ty = fy - f32(y0);
-    let a = textureLoad(masks, vec2<i32>(x0, row + y0), 0).r;
-    let b = textureLoad(masks, vec2<i32>(x1, row + y0), 0).r;
-    let c = textureLoad(masks, vec2<i32>(x0, row + y1), 0).r;
-    let e = textureLoad(masks, vec2<i32>(x1, row + y1), 0).r;
-    return mix(mix(a, b, tx), mix(c, e, tx), ty);
-}
 
 // One instance's finished contribution: the eraser clamp, its zone mask, and its
 // master opacity, in that order — which is `Instance::ev_at` followed by the two
@@ -278,8 +98,8 @@ fn apply_instance(idx: u32, ev_in: f32, x: f32, y: f32) -> f32 {
     } else {
         e = min(e, 0.0);
     }
-    if (s.mask_row >= 0) {
-        e = e * mask_at(s.mask_row, x, y);
+    if (s.mask_layer >= 0) {
+        e = e * mask_at(s.mask_layer, x, y);
     }
     return e * s.opacity;
 }
@@ -290,8 +110,8 @@ fn apply_instance(idx: u32, ev_in: f32, x: f32, y: f32) -> f32 {
 fn apply_contrast(idx: u32, coverage_in: f32, x: f32, y: f32) -> f32 {
     let s = instances[idx];
     var w = clamp(coverage_in, 0.0, 1.0);
-    if (s.mask_row >= 0) {
-        w = w * mask_at(s.mask_row, x, y);
+    if (s.mask_layer >= 0) {
+        w = w * mask_at(s.mask_layer, x, y);
     }
     return s.contrast * w * s.opacity;
 }
@@ -306,25 +126,8 @@ fn main(
     let sh = f32(p.src_h);
     let aspect = sh / sw;
 
-    // This tile's footprint on the negative. An affine maps a rectangle to a
-    // parallelogram, whose bounding box is exactly the box of its four corners —
-    // so this is tight rather than conservative, even under a straighten.
-    let ax0 = f32(i32(wid.x * 8u) + p.out_x);
-    let ay0 = f32(i32(wid.y * 8u) + p.out_y);
-    let c0 = source_at(ax0, ay0);
-    let c1 = source_at(ax0 + 7.0, ay0);
-    let c2 = source_at(ax0, ay0 + 7.0);
-    let c3 = source_at(ax0 + 7.0, ay0 + 7.0);
-    // One source pixel of slack in each direction. The box is exact in exact
-    // arithmetic; the slack is for the last bits of the mantissa, because the
-    // failure mode of a box that is a hair too small is a hard-clipped dab edge
-    // along a tile boundary — an 8-pixel step in the middle of a soft falloff.
-    let lo = min(min(c0, c1), min(c2, c3)) - vec2<f32>(1.0, 1.0);
-    let hi = max(max(c0, c1), max(c2, c3)) + vec2<f32>(1.0, 1.0);
-    let bx0 = lo.x / sw;
-    let bx1 = hi.x / sw;
-    let by0 = lo.y / sh;
-    let by1 = hi.y / sh;
+    // This tile's footprint on the negative, which the cull tests every dab against.
+    let tile = tile_bounds(wid);
 
     let sc = source_coord(gid.xy);
     let x = sc.x / sw;
@@ -353,33 +156,7 @@ fn main(
         if (base >= n) { break; }
         let count = min(CULL_CHUNK, n - base);
 
-        var w = lid;
-        loop {
-            if (w >= CULL_WORDS) { break; }
-            atomicStore(&keep[w], 0u);
-            w = w + THREADS;
-        }
-        workgroupBarrier();
-
-        // Mark every dab whose disc meets this tile. Closest-point test against the
-        // box, in width-normalised units — the same units `dab_magnitude` measures
-        // distance in, which is what makes the two agree exactly.
-        var k = lid;
-        loop {
-            if (k >= count) { break; }
-            let d = dabs[base + k];
-            let ddx = d.x - clamp(d.x, bx0, bx1);
-            let ddy = (d.y - clamp(d.y, by0, by1)) * aspect;
-            // `d.bound`, not `d.radius`: the enclosing circle of the nib, which for
-            // an elongated or rotated one is larger. Conservative — nothing that
-            // could contribute is dropped — and less effective the longer the nib,
-            // which is the honest trade.
-            if (ddx * ddx + ddy * ddy < d.bound * d.bound) {
-                atomicOr(&keep[k >> 5u], 1u << (k & 31u));
-            }
-            k = k + THREADS;
-        }
-        workgroupBarrier();
+        cull_dabs(base, count, lid, tile, aspect);
 
         // Walk the survivors in order.
         var word = 0u;
@@ -443,9 +220,11 @@ fn main(
         }
         var w = 0.0;
         if (s.kind == KIND_LINEAR) {
-            w = linear_weight(s, x, y, aspect);
+            w = linear_gradient(vec2<f32>(s.g0, s.g1), vec2<f32>(s.g2, s.g3), s.feather, x, y, aspect);
         } else {
-            w = radial_weight(s, x, y, aspect);
+            w = radial_gradient(
+                vec2<f32>(s.g0, s.g1), s.g4, s.g5, s.g6, s.g7, s.feather, s.invert != 0u, x, y, aspect,
+            );
         }
         total = total + apply_instance(k, w * s.ev, x, y);
         total_contrast = total_contrast + apply_contrast(k, w, x, y);
@@ -468,20 +247,9 @@ fn main(
         let local_base = textureLoad(detail_base, in2_coord(abs_coord(gid.xy)), 0).r;
         out = exp2(log_value + total + total_contrast * (log_value - local_base));
     }
-    // The zone mask, on its own, for the instance the panel has selected. Shown
-    // rather than the picture: a mask is a shape, and judging a shape against a
-    // photograph it is drawn over is harder than judging it alone.
-    if (p.db_show_mask >= 0 && u32(p.db_show_mask) < p.db_instances) {
-        let s = instances[u32(p.db_show_mask)];
-        if (s.mask_row >= 0) {
-            out = mask_at(s.mask_row, x, y);
-        } else {
-            // No mask on that instance is not an error and must not read as a black
-            // frame — an open mask selects everything, and white is what everything
-            // looks like.
-            out = 1.0;
-        }
-    } else if ((p.overlays & 8u) != 0u) {
+    // A layer's own mask is not shown from here: the display pass draws it, from the
+    // record the mask view is handed, over the picture or in its place.
+    if ((p.overlays & 8u) != 0u) {
         let map = visible_map_value(max(total, 0.0), p.db_ev_max);
         // Keep 15% of the photograph as registration context, then place the map over
         // it. Addition rather than interpolation is deliberate: an unpainted pixel is

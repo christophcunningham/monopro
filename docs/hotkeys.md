@@ -16,6 +16,7 @@ Letter shortcuts are suppressed while typing into text fields.
 | `b` | Surround — border around the image |
 | `y` | False-color exposure map |
 | `j` | Cycle JPEG-color and raw-linear previews |
+| `/` | Mask overlay — red film over what the mask protects |
 | `Tab` | Hide / show panels |
 | `z` | 100% / fit |
 | `Cmd+0` | Fit to window |
@@ -32,6 +33,9 @@ Letter shortcuts are suppressed while typing into text fields.
 | `Backtick` | Flick to the previous tab — A/B comparison |
 | `l` | Lightbox |
 | `e` | Bring the Develop panel forward |
+| `Shift+F` | Folders panel |
+| `Shift+S` | Search — cursor in the search field (also `Cmd+F`) |
+| `Shift+M` | Metadata panel |
 | `Alt+H` | Home — the start page |
 | `,` | Settings |
 | `.` | Keyboard shortcuts overlay |
@@ -73,8 +77,8 @@ Letter shortcuts are suppressed while typing into text fields.
 | `x` | Burn — Esc to leave |
 | `Shift+D` | Hold to see the dodge map |
 | `Shift+X` | Hold to see the burn map |
-| `Cmd+D` | New dodge instance (brush open) |
-| `Cmd+X` | New burn instance (brush open) |
+| `Cmd+Shift+D` | New dodge instance (brush open) |
+| `Cmd+Shift+X` | New burn instance (brush open) |
 | `[` | Smaller brush (brush open) |
 | `]` | Bigger brush (brush open) |
 | `Shift+[` | Harder edge (brush open) |
@@ -86,6 +90,14 @@ Letter shortcuts are suppressed while typing into text fields.
 
 ## Lightbox
 
+Ratings and color labels act on the selection in Lightbox, and on the open picture
+in Develop, where the title strip shows them after the exposure.
+
+The arrow keys move through whichever list was clicked last: the grid's tiles, or
+the folder tree once a folder has been clicked. In the tree, Up and Down open the
+folder above or below, Right expands a folder or steps into it, and Left folds it or
+steps out to its parent. The list that has the keys draws its selection in ruby.
+
 | Key | Action |
 |---|---|
 | `Space` | Quick Look selected image |
@@ -94,8 +106,6 @@ Letter shortcuts are suppressed while typing into text fields.
 | `Cmd+Shift+R` | Rename selected file(s) |
 | `Cmd+Shift+P` | Contact Sheet |
 | `Cmd+R` | Refresh folder: pick up files added or removed while it was open |
-| `Shift+S` | Search — cursor in the search field (also `Cmd+F`) |
-| `Shift+M` | Metadata panel |
 | `Cmd+A` | Select all images |
 | `Cmd+1` | One star |
 | `Cmd+2` | Two stars |
@@ -135,7 +145,6 @@ The print loupe closes with either key.
 When Home has laid the start page over Develop's tabs, `Esc` closes the start page
 first and leaves any tool under it as it was.
 
-While the brush is open, its shortcuts take precedence over tab duplication and
-rotation. `Alt+drag` erases; `Shift+click` draws a straight pass.
+While the brush is open, its shortcuts take precedence over rotation. `Alt+drag` erases; `Shift+click` draws a straight pass.
 
 Source: [binding table](../crates/raw-app/src/hotkeys.rs).

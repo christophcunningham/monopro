@@ -5,6 +5,15 @@ use raw_graph::Plan;
 
 const WORKING_BYTES: u64 = 512 * 1024 * 1024;
 
+/// The most zone-mask layers there can be at once: one per Dodge & Burn layer and one per
+/// Curve pass, each of which can have a tone mask, and one more for the tone of the mask
+/// the mask view is showing, each twice over, since a range with an island has a second
+/// layer for the island's weight. The array that holds them has this many layers at most,
+/// and WebGPU guarantees 256, so this is checked against the floor and not against the
+/// adapter: no device can be asked for more than it must offer.
+pub(crate) const MAX_MASK_LAYERS: usize =
+    2 * (raw_core::DodgeBurnParams::MAX_INSTANCES + raw_core::CurveStack::MAX_INSTANCES + 1);
+
 pub(crate) fn validate_plan(plan: &Plan, max_edge: u32) -> Result<u64, String> {
     let mut bytes = 0u64;
     for (i, step) in plan.steps.iter().enumerate() {
@@ -72,6 +81,24 @@ mod tests {
         }
         // A 4K display is supported too, without increasing the idle pool budget.
         validate_plan(&plan(16.0, 5.0, (3840, 2160)), 8192).unwrap();
+    }
+
+    #[test]
+    fn every_zone_mask_that_can_exist_fits_the_array_the_device_must_offer() {
+        // WebGPU's guaranteed `maxTextureArrayLayers`, which is what lets a layer per mask
+        // replace a strip of rows that could not hold them (11,520 rows against 8,192).
+        const GUARANTEED_LAYERS: usize = 256;
+        // A compile-time fact, so it is checked as one: adding a module with masks that
+        // pushes the count past the floor fails the build, not a device somewhere.
+        const {
+            assert!(
+                MAX_MASK_LAYERS <= GUARANTEED_LAYERS,
+                "more zone masks than a device must offer layers for"
+            );
+        }
+        // And the memory for all of them at the proxy's largest, a square 480x480 of f32.
+        let bytes = MAX_MASK_LAYERS * raw_core::zone::PROXY_WIDTH * raw_core::zone::PROXY_WIDTH * 4;
+        assert!(bytes < 64 * 1024 * 1024, "{bytes} bytes of zone masks");
     }
 
     #[test]

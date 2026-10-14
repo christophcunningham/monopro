@@ -337,8 +337,10 @@ fn notice_of_prompt(prompt: Prompt) -> Option<Notice> {
         Prompt::NotFound(_) | Prompt::Error(_) => return None,
         // The appcast embeds its notes, and they arrive with the offer.
         Prompt::ReleaseNotes(_) | Prompt::ReleaseNotesFailed(_) => return None,
-        // Every route that checks by hand already opens the sheet, and an
-        // install that finished belongs to the process that replaced this one.
+        // A check by hand already shows its result — the menu's in the sheet,
+        // About's beside its button, with a way to the sheet when there is an
+        // offer — and an install that finished belongs to the process that
+        // replaced this one.
         // A wildcard for the same reason as `notice_of`'s.
         Prompt::ShowInFocus | Prompt::ExtractionProgress(_) | Prompt::Installed { .. } | _ => {
             return None;
@@ -1113,8 +1115,9 @@ impl Updates {
     }
 
     /// **Check for Updates.** A user-initiated check, which Sparkle presents
-    /// through the in-app driver: its progress, its result and any offer all
-    /// land in the sheet. Refused while an export writes.
+    /// through the in-app driver: its progress, its result and any offer land in
+    /// this state, which the sheet and Settings › About both read. Refused while
+    /// an export writes.
     ///
     /// A user-initiated check also means "offer the skipped version again",
     /// which is exactly what Sparkle does to its own skip defaults when this

@@ -182,13 +182,43 @@ pub struct ExposureParams {
     pub enabled: bool,
     pub ev: f32,
     /// Trim on top of the sensor black level already subtracted at decode. Not only
-    /// a calibration nudge: the UI range (±0.150) is wide enough to genuinely crush
-    /// the shadows, which is a print decision. Allowed to go negative so shadows can
-    /// lift.
+    /// a calibration nudge: the UI reaches [`Self::BLACK_REACH`], enough to set a
+    /// print's black point, which is a print decision. Allowed to go negative so
+    /// shadows can lift. The panel shows it as [`Self::black_lstar`].
     pub black: f32,
 }
 
 impl ExposureParams {
+    /// How far the Black corr. slider reaches either way, in the linear units `black` is
+    /// stored in. At 0 EV that is L\* 29 going to black at one end, and black lifted to
+    /// L\* 29 at the other.
+    ///
+    /// **Narrower than the ±0.15 it was**, which reached L\* 46 — almost middle gray —
+    /// and spent most of its travel crushing shadows nobody wanted crushed; a print's
+    /// black point sits between L\* 0 and 15. A sidecar written with a value beyond this
+    /// keeps it: the slider pins at its end and the readout says where it really is.
+    pub const BLACK_REACH: f32 = 0.06;
+
+    /// Black corr. as the picture shows it: the lightness, L\* 0–100, below which tones
+    /// go to black, or — negative, like `black` — the lightness black is lifted to.
+    ///
+    /// **Measured after exposure**, because `black` is taken off before it: the same
+    /// setting reaches further up the tones at +1 EV than at 0, and this says so. Read
+    /// as display-linear, before the curve and the tone map, which leave the shadows
+    /// where they are under the default soft shoulder.
+    pub fn black_lstar(&self) -> f32 {
+        let y = self.black.abs() * self.ev.exp2();
+        let l = crate::display::lstar_encode(y) * 100.0;
+        if self.black < 0.0 { -l } else { l }
+    }
+
+    /// The `black` that puts the picture's black point at `lstar`, the inverse of
+    /// [`Self::black_lstar`] at this exposure.
+    pub fn black_for_lstar(&self, lstar: f32) -> f32 {
+        let y = crate::toning::y_from_lstar(lstar.abs() / 100.0) / self.ev.exp2();
+        if lstar < 0.0 { -y } else { y }
+    }
+
     /// Whether this changes anything: switched on, and moved off neutral.
     pub fn is_active(&self) -> bool {
         self.enabled && !self.is_default()
@@ -959,6 +989,14 @@ impl Params {
                             .any(|(a, b)| a.opacity != b.opacity),
                         "instance opacity",
                     ),
+                    (
+                        a.curve
+                            .instances
+                            .iter()
+                            .zip(&b.curve.instances)
+                            .any(|(a, b)| a.mask != b.mask),
+                        "mask",
+                    ),
                 ])
                 .or(Some("points")),
             ));
@@ -1089,6 +1127,32 @@ impl Params {
             ));
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod black_point_tests {
+    use super::ExposureParams;
+
+    #[test]
+    fn the_black_point_reads_in_lstar_and_round_trips() {
+        let at = |black, ev| ExposureParams { enabled: true, ev, black };
+        // The table the slider was judged by: 0.15 reached almost middle gray.
+        assert!((at(0.15, 0.0).black_lstar() - 45.6).abs() < 0.2);
+        assert!((at(0.02, 0.0).black_lstar() - 15.5).abs() < 0.2);
+        // Negative lifts, and says so with its sign.
+        assert!((at(-0.02, 0.0).black_lstar() + 15.5).abs() < 0.2);
+        assert_eq!(at(0.0, 0.0).black_lstar(), 0.0);
+        // Exposure is applied after, so +1 EV reaches further up the tones.
+        assert!(at(0.02, 1.0).black_lstar() > at(0.02, 0.0).black_lstar());
+        // And typing the readout back gives the value that produced it.
+        for black in [-0.05, -0.004, 0.0, 0.001, 0.0125, 0.06] {
+            for ev in [-1.0, 0.0, 1.5] {
+                let e = at(black, ev);
+                let back = e.black_for_lstar(e.black_lstar());
+                assert!((back - black).abs() < 1e-5, "{black} at {ev} EV came back {back}");
+            }
+        }
     }
 }
 
@@ -1655,6 +1719,39 @@ mod tests {
             a.what_changed(&b),
             Some(("Curve", Some("instance opacity")))
         );
+    }
+
+    #[test]
+    fn a_mask_edit_redraws_without_rebaking_and_names_itself_in_history() {
+        use crate::curve::CurveMask;
+        use crate::dodgeburn::{Linear, Shape};
+        let sky = |y1| {
+            Shape::Linear(Linear {
+                x0: 0.5,
+                y0: 0.0,
+                x1: 0.5,
+                y1,
+                feather: 1.0,
+                ev: 0.0,
+            })
+        };
+        let mut a = Params::default();
+        a.curve.instances[0].curve.add(0.5, 0.65);
+        a.curve.instances[0].mask = Some(CurveMask::of_shape(sky(0.5)));
+        let mut b = a.clone();
+        b.curve.instances[0].mask = Some(CurveMask::of_shape(sky(0.3)));
+        let dirty = a.diff(&b);
+        assert!(dirty.render, "moving a mask must redraw");
+        assert!(!dirty.decode && !dirty.luminance);
+        assert_eq!(a.what_changed(&b), Some(("Curve", Some("mask"))));
+        // And a mask that is switched off is the same picture as none.
+        let mut off = a.clone();
+        if let Some(mask) = &mut off.curve.instances[0].mask {
+            mask.enabled = false;
+        }
+        let mut none = a.clone();
+        none.curve.instances[0].mask = None;
+        assert_eq!(off.diff(&none), Dirty::NONE);
     }
 
     #[test]

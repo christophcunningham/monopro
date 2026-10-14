@@ -45,6 +45,9 @@ impl Preset {
             name: self.name.trim().to_owned(),
             curve,
             opacity: self.opacity.clamp(0.0, 1.0),
+            // A preset is a tonal recipe and a mask is a place on one negative, so it
+            // never carries one: `from_instance` stores no mask to load.
+            mask: None,
         })
     }
 

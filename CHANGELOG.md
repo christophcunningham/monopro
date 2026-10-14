@@ -16,7 +16,95 @@ changes belong in [docs/known-limitations.md](docs/known-limitations.md).
 
 ## Unreleased
 
+## 0.2.5 — 2026-10-13
+
+This release lets any Curve instance be limited to part of the picture, by a
+gradient, a painted mask, a range of tones or a tone island, and brings the same tone
+ranges, islands and eyedropper to Dodge & Burn, with Lightroom-style brush feathering
+and softer Lights and Darks presets. Around them: a start page with your recent
+folders and images, ratings and labels in Develop, Lightbox panels that close and pop
+out, the folder tree on the arrow keys, toning in the print loupe and in developed
+thumbnails, a clearer mask overlay, and quicker selection in Lightbox. Photographs
+that use the new masks are saved as sidecar version 19, which monopro 0.2.1 and
+earlier will not open; every other photograph stays at version 18.
+
 New
+- A Curve instance can be limited to part of the picture. Select an instance and open
+  its MASK section, which sits inside the instance between its red rules, and pick
+  Linear or Radial. Picking one places a mask at once and opens it on the picture:
+  Linear starts as a sky grad, full at the top edge of the picture and gone by the
+  middle, and Radial as a soft ellipse in the center. Drag a handle to move it, or
+  press on empty canvas to lay the shape again; Return keeps it, Esc puts everything
+  back as it was, and Space pans. The section is one row of icons, the four shapes and
+  then Adjust on image (a crosshair), Invert and Remove, with Transition, Core, Aspect
+  and Angle under it. An instance that has a mask shows a mask icon
+  beside its opacity, red while the mask is on; click it to switch the mask off and on
+  without losing the shape. Masks follow the photograph through crop, rotation and
+  export. The point sampler reads the masks where you click.
+- A Curve instance's mask can also be limited to a range of tones, on its own or inside
+  a shape. The MASK section has a TONE switch with the same ruler, Shadows, Midtones
+  and Highlights presets, Inv, and Edge and diffusion that Dodge & Burn's tone mask has.
+  A tone on its own is a luminosity mask across the whole frame. When a mask has both a
+  shape and a tone, Join says how they combine: Intersect, Subtract or Add. The range
+  reads the picture as it stood before Dodge & Burn, so burning never moves it, and
+  switching the tone off keeps its range.
+- A Curve instance's mask can be painted. Round and Card on the MASK row give the
+  instance a painted mask and put Dodge & Burn's brush in your hand: drag to paint
+  where the curve applies, Option-drag to erase, Shift-click for a straight pass, and
+  the bracket keys for the brush's radius and feather. A painted mask starts empty,
+  so the curve applies nowhere until it is painted in, as a Dodge & Burn layer does.
+  Radius, Feather, Aspect, Angle and Opacity are in the MASK section. Picking the
+  other nib keeps what you have painted. A painted mask joins a tone range as a
+  Linear or Radial one does, and can be inverted.
+- A tone range can be sampled from the picture, in the Curve's TONE section and in
+  Dodge & Burn's TONE MASK alike. The eyedropper at the end of the Shadows, Midtones
+  and Highlights row stays armed while you work. Click a tone to set the range around
+  it, one zone wide with one-zone shoulders. Drag a box to span the tones inside it,
+  leaving out the brightest and darkest tenth so a stray highlight does not stretch
+  the range. Hold Shift to add to the range instead of replacing it. Return, or the
+  eyedropper again, keeps the range; Esc puts it back as it was; Space pans. It reads
+  the same image the range selects from, regionally when the range is edge-aware, so
+  what you click is what gets selected. In Dodge & Burn, leaving the eyedropper
+  gives the brush back.
+- A tone range can be an island: only the tones connected to where you click, instead
+  of every part of the picture that has them, so a range set on the sea leaves out the
+  rock of the same gray above it. Island is a switch at the end of the L1 to D4 row,
+  in the Curve's TONE section and in Dodge & Burn's TONE MASK alike. Turning it on arms
+  the eyedropper. Click the picture to set the range around that tone and select what
+  is connected to that spot; Shift-click another spot to add it, up to eight; Option-
+  click a seed to take it away. The seeds show on the picture while the eyedropper is
+  armed, and the switch shows how many there are. The ruler is the tolerance: narrow
+  the range and the island stops sooner. Two areas that only touch along a thin strip
+  count as separate, so an island does not leak through a sliver. An island follows
+  the photograph through crop and rotation, and is worked out again when exposure
+  changes. Switching Island off keeps the seeds.
+- A mask can be seen on the picture, for a Curve instance and for a Dodge & Burn
+  layer alike. The Curve's MASK header and Dodge & Burn's TONE MASK heading have the
+  same two switches: "overlay" lays red film over what the mask protects and leaves
+  what it applies to clear, as Photoshop shows a layer mask, and "view mask" shows
+  the mask alone in place of the picture. They are one choice, since the picture
+  shows one mask at a time. With neither on, a mask still shows itself while you
+  shape it and goes when you let go: dragging a shape's or a gradient's handle on
+  the picture shows the overlay, and dragging a handle on the tone ruler shows the
+  mask alone. It works before a Curve instance has a curve or a layer has a stroke,
+  and with the module bypassed.
+- The / key turns the mask overlay on and off: red film over what the mask protects,
+  the same switch as "overlay" in the Curve's MASK header and Dodge & Burn's TONE MASK
+  heading. It shows the mask you are working on: the brush's layer while the brush is
+  open, otherwise the selected Curve instance's mask, or the selected layer's.
+- The Curve editor's histogram and Average are taken inside the selected instance's
+  mask. The histogram behind the graph shows the tones the curve actually reaches, a
+  red band along its foot marks where most of them lie, and the readout says, for
+  example, "Average: 0.42 EV darker inside the mask (38% of the frame)". Instances
+  above the selected one are counted where their own masks lie.
+- The Curve's point sampler has a "limit to tone" option beside it. With it on, the
+  click that places a point also limits the instance to the tones around the one you
+  clicked, so dragging the new point moves only those tones. The range it sets is in
+  the MASK section, which opens to show it.
+- Photographs with a Curve mask, a tone island on a Dodge & Burn layer, or a Dodge &
+  Burn stroke painted with this version's brush are saved as sidecar version 19.
+  monopro 0.2.1 and earlier will refuse to open or overwrite them, so their edits are
+  not lost. Every other photograph is still saved as version 18.
 - A start page: with no folder chosen, Lightbox shows the monopro mark, a way into
   the folder tree and your ten most recent folders, and Develop with no image open
   shows Open Image and your ten most recent images. Both link to Settings and the
@@ -29,14 +117,117 @@ New
 - Each Dodge & Burn layer has a Mask button beside its opacity. It turns the
   layer's tone mask on and off, and shows red while it is on, so you can see which
   layers are limited to a tonal range without opening them.
+- Ratings and color labels work in Develop. Command-1 to Command-5 and Shift-1 to
+  Shift-5 rate and label the open picture, and the same key again takes it off. The
+  title strip shows the stars and the label's dot after the exposure.
+- Shift-F brings the Lightbox FOLDERS panel forward, from Develop as well.
+- Scrolling can pan the picture instead of zooming it: Settings, Controls, Scrolling,
+  Pans. Two fingers on a trackpad then move the picture around, in Develop and in the
+  compare grid, and a pinch or Command-scroll zooms. A pan stops at the edge of the
+  picture, so a flick cannot send it off the canvas, and a picture that fits the
+  window stays centered.
+- A pinch on a trackpad zooms the picture in Develop and the compare grid, whatever
+  scrolling is set to.
+- Lightbox panels can be closed and popped out, as Develop's can. A panel's bar, or
+  the tab strip for the panel that is showing, has a pop-out button and an x at its
+  right end. A closed panel comes back from the Window menu, its key, or Tab twice; a
+  popped-out panel goes back with the button on its window or by closing the window.
+  Resetting the panel positions brings every panel back. The grid itself stays put.
+- The arrow keys move through the folder tree once a folder has been clicked. Up and
+  Down open the folder above or below, Right expands a folder or steps into it, and
+  Left folds it or steps out to its parent. Clicking a tile gives the arrows back to
+  the grid. Whichever has them draws its selection in ruby and the other in gray.
+- Opening a module near the bottom of the Develop panel scrolls the panel smoothly, just
+  far enough to show the whole module, without pushing its name off the top.
+- With the Curve's point sampler armed, the graph shows where a point would land: a
+  hollow ring on the curve, with a faint line down to its input, follows the tone
+  under the pointer on the picture until you click.
+- Each row in the start page's Recent Folders and Recent Images shows an x under the
+  pointer. Click it to take that row off the list; the folder or file itself is not
+  touched.
+
+Faster
+- Dragging a point or an opacity in the Curve is several times faster, most of all
+  with many instances.
+- Clicking from tile to tile in Lightbox is immediate. A tile is selected as you press
+  it rather than when you let go, and with the METADATA panel showing, the grid no
+  longer stops while the panel reads the file: a DNG took about a third of a second.
+  The panel shows the last picture's rows faded until the new ones arrive, and a
+  picture already looked at shows at once.
 
 Changed
+- The brush's Feather now means how much of the brush fades, as in Lightroom. A dab is
+  at full strength inside the cursor's dashed inner circle and fades smoothly to
+  nothing at the outer circle; Feather 0 is a hard edge and 1.0 fades from the middle
+  all the way out. Before, a higher Feather painted a smaller mark, and at 1.0 the
+  paint had faded out by half the brush. This is the same brush for Dodge & Burn and
+  for a painted Curve mask. Strokes saved before this change keep the edge they were
+  painted with, so prints already made look as they did. The brush now starts at
+  Feather 0.60.
+- Tone masks, in Dodge & Burn and in the Curve, have eight new presets under Shadows,
+  Midtones and Highlights: L1 to L4 and D1 to D4, approximating Tony Kuyper's Lights 1
+  to 4 and Darks 1 to 4. They are soft masks with no flat top, and each step selects a
+  narrower part of the picture than the last.
 - Dodge & Burn's shape picker has larger buttons, each with an icon beside its
   name: Round, Card, Linear and Radial, spread evenly across the panel. The area
   that holds them and the Dodge and Burn buttons is now a card like the modules
   above it.
 - Icons throughout the app are drawn a little larger inside their buttons, so their
   detail is easier to see. The buttons themselves are the same size.
+- The Curve's point sampler is an icon directly above the graph, without the "Point
+  sampler" label, and its cursor is drawn in dark and light so it shows on a bright sky.
+- Dodge & Burn's "view mask" shows a Linear or Radial layer's whole mask, the
+  gradient through its tone mask, where it used to show the tone mask alone. A
+  brushed layer still shows its tone mask. It also works on a layer with no strokes
+  yet, which it did not before.
+- Black corr. reads in L*: the lightness below which tones go to black, or, negative,
+  the lightness black is lifted to, as the picture shows it at the current exposure.
+  The slider is finer near zero, where a print's black point sits, and reaches L* 29
+  either way instead of almost middle gray. Edits made before look exactly as they did.
+- The mask overlay is solid red over what the mask protects. Before, a quarter of the
+  picture showed through, which turned the red pink over a bright sky or a pale wall and
+  made untouched areas look painted. Now the picture shows only as darker and lighter
+  red, and a lighter, pinker film means the mask is partly there. This is the same
+  overlay for Dodge & Burn and for a Curve mask.
+- Dragging the picture in Develop stops at its edge, with the margin around it, rather
+  than letting it slide off the canvas.
+- Develop's panels carry their pop-out button and x at the right end of the tab strip,
+  for the panel that is showing, as Lightbox's do, in place of an x on every tab and a
+  row under the strip holding the pop-out. TONAL DISTRIBUTION moves up to sit one
+  module gap under the tabs, and Reset All is on its header. A panel on its own wears
+  the same bar in both modes: its name, then the pop-out and the x.
+- A new dodge or burn instance is now Command-Shift-D or Command-Shift-X while the
+  brush is open, and Command-D duplicates the tab even then.
+- The duplicate button is part of the tab in front: a square at its right end, the
+  tab's own height and shade, parted from the name by a thin seam, where it used to be
+  a loose icon beside it.
+- The keyboard shortcuts reference lists Shift-S and Shift-M under Navigation, with
+  the new Shift-F.
+- "Use the folder tree to start" on the Lightbox start page is plain text now rather
+  than a row that lit up like a link.
+- Check for Updates in Settings, About answers right there: the version you have,
+  then "checking", "up to date", or the version on offer with a Show Update button.
+  It no longer opens the update sheet unless there is an update to show. The
+  "Zoom with the scroll wheel" switch is now the Scrolling menu's Zooms and Does
+  nothing.
+
+Fixed
+- Tone masks no longer have stair-stepped edges. A tone range in Dodge & Burn or in a
+  Curve mask was cut on a 480-pixel copy of the picture and then enlarged, so its edge
+  followed that copy's pixels, in steps about 16 pixels high on a 40 MP photograph, on
+  screen and in exports, most of all where an Edge-aware range meets a hard edge. The
+  range is now cut at every pixel, so its edge runs smoothly at any zoom, and what it
+  selects is unchanged.
+- A tool open on the picture no longer blinks out, or misses a press, in the moment
+  tone masks are being prepared after a change.
+- A popped-out panel stays above the main window while monopro is in front, instead
+  of disappearing behind it when the main window is clicked. Switching to another
+  application lets it go behind that application's windows as usual.
+- The print loupe shows toning. It was always gray; it now shows the toned print in
+  color, Before and After both, matching the picture around it.
+- Developed thumbnails in Lightbox keep their toning when GRAY is on. GRAY now grays
+  only the camera's own color thumbnails. The contact sheet's Developed preview keeps a
+  developed picture's toning the same way.
 
 ## 0.2.1 — 2026-09-26
 

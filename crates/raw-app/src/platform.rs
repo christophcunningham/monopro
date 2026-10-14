@@ -31,16 +31,36 @@ fn application_icon() -> egui::IconData {
     }
 }
 
-pub fn panel_viewport(title: &str, size: [f32; 2]) -> egui::ViewportBuilder {
+/// A popped-out panel's window.
+///
+/// **Above the main window while monopro is the app in front, and level with every
+/// other window when it is not.** A plain window fell behind the main one the moment
+/// the main one was clicked, and with the main window filling the screen the panel was
+/// gone until it was resized out of the way. Always-on-top alone would have floated it
+/// over every other application too, which is not what a tool palette does; so the
+/// level follows `app_active`, which the caller reads each frame from
+/// [`app_is_active`], and egui applies the change when the builder differs.
+pub fn panel_viewport(title: &str, size: [f32; 2], app_active: bool) -> egui::ViewportBuilder {
     let viewport = egui::ViewportBuilder::default()
         .with_title(title)
-        .with_inner_size(size);
+        .with_inner_size(size)
+        .with_window_level(if app_active {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        });
 
     #[cfg(target_os = "macos")]
     return viewport.with_decorations(false);
 
     #[cfg(not(target_os = "macos"))]
     viewport.with_decorations(true)
+}
+
+/// Whether any of monopro's windows has the keyboard — the main one, a floating
+/// panel, Settings. Read from the root context, which carries every viewport's info.
+pub fn app_is_active(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.raw.viewports.values().any(|v| v.focused == Some(true)))
 }
 
 pub fn settings_viewport() -> egui::ViewportBuilder {
@@ -382,10 +402,17 @@ mod tests {
 
     #[test]
     fn auxiliary_windows_keep_native_controls_off_mac() {
-        let panel = panel_viewport("info", [340.0, 620.0]);
+        let panel = panel_viewport("info", [340.0, 620.0], true);
         let settings = settings_viewport();
         let expected = Some(!cfg!(target_os = "macos"));
         assert_eq!(panel.decorations, expected);
         assert_eq!(settings.decorations, expected);
+    }
+
+    #[test]
+    fn a_floating_panel_stays_above_the_main_window_only_while_monopro_is_in_front() {
+        let level = |active| panel_viewport("info", [340.0, 620.0], active).window_level;
+        assert_eq!(level(true), Some(egui::WindowLevel::AlwaysOnTop));
+        assert_eq!(level(false), Some(egui::WindowLevel::Normal));
     }
 }

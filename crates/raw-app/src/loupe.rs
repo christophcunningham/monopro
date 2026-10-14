@@ -22,10 +22,14 @@
 //! - The pixels come from [`Viewport::patch`](raw_gpu::Viewport::patch), which is
 //!   `export`'s tile loop with the walk taken out — the same graph, the same tap,
 //!   the same scene-referred f32. `a_patch_is_the_export_cut_out_of_it` pins it.
-//! - The tone map is the export's, then the resize, then grain, then sharpening, then
-//!   **the screen's** transfer function. Only the last step differs from a file, and it
-//!   has to: this is going on a monitor, and L\* on a monitor is the exact mistake
-//!   `raw_core::display` exists to record.
+//! - The tone map is the export's, then the resize, then grain, then toning, then
+//!   sharpening, then **the screen's** transfer function. Only the last step differs
+//!   from a file, and it has to: this is going on a monitor, and L\* on a monitor is
+//!   the exact mistake `raw_core::display` exists to record.
+//! - **A toned tile is drawn in color**, through the conversion the viewport's display
+//!   pass makes — OKLab to sRGB, gamut-fitted, then the monitor's gamma per channel —
+//!   so the loupe shows the print's color as well as its grain. Both views are toned:
+//!   Before takes away the export-only tail, and toning is not export-only.
 //! - **Sharpening runs over the grain**, which is what makes this window the only place
 //!   either module can honestly be judged: Amount changes how loud the grain reads, so
 //!   the two are dialled together or not at all.
@@ -59,6 +63,7 @@
 
 use std::sync::mpsc::{Receiver, channel};
 
+use raw_core::colour::{oklab_lightness, oklab_to_display_srgb};
 use raw_core::display::{monitor_encode, tone_map};
 use raw_core::geometry::Dims;
 use raw_core::{Frame, Params};
@@ -474,6 +479,11 @@ pub fn window_rect(viewer: egui::Rect, sample: egui::Rect, window_size: egui::Ve
 /// **"Clean" means before the whole export tail, not before grain.** Both modules that
 /// run down here are export-only and invisible to the viewport, so the useful
 /// comparison is the print with them and the print without — one checkbox, not two.
+///
+/// **Toning is in both**, between grain and sharpening in the print as in the export.
+/// The viewport already shows it, so a clean tile without it would be a picture
+/// nowhere else in the app looks like. With toning active both buffers are
+/// interleaved `[y, a, b]`, as `export::tone` makes them; without, one channel.
 #[expect(
     clippy::too_many_arguments,
     reason = "the export tail's inputs for one tile, passed as the export passes them"
@@ -489,6 +499,7 @@ fn compose(
     tone: raw_core::ToneMap,
     filter: raw_core::Filter,
     grain: &raw_core::GrainParams,
+    toning: &raw_core::ToningParams,
     sharpen: &raw_core::sharpen::SharpenParams,
 ) -> (Vec<f32>, Vec<f32>) {
     let (tw, th) = tile;
@@ -498,10 +509,16 @@ fn compose(
     } else {
         raw_core::resample(&mapped, pw, ph, tw, th, filter)
     };
+    let toned = toning.is_active();
+    let clean_out = if toned {
+        crate::export::tone(&clean, toning)
+    } else {
+        clean.clone()
+    };
     if !grain.is_active() && !sharpen.is_active() {
         // Both switched off: the two views are the same picture, which is the honest
         // answer and also what stops "Before" looking broken with the tail bypassed.
-        return (clean.clone(), clean);
+        return (clean_out.clone(), clean_out);
     }
 
     // Grain first, as the export does. The apron's first purpose: grain the wide tile,
@@ -522,8 +539,16 @@ fn compose(
     //
     // `raw_core::sharpen` takes no origin because a band gain is not keyed on position —
     // unlike the emulsion above, it gives the same answer anywhere in the file.
-    let print = raw_core::sharpen::apply(&grained, tw as usize, th as usize, sharpen);
-    (clean, print)
+    //
+    // Toned, it is toned first and sharpened in lightness only, which is the export's
+    // order and its call: see `raw_core::sharpen::apply_toned`.
+    let print = if toned {
+        let lab = crate::export::tone(&grained, toning);
+        raw_core::sharpen::apply_toned(&lab, tw as usize, th as usize, sharpen)
+    } else {
+        raw_core::sharpen::apply(&grained, tw as usize, th as usize, sharpen)
+    };
+    (clean_out, print)
 }
 
 /// Ask for a render if what is on screen is not what the parameters describe.
@@ -592,6 +617,7 @@ pub fn refresh(
     let tone = params.display.tone_map;
     let display = params.display;
     let grain = params.grain;
+    let toning = params.toning.clone();
     let sharpen = params.sharpen;
     // The export's filter, not a fixed one. Lanczos and Mitchell ring differently at
     // an edge, and a loupe that always used the default would be showing a resample
@@ -611,21 +637,34 @@ pub fn refresh(
             tone,
             filter,
             &grain,
+            &toning,
             &sharpen,
         );
 
+        // `compose` already began with the selected tonal transform, just as export
+        // does. Applying `display::encode` here would run AgX or the soft shoulder a
+        // second time and make this window darker than the viewport. At this boundary
+        // only the monitor transfer remains.
+        let code = |v: f32| (monitor_encode(v, display.gamma) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        let toned = toning.is_active();
         let inner = |src: &[f32]| -> egui::ColorImage {
             let mut px = Vec::with_capacity((sw * sh) as usize);
             for y in 0..sh {
                 for x in 0..sw {
-                    let v = src[((y + a_top) * tw + x + a_left) as usize];
-                    // `compose` already began with the selected tonal transform, just
-                    // as export does. Applying `display::encode` here would run AgX or
-                    // the soft shoulder a second time and make this window darker than
-                    // the viewport. At this boundary only the monitor transfer remains.
-                    let q =
-                        (monitor_encode(v, display.gamma) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                    px.push(egui::Color32::from_gray(q));
+                    let i = ((y + a_top) * tw + x + a_left) as usize;
+                    px.push(if toned {
+                        // The display pass's conversion, in its order: the neutral's
+                        // OKLab lightness, the toner's (a, b), fitted into sRGB at
+                        // constant hue, then gamma per channel. See `display.wgsl`.
+                        let [r, g, b] = oklab_to_display_srgb(
+                            oklab_lightness(src[i * 3]),
+                            src[i * 3 + 1],
+                            src[i * 3 + 2],
+                        );
+                        egui::Color32::from_rgb(code(r), code(g), code(b))
+                    } else {
+                        egui::Color32::from_gray(code(src[i]))
+                    });
                 }
             }
             egui::ColorImage {
@@ -937,6 +976,7 @@ mod tests {
             p.display.tone_map,
             p.output.filter,
             &p.grain,
+            &p.toning,
             &p.sharpen,
         );
 
@@ -974,6 +1014,52 @@ mod tests {
             grain_moved > 0.05,
             "grain changed almost nothing: {grain_moved}"
         );
+
+        // **Toned, the loupe is the toned file**: toning between grain and sharpening,
+        // sharpening in lightness only, all three planes compared.
+        let toning = raw_core::ToningParams {
+            enabled: true,
+            applied: vec![raw_core::toning::Applied {
+                key: "selenium",
+                amount: 1.0,
+            }],
+            ..Default::default()
+        };
+        let lab = crate::export::tone(&grained_file(&mapped, fw, fh, &p), &toning);
+        let toned_file = raw_core::sharpen::apply_toned(&lab, fw as usize, fh as usize, &p.sharpen);
+        let (clean_tile, toned_tile) = compose(
+            &patch,
+            pw,
+            ph,
+            (tw, th),
+            (px, py),
+            p.display.tone_map,
+            p.output.filter,
+            &p.grain,
+            &toning,
+            &p.sharpen,
+        );
+        assert_eq!(toned_tile.len(), (tw * th * 3) as usize, "a toned tile is three planes");
+        assert_eq!(clean_tile.len(), toned_tile.len(), "Before is toned as well");
+        let mut worst = 0.0f32;
+        let mut chroma = 0.0f32;
+        for y in 0..pl.size.1 {
+            for x in 0..pl.size.0 {
+                let f = ((pl.origin.1 + y) * fw + pl.origin.0 + x) as usize * 3;
+                let t = ((y + t.a_top) * tw + x + t.a_left) as usize * 3;
+                for k in 0..3 {
+                    worst = worst.max((toned_file[f + k] - toned_tile[t + k]).abs());
+                }
+                chroma = chroma.max(toned_tile[t + 1].abs() + toned_tile[t + 2].abs());
+            }
+        }
+        assert!(worst < 0.02, "the toned loupe is not the toned file: worst {worst}");
+        assert!(chroma > 0.005, "selenium put no color in the tile: {chroma}");
+    }
+
+    /// The file's grained picture, by the export's route, for the toned comparison.
+    fn grained_file(mapped: &[f32], fw: u32, fh: u32, p: &Params) -> Vec<f32> {
+        raw_core::grain::apply(mapped, fw as usize, fh as usize, &p.grain).image
     }
 
     #[test]

@@ -109,9 +109,34 @@ impl Nib {
     }
 }
 
+/// How a dab fades from its middle to its rim.
+///
+/// **Two, because a stroke keeps the edge it was painted with.** Feather once meant how
+/// far a bell curve had fallen by the rim, and that curve paints every stroke saved
+/// before Feather meant the width of the fade. Redrawing those with the new edge would
+/// enlarge and strengthen every dodge and burn already in somebody's prints, so a dab
+/// says which it is, as it says which nib.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Falloff {
+    /// The edge of every stroke saved before [`Core`](Self::Core): a bell curve that
+    /// Feather narrowed, held to zero at the rim by a window across the whole radius.
+    /// It reached the rim only at the smallest feathers, and at Feather 1.0 it had
+    /// faded out by half the radius, so a softer brush painted a smaller mark.
+    Bell,
+    /// Full strength out to a core of `1 − feather` of the radius, then a smoothstep to
+    /// nothing at the rim. **Feather is how much of the radius the fade takes**, as in
+    /// Lightroom's brush: the cursor's outer circle is where paint ends and its inner
+    /// circle where it is at full strength, and Feather 1.0 fades from the middle all
+    /// the way out. A dab at Feather 1.0 has the cross-section of a [`Radial`] with no
+    /// Core and Transition 1.0.
+    #[default]
+    Core,
+}
+
 /// One dab: a brush contact, and the whole storage primitive.
 ///
-/// Nine numbers, laid out in the order the GPU buffer packs them.
+/// Ten numbers, laid out in the order the GPU buffer packs them, the nib and the
+/// falloff sharing a word there.
 ///
 /// # Coordinates
 ///
@@ -128,8 +153,10 @@ pub struct Dab {
     pub y: f32,
     /// Fraction of the frame width.
     pub radius: f32,
-    /// 0 is a hard disc, 1 is fully soft. Below [`Dab::HARD`] the Gaussian is
-    /// skipped entirely rather than approached asymptotically.
+    /// 0 is a hard disc, 1 is fully soft; what it measures is the [`falloff`]'s. Below
+    /// [`Dab::HARD`] the dab is a disc whichever falloff it has.
+    ///
+    /// [`falloff`]: Self::falloff
     pub feather: f32,
     pub opacity: f32,
     /// Signed: positive dodges, negative burns. The sign is what makes an eraser
@@ -147,15 +174,17 @@ pub struct Dab {
     /// It does something on a card at any aspect.
     pub angle: f32,
     pub nib: Nib,
+    pub falloff: Falloff,
 }
 
 impl Dab {
     /// A round nib at rest: aspect 1, no rotation, and nothing else set.
     ///
     /// The tail for a struct-update literal — `Dab { x, y, radius, .., ..Dab::ROUND }`
-    /// — so the common case reads as six numbers even though a dab now carries nine.
+    /// — so the common case reads as six numbers even though a dab now carries ten.
     /// Not `Default`, because a dab of radius zero is not a sensible default, it is
-    /// the absence of one; this is explicitly *the round part* of a dab.
+    /// the absence of one; this is explicitly *the round part* of a dab, with the edge
+    /// the brush paints now.
     pub const ROUND: Self = Self {
         x: 0.0,
         y: 0.0,
@@ -166,54 +195,52 @@ impl Dab {
         aspect: 1.0,
         angle: 0.0,
         nib: Nib::Round,
+        falloff: Falloff::Core,
     };
 
     /// Below this feather the profile is a hard disc.
     ///
-    /// Not a rounding convenience: the Gaussian's sigma is `radius /
-    /// sqrt(-2·ln(1-feather))`, which goes to zero as feather does, so the
-    /// smallest feathers would otherwise cost a division that tends to infinity
-    /// to describe a shape the disc already describes exactly.
+    /// For a [`Falloff::Bell`] dab it is not a rounding convenience: the Gaussian's
+    /// sigma is `radius / sqrt(-2·ln(1-feather))`, which goes to zero as feather does,
+    /// so the smallest feathers would otherwise cost a division that tends to infinity
+    /// to describe a shape the disc already describes exactly. A [`Falloff::Core`] dab
+    /// there fades over a hundredth of its radius, which is a disc in all but name.
     pub const HARD: f32 = 0.01;
 
     /// Normalised brush profile at `distance`, before opacity and EV.
     ///
     /// Kept in one function because the cursor's feather guide must describe this
     /// exact falloff rather than inventing a second interpretation of Feather.
-    fn profile(distance: f32, feather: f32) -> f32 {
+    fn profile(distance: f32, feather: f32, falloff: Falloff) -> f32 {
         if distance >= 1.0 {
             return 0.0;
         }
         if feather < Self::HARD {
             return 1.0;
         }
-        let f = feather.clamp(Self::HARD, 0.999);
-        let sigma = 1.0 / (-2.0 * (1.0 - f).ln()).sqrt();
-        let t = (1.0 - distance).clamp(0.0, 1.0);
-        (-0.5 * (distance / sigma) * (distance / sigma)).exp() * t * t * (3.0 - 2.0 * t)
-    }
-
-    /// Radius of the actual 50% strength contour, for the brush cursor.
-    ///
-    /// Sigma is not that contour: at the default Feather 0.40 sigma is almost the
-    /// outer radius, so the old guide looked indistinguishable from a hard brush
-    /// even though the painted dab was already below half strength near mid-radius.
-    /// A tiny binary solve is app chrome only and keeps the preview pinned to the
-    /// same profile the CPU and GPU render.
-    pub fn half_strength_radius(feather: f32) -> Option<f32> {
-        if feather < Self::HARD {
-            return None;
-        }
-        let (mut lo, mut hi) = (0.0, 1.0);
-        for _ in 0..16 {
-            let mid = (lo + hi) * 0.5;
-            if Self::profile(mid, feather) > 0.5 {
-                lo = mid;
-            } else {
-                hi = mid;
+        match falloff {
+            Falloff::Bell => {
+                let f = feather.clamp(Self::HARD, 0.999);
+                let sigma = 1.0 / (-2.0 * (1.0 - f).ln()).sqrt();
+                let t = (1.0 - distance).clamp(0.0, 1.0);
+                (-0.5 * (distance / sigma) * (distance / sigma)).exp() * t * t * (3.0 - 2.0 * t)
+            }
+            Falloff::Core => {
+                let f = feather.min(1.0);
+                let s = ((distance - (1.0 - f)) / f).clamp(0.0, 1.0);
+                1.0 - s * s * (3.0 - 2.0 * s)
             }
         }
-        Some((lo + hi) * 0.5)
+    }
+
+    /// Where a [`Falloff::Core`] dab stops being at full strength, as a fraction of its
+    /// radius: the brush cursor's inner circle. `None` for a hard brush, which is at
+    /// full strength out to its rim, where the outer circle already is.
+    ///
+    /// Only the falloff the brush paints with, because the cursor is the brush's: a
+    /// stroke already saved with the other one is never under it.
+    pub fn core_radius(feather: f32) -> Option<f32> {
+        (feather >= Self::HARD).then(|| 1.0 - feather.min(1.0))
     }
 
     /// **Two aspects are in play here and they are not the same thing.**
@@ -262,7 +289,7 @@ impl Dab {
     /// what makes 10c an addition rather than a migration of everyone's strokes.
     pub fn magnitude_at(&self, x: f32, y: f32, frame: f32) -> f32 {
         let d = self.distance(x, y, frame);
-        Self::profile(d, self.feather) * self.opacity * self.ev.abs()
+        Self::profile(d, self.feather, self.falloff) * self.opacity * self.ev.abs()
     }
 
     /// This dab's coverage independent of its EV intensity.
@@ -271,7 +298,7 @@ impl Dab {
     /// not secretly become a second Contrast amount. Opacity and feather still
     /// belong to the mark and therefore remain part of coverage.
     pub fn coverage_at(&self, x: f32, y: f32, frame: f32) -> f32 {
-        Self::profile(self.distance(x, y, frame), self.feather) * self.opacity
+        Self::profile(self.distance(x, y, frame), self.feather, self.falloff) * self.opacity
     }
 
     /// The radius of the circle that encloses this dab, in width units.
@@ -404,6 +431,15 @@ impl Sign {
 /// scatter of dark pixels, and lifting it carries the wall's texture while its edge
 /// against the sky stays clean. A hand under the enlarger is a spatially coherent
 /// region, not a density-selective filter.
+///
+/// # The island
+///
+/// A range selects every part of the frame that has its tones: set on a bright cloud,
+/// it takes the white shirt too. With [`island`](Self::island) on and a seed placed,
+/// the range selects only what is **connected to a seed**, growing from where the
+/// picture was clicked through neighbors of the same tones and stopping where the tone
+/// leaves the range. It is still this range, read the same way; the island is where it
+/// is allowed to reach.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ZoneMask {
     pub enabled: bool,
@@ -431,6 +467,97 @@ pub struct ZoneMask {
     /// shows — the same argument `ContrastMaskParams::spacer` makes for keeping a
     /// percentage rather than the pixels it becomes.
     pub edge: f32,
+    /// Where the range may reach: everywhere, or only what is connected to its seeds.
+    pub island: Island,
+}
+
+/// The seeds a tonal range grows from, when it is limited to what they are connected to.
+///
+/// **Points on the negative, and not a picture of the result.** A seed is where the
+/// photograph was clicked, source-normalized, so a crop or a turn cannot move it off its
+/// subject, and what grows from it is worked out again whenever the tones under it
+/// change: an island follows an exposure change the way a range does.
+///
+/// A fixed few and not a list, which keeps a [`ZoneMask`] a plain value that is copied
+/// and compared everywhere a range is. [`MAX`](Self::MAX) is more separate subjects
+/// than one mask is for; past that, another instance says it better.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Island {
+    /// The island's own switch. Off keeps the seeds, so turning it back on returns to
+    /// the selection and not to an empty picture. On with no seed placed limits
+    /// nothing: there is nowhere yet to be connected to.
+    pub enabled: bool,
+    seeds: [(f32, f32); Island::MAX],
+    count: u8,
+}
+
+impl Island {
+    /// The most seeds one range holds.
+    pub const MAX: usize = 8;
+
+    /// An island with no seeds yet, switched on or off.
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ..Self::default()
+        }
+    }
+
+    /// The seeds placed, in the order they were placed.
+    pub fn seeds(&self) -> &[(f32, f32)] {
+        &self.seeds[..usize::from(self.count)]
+    }
+
+    /// Whether the range is limited to what its seeds reach: switched on, with at
+    /// least one seed to reach from.
+    pub fn is_live(&self) -> bool {
+        self.enabled && self.count > 0
+    }
+
+    /// Start again from one seed at `at`: what a plain click with the eyedropper does.
+    /// `false`, and the seeds there were are kept, when `at` is not a point of the
+    /// negative.
+    pub fn set(&mut self, at: (f32, f32)) -> bool {
+        let mut fresh = Self::new(self.enabled);
+        if !fresh.add(at) {
+            return false;
+        }
+        *self = fresh;
+        true
+    }
+
+    /// One more seed at `at`: what `⇧`-click does. `false`, and nothing changed, when
+    /// the island is full or `at` is not a point of the negative.
+    pub fn add(&mut self, at: (f32, f32)) -> bool {
+        let on_negative = |v: f32| (0.0..=1.0).contains(&v);
+        if usize::from(self.count) >= Self::MAX || !on_negative(at.0) || !on_negative(at.1) {
+            return false;
+        }
+        self.seeds[usize::from(self.count)] = at;
+        self.count += 1;
+        true
+    }
+
+    /// Take seed `index` away and close the gap, keeping the others in order.
+    pub fn remove(&mut self, index: usize) {
+        let n = usize::from(self.count);
+        if index >= n {
+            return;
+        }
+        self.seeds.copy_within(index + 1..n, index);
+        self.count -= 1;
+        // The freed slot goes back to zero, so two islands with the same seeds are
+        // equal whatever was placed and removed on the way.
+        self.seeds[n - 1] = (0.0, 0.0);
+    }
+
+    /// Take every seed away. The switch stays as it is.
+    pub fn clear(&mut self) {
+        *self = Self {
+            enabled: self.enabled,
+            ..Self::default()
+        };
+    }
 }
 
 impl ZoneMask {
@@ -444,8 +571,19 @@ impl ZoneMask {
     /// Whether this mask has no effect at all, and the whole evaluation can be
     /// skipped rather than computed and multiplied by one.
     pub fn is_identity(&self) -> bool {
-        !self.enabled
-            || (self.lo <= Self::MIN_EV + 1e-6 && self.hi >= Self::MAX_EV - 1e-6 && !self.invert)
+        !self.enabled || (self.opens_below() && self.opens_above() && !self.invert)
+    }
+
+    /// Whether the range has no lower bound: its low end is on Zone 0, so every tone
+    /// below the top of the range is selected. One test, shared by [`select`](Self::select)
+    /// and the shader's copy of it, which is handed the answer rather than the ruler's ends.
+    pub fn opens_below(&self) -> bool {
+        self.lo <= Self::MIN_EV + 1e-6
+    }
+
+    /// Whether the range has no upper bound: its high end is on Zone X.
+    pub fn opens_above(&self) -> bool {
+        self.hi >= Self::MAX_EV - 1e-6
     }
 
     /// The mask at one point, given the EV there.
@@ -454,13 +592,28 @@ impl ZoneMask {
     /// `edge_aware` is on, because that smoothing is a whole-image operation and
     /// cannot be done per point. Which EV image arrives is the caller's business;
     /// what the trapezoid does with it is this function's.
+    ///
+    /// **An island is not in this answer**: whether a point is connected to a seed is a
+    /// fact about the picture around it, which one EV cannot say.
+    /// [`Basis::evaluate`](crate::Basis::evaluate) is where an island is grown.
     pub fn evaluate(&self, ev: f32) -> f32 {
+        let m = self.select(ev);
+        if self.invert { 1.0 - m } else { m }
+    }
+
+    /// How strongly the range selects a tone, in `[0, 1]`, **before `Inv`**: the
+    /// trapezoid alone. What an island grows through, since `Inv` turns over the
+    /// finished selection and not the tones it was grown from.
+    ///
+    /// **The shader has a copy**, `tone_select` in `raw-gpu/src/zone_mask.wgsl`, which
+    /// cuts every rendered pixel with it. The two change together.
+    pub fn select(&self, ev: f32) -> f32 {
         let ss = |t: f32| {
             let t = t.clamp(0.0, 1.0);
             t * t * (3.0 - 2.0 * t)
         };
 
-        let mut m = if self.lo <= Self::MIN_EV + 1e-6 {
+        let mut m = if self.opens_below() {
             1.0
         } else if self.f_lo > 1e-6 {
             ss((ev - (self.lo - self.f_lo)) / self.f_lo)
@@ -468,15 +621,14 @@ impl ZoneMask {
             f32::from(ev >= self.lo)
         };
 
-        if self.hi < Self::MAX_EV - 1e-6 {
+        if !self.opens_above() {
             m *= if self.f_hi > 1e-6 {
                 1.0 - ss((ev - self.hi) / self.f_hi)
             } else {
                 f32::from(ev <= self.hi)
             };
         }
-
-        if self.invert { 1.0 - m } else { m }
+        m
     }
 
     /// The guided filter's regularisation term, in the squared units of an EV
@@ -495,6 +647,99 @@ impl ZoneMask {
         ("Midtones", -2.0, 2.0, 1.0, 1.0),
         ("Highlights", 2.0, 5.0, 1.5, 1.0),
     ];
+
+    /// TK9's ladder, as trapezoids: Lights 1 to 4, then Darks 1 to 4, each as
+    /// `(label, lo, hi, f_lo, f_hi)` like [`PRESETS`](Self::PRESETS).
+    ///
+    /// In Tony Kuyper's panels each Lights step multiplies the mask by itself, so Lights-2
+    /// is about the luminosity squared, Lights-3 its cube, and each selects a narrower and
+    /// brighter part of the picture than the last. Darks are the same on the shadow side,
+    /// from the inverted luminosity. These are **soft masks with no flat top**: there is no
+    /// plateau, only a long shoulder that stiffens with every step.
+    ///
+    /// **The trapezoid approximates them rather than reproducing them**, which was a
+    /// decision (a second falloff kind would be truer and would add a field to the file).
+    /// Each is the shoulder that best fits `L^n`, where `L` is the sRGB-encoded
+    /// luminance at that many stops from middle gray, found by a grid search over this
+    /// ruler's window and rounded to a quarter stop. **Every Lights step is pinned to the
+    /// ruler's top and every Darks step to its bottom**, and only the shoulder varies. That
+    /// is what makes a later step never select more than an earlier one at any tone, as
+    /// `L^2 <= L` never does in TK9: free-fitting the top point as well gave a slightly
+    /// closer curve and broke the nesting, which a test caught. A test also holds each step
+    /// to a bound against the function it stands for.
+    ///
+    /// The fit cannot do better than a smoothstep allows: TK9's tails are longer than
+    /// one, so Lights-1 reads a little low in the deep shadows and a little high in the
+    /// midtones. It is a starting point to refine on the ruler, not a measurement.
+    pub const LADDER: [(&'static str, f32, f32, f32, f32); 8] = [
+        ("Lights 1", 5.0, 5.0, 10.25, 1.0),
+        ("Lights 2", 5.0, 5.0, 7.75, 1.0),
+        ("Lights 3", 5.0, 5.0, 6.75, 1.0),
+        ("Lights 4", 5.0, 5.0, 6.25, 1.0),
+        ("Darks 1", -5.0, -5.0, 1.0, 9.5),
+        ("Darks 2", -5.0, -5.0, 1.0, 7.5),
+        ("Darks 3", -5.0, -5.0, 1.0, 5.75),
+        ("Darks 4", -5.0, -5.0, 1.0, 4.75),
+    ];
+
+    /// How wide a range sampled from the picture starts, in EV: one zone.
+    ///
+    /// A click names one tone and a range has to have some width to select anything, so
+    /// this is the least that reads as "that tone" on the ruler. It is a starting point
+    /// to widen there, not a measurement of what was clicked.
+    pub const SAMPLE_WIDTH: f32 = 1.0;
+    /// The shoulders a sampled range is given, in EV: one zone either side.
+    pub const SAMPLE_SHOULDER: f32 = 1.0;
+
+    /// Whether neither end of the range is set, so it selects every tone.
+    pub fn is_open(&self) -> bool {
+        self.lo <= Self::MIN_EV + 1e-6 && self.hi >= Self::MAX_EV - 1e-6
+    }
+
+    /// Set the range from tones sampled in the picture, `lo` to `hi` in EV: what the
+    /// eyedropper does with a click (`lo == hi`) and with a dragged box.
+    ///
+    /// **Never narrower than [`SAMPLE_WIDTH`](Self::SAMPLE_WIDTH)**, widened about its own
+    /// middle, so a click and a box over a flat wall give the same range. The shoulders
+    /// are reset with it, because the sample replaces the range rather than adjusting it,
+    /// and the range is switched on, as choosing a preset does. `Inv` is left alone: it
+    /// says what the range means, and the sample only says where the range is.
+    ///
+    /// A sample at or past an end of the ruler clamps onto it, which reads as open on
+    /// that side: sampling the deepest shadow selects it and everything below.
+    pub fn sample(&mut self, lo: f32, hi: f32) {
+        if !lo.is_finite() || !hi.is_finite() {
+            return;
+        }
+        let (mut lo, mut hi) = (lo.min(hi), lo.max(hi));
+        if hi - lo < Self::SAMPLE_WIDTH {
+            let middle = 0.5 * (lo + hi);
+            lo = middle - 0.5 * Self::SAMPLE_WIDTH;
+            hi = middle + 0.5 * Self::SAMPLE_WIDTH;
+        }
+        self.lo = lo.clamp(Self::MIN_EV, Self::MAX_EV);
+        self.hi = hi.clamp(Self::MIN_EV, Self::MAX_EV);
+        self.f_lo = Self::SAMPLE_SHOULDER;
+        self.f_hi = Self::SAMPLE_SHOULDER;
+        self.enabled = true;
+    }
+
+    /// Widen the range to take in tones `lo` to `hi` as well: the eyedropper with `⇧`.
+    ///
+    /// **It only ever widens.** An end moves outward to reach a tone it did not include
+    /// and otherwise stays, and the shoulders are kept, since they were set for this
+    /// range. A range open at both ends already includes every tone, so there is nothing
+    /// for it to do: starting a range there instead was tried, and it meant a range
+    /// widened to the whole ruler collapsed to one zone on the next `⇧`-click, which a
+    /// test caught. A plain click is what starts a range.
+    pub fn extend(&mut self, lo: f32, hi: f32) {
+        if !lo.is_finite() || !hi.is_finite() {
+            return;
+        }
+        self.lo = self.lo.min(lo.min(hi)).clamp(Self::MIN_EV, Self::MAX_EV);
+        self.hi = self.hi.max(lo.max(hi)).clamp(Self::MIN_EV, Self::MAX_EV);
+        self.enabled = true;
+    }
 }
 
 impl Default for ZoneMask {
@@ -514,6 +759,7 @@ impl Default for ZoneMask {
             edge_aware: true,
             region: 0.040,
             edge: 0.50,
+            island: Island::default(),
         }
     }
 }
@@ -725,6 +971,180 @@ impl Shape {
             _ => None,
         }
     }
+
+    /// The passes of a painted shape, or nothing at all for a gradient.
+    pub fn passes(&self) -> &[Gesture] {
+        match self {
+            Self::Brush { passes, .. } => passes,
+            _ => &[],
+        }
+    }
+
+    /// `None` for a gradient, which has no passes to add one to.
+    pub fn passes_mut(&mut self) -> Option<&mut Vec<Gesture>> {
+        match self {
+            Self::Brush { passes, .. } => Some(passes),
+            _ => None,
+        }
+    }
+
+    /// How much of a point a painted shape covers, in `[0, 1]`, **as a mask**: each
+    /// pass counts by its coverage, an eraser pass takes its coverage away, and the sum
+    /// is held between nothing and everything.
+    ///
+    /// The same sum a Dodge layer's [`Instance::coverage_at`] is, since painting a mask
+    /// is painting in a positive direction: a pass whose dabs carry a positive `ev`
+    /// adds and one whose dabs are negative erases, and how large the `ev` is does not
+    /// come into it. Zero for a gradient, which is not painted.
+    pub fn painted_at(&self, x: f32, y: f32, aspect: f32) -> f32 {
+        self.passes()
+            .iter()
+            .map(|pass| pass.sign() * pass.coverage_at(x, y, aspect))
+            .sum::<f32>()
+            .clamp(0.0, 1.0)
+    }
+}
+
+/// What has been painted, **as a small picture**: a painted shape's coverage, kept up
+/// to date as strokes are added, for a caller that asks about many points at once.
+///
+/// [`Shape::painted_at`] is the truth and tests every dab for every point, which is
+/// right for a click and ruinous for the curve editor's histogram: fifty thousand
+/// samples against a thousand dabs, on every frame of a stroke. This holds the same
+/// coverage on a grid [`LONG_EDGE`](Self::LONG_EDGE) on its long side, and a stroke in
+/// progress costs only its new dabs, each over its own bounding box.
+///
+/// It is the picture a mask is: soft, with no detail finer than a brush, which is why
+/// a few hundred pixels hold it. It is an estimate all the same, and nothing that
+/// renders reads it; the shader walks the dabs.
+#[derive(Debug, Clone)]
+pub struct Coverage {
+    w: usize,
+    h: usize,
+    aspect: f32,
+    /// The passes folded into `total`, in order.
+    done: Vec<Gesture>,
+    /// Their sum, signed and unclamped, as `painted_at` sums before it clamps.
+    total: Vec<f32>,
+    /// The newest pass, which may still be growing: what of it has been drawn, and its
+    /// coverage, a maximum over its dabs. Folded into `total` when a pass follows it.
+    last: Option<(Gesture, Vec<f32>)>,
+}
+
+impl Coverage {
+    /// The grid's long side, in pixels: the size the zone masks are prepared at, for
+    /// the same reason. A mask has no detail finer than this.
+    pub const LONG_EDGE: usize = 480;
+
+    /// An empty picture for a negative whose height over width is `aspect`.
+    pub fn new(aspect: f32) -> Self {
+        let aspect = if aspect.is_finite() && aspect > 0.0 {
+            aspect
+        } else {
+            1.0
+        };
+        let (w, h) = if aspect <= 1.0 {
+            (Self::LONG_EDGE, (Self::LONG_EDGE as f32 * aspect).round() as usize)
+        } else {
+            ((Self::LONG_EDGE as f32 / aspect).round() as usize, Self::LONG_EDGE)
+        };
+        let (w, h) = (w.max(1), h.max(1));
+        Self {
+            w,
+            h,
+            aspect,
+            done: Vec::new(),
+            total: vec![0.0; w * h],
+            last: None,
+        }
+    }
+
+    /// The negative's height over width this was made for.
+    pub fn aspect(&self) -> f32 {
+        self.aspect
+    }
+
+    /// Bring the picture up to `passes`.
+    ///
+    /// **Only what is new is drawn.** When the passes held are still the first of
+    /// `passes` and the newest has only grown, the new dabs are drawn and nothing else:
+    /// that is every frame of a stroke, and every stroke after the first. Anything else,
+    /// an undo, an erased pass, another mask's strokes, starts again from nothing.
+    pub fn update(&mut self, passes: &[Gesture]) {
+        let kept = self.done.len();
+        let same_start =
+            passes.len() >= kept && self.done.iter().zip(passes).all(|(a, b)| a == b);
+        let newest_grew = match &self.last {
+            None => true,
+            Some((drawn, _)) => passes.get(kept).is_some_and(|now| {
+                now.dabs.len() >= drawn.dabs.len()
+                    && now.dabs[..drawn.dabs.len()] == drawn.dabs[..]
+            }),
+        };
+        if !(same_start && newest_grew) {
+            self.done.clear();
+            self.total.fill(0.0);
+            self.last = None;
+        }
+        for i in self.done.len()..passes.len() {
+            let pass = &passes[i];
+            let (w, h, aspect) = (self.w, self.h, self.aspect);
+            let (drawn, cover) = self
+                .last
+                .get_or_insert_with(|| (Gesture::default(), vec![0.0; w * h]));
+            for dab in &pass.dabs[drawn.dabs.len()..] {
+                Self::draw(cover, w, h, aspect, dab);
+            }
+            *drawn = pass.clone();
+            // Every pass but the newest is finished, and joins the sum.
+            if i + 1 < passes.len() {
+                let sign = pass.sign();
+                if let Some((done, cover)) = self.last.take() {
+                    for (total, c) in self.total.iter_mut().zip(&cover) {
+                        *total += sign * c;
+                    }
+                    self.done.push(done);
+                }
+            }
+        }
+    }
+
+    /// One dab into a pass's coverage, as a maximum, over the dab's own bounding box.
+    fn draw(cover: &mut [f32], w: usize, h: usize, aspect: f32, dab: &Dab) {
+        let reach = dab.bound();
+        let column = |x: f32| ((x * w as f32).floor().max(0.0) as usize).min(w - 1);
+        let row = |y: f32| ((y * h as f32).floor().max(0.0) as usize).min(h - 1);
+        // The bound is in width units; a row is a fraction of the height.
+        let (x0, x1) = (column(dab.x - reach), column(dab.x + reach));
+        let (y0, y1) = (row(dab.y - reach / aspect), row(dab.y + reach / aspect));
+        for py in y0..=y1 {
+            let y = (py as f32 + 0.5) / h as f32;
+            for px in x0..=x1 {
+                let x = (px as f32 + 0.5) / w as f32;
+                let at = &mut cover[py * w + px];
+                *at = at.max(dab.coverage_at(x, y, aspect));
+            }
+        }
+    }
+
+    /// What has been painted at a source-normalized point, in `[0, 1]`: the grid's
+    /// answer to [`Shape::painted_at`], blended from the four pixels around the point.
+    pub fn at(&self, x: f32, y: f32) -> f32 {
+        let (w, h) = (self.w, self.h);
+        let fx = (x * w as f32 - 0.5).clamp(0.0, (w - 1) as f32);
+        let fy = (y * h as f32 - 0.5).clamp(0.0, (h - 1) as f32);
+        let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+        let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+        let newest = self.last.as_ref().map(|(pass, cover)| (pass.sign(), cover));
+        let cell = |cx: usize, cy: usize| {
+            let i = cy * w + cx;
+            self.total[i] + newest.map_or(0.0, |(sign, cover)| sign * cover[i])
+        };
+        let top = cell(x0, y0) + (cell(x1, y0) - cell(x0, y0)) * tx;
+        let bottom = cell(x0, y1) + (cell(x1, y1) - cell(x0, y1)) * tx;
+        (top + (bottom - top) * ty).clamp(0.0, 1.0)
+    }
 }
 
 /// One dodge or one burn: a named stack of passes, with its own mask and opacity.
@@ -745,7 +1165,7 @@ pub struct Instance {
 }
 
 impl Instance {
-    /// An empty brush instance — what `⌘D` and `⌘X` make.
+    /// An empty brush instance — what `⌘⇧D` and `⌘⇧X` make.
     pub fn new(sign: Sign, name: String) -> Self {
         Self::of(
             sign,
@@ -985,6 +1405,104 @@ impl DodgeBurnParams {
 
 #[cfg(test)]
 mod tests {
+    /// sRGB-encoded luminance at `ev` stops from middle gray: the `L` TK9's masks are
+    /// powers of.
+    fn tk9_luminance(ev: f32) -> f32 {
+        let linear = (MID_GREY * ev.exp2()).clamp(0.0, 1.0);
+        if linear <= 0.003_130_8 {
+            12.92 * linear
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    fn ladder(label: &str) -> ZoneMask {
+        let &(_, lo, hi, f_lo, f_hi) = ZoneMask::LADDER
+            .iter()
+            .find(|row| row.0 == label)
+            .expect("a step of the ladder");
+        ZoneMask {
+            enabled: true,
+            lo,
+            hi,
+            f_lo,
+            f_hi,
+            ..ZoneMask::default()
+        }
+    }
+
+    /// RMS difference between a step and the function TK9's step is, over the ruler.
+    fn rms_against(mask: &ZoneMask, target: impl Fn(f32) -> f32) -> f32 {
+        let evs: Vec<f32> = (0..=200).map(|i| -5.0 + i as f32 * 0.05).collect();
+        let sum: f32 = evs
+            .iter()
+            .map(|&ev| (mask.evaluate(ev) - target(ev)).powi(2))
+            .sum();
+        (sum / evs.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn each_ladder_step_stands_for_a_power_of_luminosity() {
+        for n in 1..=4 {
+            let lights = ladder(&format!("Lights {n}"));
+            let darks = ladder(&format!("Darks {n}"));
+            let lights_err = rms_against(&lights, |ev| tk9_luminance(ev).powi(n));
+            let darks_err = rms_against(&darks, |ev| (1.0 - tk9_luminance(ev)).powi(n));
+            // A smoothstep cannot be TK9's long tail, so this is a bound on how far
+            // from it the preset is allowed to drift, not a claim of equality.
+            assert!(lights_err < 0.13, "Lights {n} is {lights_err} from L^{n}");
+            assert!(darks_err < 0.13, "Darks {n} is {darks_err} from (1-L)^{n}");
+        }
+    }
+
+    #[test]
+    fn each_step_is_narrower_and_stiffer_than_the_last() {
+        // Narrower: a later step selects less of every tone that an earlier one only
+        // partly selected, so at any stop below white its weight is no greater.
+        for family in ["Lights", "Darks"] {
+            for n in 1..4 {
+                let (wide, tight) = (
+                    ladder(&format!("{family} {n}")),
+                    ladder(&format!("{family} {}", n + 1)),
+                );
+                for i in 0..=100 {
+                    let ev = -5.0 + i as f32 * 0.1;
+                    assert!(
+                        tight.evaluate(ev) <= wide.evaluate(ev) + 1.0e-6,
+                        "{family} {} selects more than {family} {n} at {ev} EV",
+                        n + 1
+                    );
+                }
+                // And its shoulder is shorter, which is what "narrower" means on the ruler.
+                let shoulder = |m: &ZoneMask| if family == "Lights" { m.f_lo } else { m.f_hi };
+                assert!(shoulder(&tight) < shoulder(&wide), "{family} {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn lights_reach_the_highlights_and_darks_the_shadows() {
+        for n in 1..=4 {
+            let lights = ladder(&format!("Lights {n}"));
+            let darks = ladder(&format!("Darks {n}"));
+            assert!(lights.evaluate(5.0) > 0.99 && lights.evaluate(-5.0) < 0.01);
+            assert!(darks.evaluate(-5.0) > 0.99 && darks.evaluate(5.0) < 0.01);
+        }
+        // No flat top: the band has no width, only shoulders.
+        for (label, lo, hi, ..) in ZoneMask::LADDER {
+            assert!((hi - lo).abs() < 1.0e-6, "{label} has a flat top");
+        }
+    }
+
+    #[test]
+    fn every_ladder_step_sits_inside_the_ruler() {
+        for (label, lo, hi, f_lo, f_hi) in ZoneMask::LADDER {
+            assert!((ZoneMask::MIN_EV..=ZoneMask::MAX_EV).contains(&lo), "{label}");
+            assert!((ZoneMask::MIN_EV..=ZoneMask::MAX_EV).contains(&hi), "{label}");
+            assert!(lo <= hi && f_lo > 0.0 && f_hi > 0.0, "{label}");
+        }
+    }
+
     use super::*;
 
     fn dab(x: f32, y: f32, ev: f32) -> Dab {
@@ -1024,7 +1542,7 @@ mod tests {
         let soft = dab(0.5, 0.5, -1.0);
         let near_edge = soft.magnitude_at(0.59, 0.5, SQUARE);
         assert!(
-            near_edge > 0.0 && near_edge < 0.1,
+            near_edge > 0.0 && near_edge < 0.15,
             "feathered edge, not a cliff: {near_edge}"
         );
         assert!(
@@ -1034,18 +1552,62 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_guide_is_the_rendered_half_strength_contour() {
-        assert_eq!(
-            Dab::half_strength_radius(0.0),
-            None,
-            "a hard edge has no feather guide"
+    fn feather_is_how_much_of_the_radius_the_fade_takes() {
+        let at = |d: f32, feather: f32| Dab::profile(d, feather, Falloff::Core);
+        for feather in [0.1, 0.4, 0.6, 1.0] {
+            let core = 1.0 - feather;
+            // Full strength to the core, half way through the fade at its middle, and
+            // nothing at the rim: the cursor's two circles and the halfway between.
+            assert_eq!(at(core * 0.99, feather), 1.0, "inside the core at {feather}");
+            let half = at(1.0 - feather * 0.5, feather);
+            assert!((half - 0.5).abs() < 1e-5, "half way at {feather}: {half}");
+            assert!(at(0.999, feather) > 0.0, "the fade reaches the rim at {feather}");
+            assert_eq!(at(1.0, feather), 0.0);
+            // Smooth all the way: no step anywhere along the radius.
+            let steepest = (0..1000)
+                .map(|i| (at(i as f32 / 1000.0, feather) - at((i + 1) as f32 / 1000.0, feather)).abs())
+                .fold(0.0, f32::max);
+            assert!(steepest < 0.02 / feather.max(0.1), "a step of {steepest} at {feather}");
+        }
+        // **A softer brush is not a smaller one**, which is what the bell did: at
+        // Feather 1.0 it had faded below a twentieth by 0.55 of the radius.
+        assert!(at(0.85, 1.0) > 0.05);
+        assert!(Dab::profile(0.6, 1.0, Falloff::Bell) < 0.05);
+        // The cursor's inner circle is the core.
+        assert_eq!(Dab::core_radius(0.0), None, "a hard edge has no inner circle");
+        assert!((Dab::core_radius(0.6).unwrap() - 0.4).abs() < 1e-6);
+        assert_eq!(Dab::core_radius(1.0), Some(0.0));
+    }
+
+    #[test]
+    fn a_saved_stroke_keeps_the_bell_it_was_painted_with() {
+        // The old falloff, pinned: the default Feather 0.40 was at half strength a
+        // little short of mid-radius. A stroke read from a file saved before the core
+        // falloff is drawn this way still.
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..24 {
+            let mid = (lo + hi) * 0.5;
+            if Dab::profile(mid, 0.4, Falloff::Bell) > 0.5 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        assert!((lo - 0.465).abs() < 0.01, "half strength at {lo}");
+        let bell = Dab {
+            feather: 0.4,
+            falloff: Falloff::Bell,
+            ..dab(0.5, 0.5, -1.0)
+        };
+        let core = Dab {
+            falloff: Falloff::Core,
+            ..bell
+        };
+        assert_ne!(
+            bell.coverage_at(0.57, 0.5, SQUARE),
+            core.coverage_at(0.57, 0.5, SQUARE),
+            "the two edges are not the same edge"
         );
-        let radius = Dab::half_strength_radius(0.4).expect("the default is feathered");
-        assert!(
-            (radius - 0.47).abs() < 0.02,
-            "the default guide should sit near mid-radius, not on the outer ring: {radius}"
-        );
-        assert!((Dab::profile(radius, 0.4) - 0.5).abs() < 1e-4);
     }
 
     #[test]
@@ -1573,6 +2135,104 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------- painted coverage, as a picture
+
+    /// A soft dab for a mask: `paint` adds, and not erases.
+    fn mask_dab(x: f32, y: f32, paint: bool) -> Dab {
+        Dab {
+            x,
+            y,
+            radius: 0.12,
+            feather: 0.5,
+            opacity: 0.8,
+            ev: if paint { 1.0 } else { -1.0 },
+            ..Dab::ROUND
+        }
+    }
+
+    fn stroke(y: f32, n: usize, paint: bool) -> Gesture {
+        Gesture::new(
+            (0..n)
+                .map(|i| mask_dab(0.1 + 0.8 * i as f32 / n.max(1) as f32, y, paint))
+                .collect(),
+        )
+    }
+
+    /// The worst difference between the picture and `painted_at`, at the grid's own
+    /// pixel centers, where the two are the same arithmetic.
+    fn worst(cover: &Coverage, passes: &[Gesture]) -> f32 {
+        let shape = Shape::brush(passes.to_vec());
+        let (w, h) = (cover.w, cover.h);
+        let mut worst = 0.0f32;
+        for py in (0..h).step_by(7) {
+            for px in (0..w).step_by(7) {
+                let (x, y) = ((px as f32 + 0.5) / w as f32, (py as f32 + 0.5) / h as f32);
+                worst = worst.max((cover.at(x, y) - shape.painted_at(x, y, cover.aspect)).abs());
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn the_picture_of_what_is_painted_is_what_is_painted() {
+        // Two passes that overlap, and an eraser through them, on a negative that is
+        // not square. At its own pixels the picture is `painted_at`, to rounding.
+        for aspect in [0.667, 1.5] {
+            let passes = vec![stroke(0.3, 12, true), stroke(0.45, 12, true), stroke(0.38, 5, false)];
+            let mut cover = Coverage::new(aspect);
+            assert_eq!(cover.w.max(cover.h), Coverage::LONG_EDGE);
+            cover.update(&passes);
+            assert!(worst(&cover, &passes) < 1.0e-5, "{aspect}: {}", worst(&cover, &passes));
+            // And there is something in it to agree about.
+            assert!(cover.at(0.5, 0.3) > 0.5);
+            assert_eq!(cover.at(0.5, 0.95), 0.0);
+        }
+    }
+
+    #[test]
+    fn a_stroke_drawn_dab_by_dab_is_the_stroke_drawn_at_once() {
+        // The incremental path is the one that runs: a pass grows a few dabs a frame,
+        // then another starts. After every step the picture is what a fresh one of the
+        // same passes would be.
+        let mut passes: Vec<Gesture> = Vec::new();
+        let mut cover = Coverage::new(0.667);
+        for (y, n, paint) in [(0.3, 9, true), (0.6, 7, true), (0.45, 6, false), (0.5, 4, true)] {
+            passes.push(Gesture::new(Vec::new()));
+            for dab in stroke(y, n, paint).dabs.iter() {
+                passes.last_mut().unwrap().dabs_mut().push(*dab);
+                cover.update(&passes);
+                assert!(worst(&cover, &passes) < 1.0e-5);
+            }
+        }
+        let mut fresh = Coverage::new(0.667);
+        fresh.update(&passes);
+        assert_eq!(cover.total, fresh.total);
+        assert_eq!(cover.done.len(), 3, "three finished passes and one still growing");
+    }
+
+    #[test]
+    fn a_picture_follows_an_undo_and_a_change_of_strokes() {
+        let passes = vec![stroke(0.3, 8, true), stroke(0.6, 8, true)];
+        let mut cover = Coverage::new(1.0);
+        cover.update(&passes);
+        // The last stroke undone, then all of them.
+        cover.update(&passes[..1]);
+        assert!(worst(&cover, &passes[..1]) < 1.0e-5);
+        assert_eq!(cover.at(0.5, 0.6), 0.0, "the undone stroke is still in the picture");
+        cover.update(&[]);
+        assert_eq!(cover.at(0.5, 0.3), 0.0);
+        // A dab of the stroke in flight taken back, which a growing pass never does.
+        let mut shorter = passes.clone();
+        shorter[1].dabs_mut().truncate(3);
+        cover.update(&passes);
+        cover.update(&shorter);
+        assert!(worst(&cover, &shorter) < 1.0e-5);
+        // Other strokes altogether.
+        let other = vec![stroke(0.8, 5, true)];
+        cover.update(&other);
+        assert!(worst(&cover, &other) < 1.0e-5);
+    }
+
     // ------------------------------------------------------------- gradients
 
     fn linear(x0: f32, y0: f32, x1: f32, y1: f32, feather: f32) -> Linear {
@@ -1935,6 +2595,197 @@ mod tests {
                 "at {ev}"
             );
         }
+    }
+
+    #[test]
+    fn a_sampled_tone_becomes_one_zone_with_one_zone_shoulders() {
+        // Starting from a range somebody had shaped, inverted and switched off: the sample
+        // replaces where the range is, switches it on, and leaves what it means alone.
+        let mut m = ZoneMask {
+            lo: -4.0,
+            hi: -3.0,
+            f_lo: 0.25,
+            f_hi: 2.0,
+            invert: true,
+            region: 0.08,
+            ..Default::default()
+        };
+        m.sample(1.5, 1.5);
+        assert!(m.enabled, "sampling a range is asking to see it");
+        assert_eq!((m.lo, m.hi), (1.0, 2.0), "one zone, centered on the tone");
+        assert_eq!((m.f_lo, m.f_hi), (1.0, 1.0));
+        assert!(m.invert, "Inv says what the range means, not where it is");
+        assert_eq!(m.region, 0.08, "and how it reads the picture is not the sample's");
+        // The sampled tone is at full weight, once Inv is set aside.
+        m.invert = false;
+        assert_eq!(m.evaluate(1.5), 1.0);
+        assert_eq!(m.evaluate(-0.5), 0.0, "past the lower shoulder");
+    }
+
+    #[test]
+    fn a_sampled_box_spans_its_tones_and_is_never_narrower_than_a_click() {
+        let mut m = ZoneMask::default();
+        // Given either way round.
+        m.sample(2.0, -1.0);
+        assert_eq!((m.lo, m.hi), (-1.0, 2.0));
+        // A box over a flat wall is a click on it.
+        let mut flat = ZoneMask::default();
+        flat.sample(0.4, 0.6);
+        let mut click = ZoneMask::default();
+        click.sample(0.5, 0.5);
+        assert_eq!(flat, click);
+        assert!((flat.hi - flat.lo - ZoneMask::SAMPLE_WIDTH).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_sample_at_the_end_of_the_ruler_is_open_on_that_side() {
+        // The deepest shadow: there is nothing below it to leave out, so the range runs
+        // off the bottom of the ruler, which is what open means.
+        let mut m = ZoneMask::default();
+        m.sample(-4.8, -4.8);
+        assert_eq!(m.lo, ZoneMask::MIN_EV);
+        assert!((m.hi + 4.3).abs() < 1e-6);
+        assert_eq!(m.evaluate(-9.0), 1.0, "everything below is in");
+        // A tone off the ruler altogether still selects itself.
+        let mut off = ZoneMask::default();
+        off.sample(7.0, 7.0);
+        assert_eq!((off.lo, off.hi), (ZoneMask::MAX_EV, ZoneMask::MAX_EV));
+        assert_eq!(off.evaluate(7.0), 1.0);
+        assert_eq!(off.evaluate(3.5), 0.0);
+        // And a sample that is not a number changes nothing.
+        let before = off;
+        off.sample(f32::NAN, 1.0);
+        off.extend(1.0, f32::INFINITY);
+        assert_eq!(off, before);
+    }
+
+    #[test]
+    fn extending_a_range_widens_it_and_never_narrows_it() {
+        let start = ZoneMask {
+            enabled: true,
+            lo: -1.0,
+            hi: 1.0,
+            f_lo: 0.5,
+            f_hi: 1.5,
+            ..Default::default()
+        };
+        // A tone already inside moves nothing, shoulders included.
+        let mut m = start;
+        m.extend(0.25, 0.25);
+        assert_eq!(m, start);
+        // One in a shoulder, only partly selected, is taken in whole.
+        m.extend(-1.25, -1.25);
+        assert_eq!((m.lo, m.hi), (-1.25, 1.0));
+        assert_eq!(m.evaluate(-1.25), 1.0);
+        // One above moves the top and leaves the bottom where it was.
+        m.extend(3.0, 3.0);
+        assert_eq!((m.lo, m.hi), (-1.25, 3.0));
+        assert_eq!((m.f_lo, m.f_hi), (0.5, 1.5), "the shoulders were set for this range");
+        // A box reaches both ways at once, and every step so far only grew the range.
+        m.extend(-2.0, 3.5);
+        assert_eq!((m.lo, m.hi), (-2.0, 3.5));
+        for (lo, hi) in [(-9.0, -9.0), (0.0, 0.0), (9.0, 9.0), (-3.0, 4.0)] {
+            let before = m;
+            m.extend(lo, hi);
+            assert!(m.lo <= before.lo && m.hi >= before.hi, "narrowed by {lo}..{hi}");
+        }
+        assert!(m.is_open(), "widened right off both ends of the ruler");
+        // Extending a range that was off switches it on: it was asked to select something.
+        let mut off = ZoneMask { enabled: false, ..start };
+        off.extend(2.0, 2.0);
+        assert!(off.enabled && off.hi == 2.0);
+    }
+
+    #[test]
+    fn extending_an_open_range_leaves_it_open() {
+        // Open at both ends already includes every tone, so there is no end to move
+        // outward, and narrowing it to the tone clicked would be the one thing extend
+        // must never do. Whether the range was never set or was widened to everything
+        // cannot be told apart, and need not be.
+        let mut m = ZoneMask::default();
+        m.extend(2.0, 2.0);
+        assert!(m.is_open() && m.enabled);
+        // Open at one end only is a range like any other.
+        let mut shadows = ZoneMask {
+            enabled: true,
+            hi: -2.0,
+            ..Default::default()
+        };
+        shadows.extend(-4.0, -4.0);
+        assert_eq!((shadows.lo, shadows.hi), (ZoneMask::MIN_EV, -2.0));
+        shadows.extend(0.0, 0.0);
+        assert_eq!((shadows.lo, shadows.hi), (ZoneMask::MIN_EV, 0.0));
+    }
+
+    #[test]
+    fn seeds_are_placed_added_and_taken_away_in_order() {
+        let mut island = Island::default();
+        assert!(!island.is_live() && island.seeds().is_empty());
+        // A plain click starts again from one seed; a shift-click adds.
+        island.set((0.25, 0.5));
+        assert!(island.add((0.5, 0.5)));
+        assert!(island.add((0.75, 0.25)));
+        assert_eq!(island.seeds(), &[(0.25, 0.5), (0.5, 0.5), (0.75, 0.25)]);
+        assert!(!island.is_live(), "seeds, but not switched on");
+        island.enabled = true;
+        assert!(island.is_live());
+        // The middle one taken away closes the gap and keeps the order.
+        island.remove(1);
+        assert_eq!(island.seeds(), &[(0.25, 0.5), (0.75, 0.25)]);
+        island.remove(7);
+        assert_eq!(island.seeds().len(), 2, "no such seed, nothing removed");
+        // Two islands with the same seeds are equal whatever was removed on the way.
+        let mut direct = Island::new(true);
+        direct.add((0.25, 0.5));
+        direct.add((0.75, 0.25));
+        assert_eq!(island, direct);
+        // A click starts again; clearing keeps the switch.
+        island.set((0.5, 0.125));
+        assert_eq!(island.seeds(), &[(0.5, 0.125)]);
+        island.clear();
+        assert!(island.seeds().is_empty() && island.enabled && !island.is_live());
+    }
+
+    #[test]
+    fn an_island_holds_a_fixed_few_seeds_and_only_points_of_the_negative() {
+        let mut island = Island::new(true);
+        for i in 0..Island::MAX {
+            assert!(island.add((i as f32 / Island::MAX as f32, 0.5)), "seed {i}");
+        }
+        assert!(!island.add((0.5, 0.5)), "one more than it holds");
+        assert_eq!(island.seeds().len(), Island::MAX);
+        let mut island = Island::new(true);
+        for off in [(-0.1, 0.5), (0.5, 1.2), (f32::NAN, 0.5), (0.5, f32::INFINITY)] {
+            assert!(!island.add(off), "{off:?} is not on the negative");
+        }
+        assert!(island.seeds().is_empty());
+        assert!(island.add((0.0, 1.0)), "the corners are");
+        // A click that missed the picture does not throw the selection away.
+        assert!(!island.set((1.5, 0.5)));
+        assert_eq!(island.seeds(), &[(0.0, 1.0)]);
+        assert!(island.set((0.5, 0.5)) && island.enabled);
+        assert_eq!(island.seeds(), &[(0.5, 0.5)]);
+    }
+
+    #[test]
+    fn an_island_is_not_in_a_tones_own_answer_and_inv_still_is() {
+        // One EV cannot say whether a point is connected to a seed, so the per-tone
+        // answer is the range's, island or not; `select` is that answer before `Inv`.
+        let mut m = ZoneMask {
+            enabled: true,
+            lo: 1.0,
+            ..Default::default()
+        };
+        let plain = m;
+        m.island.enabled = true;
+        m.island.add((0.5, 0.5));
+        for ev in [-2.0, 0.5, 1.0, 3.0] {
+            assert_eq!(m.evaluate(ev), plain.evaluate(ev));
+            assert_eq!(m.select(ev), plain.evaluate(ev));
+        }
+        m.invert = true;
+        assert_eq!(m.select(3.0), 1.0, "before Inv");
+        assert_eq!(m.evaluate(3.0), 0.0, "after it");
     }
 
     #[test]

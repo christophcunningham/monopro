@@ -3011,7 +3011,8 @@ fn a_cropped_frame_never_shows_canvas_inside_its_own_edge() {
 // quantisation between the claim and the evidence.
 
 use raw_core::dodgeburn::{
-    Dab, DodgeBurnParams, Gesture, Instance, Linear, Nib, Radial, Shape, Sign, ZoneMask,
+    Dab, DodgeBurnParams, Falloff, Gesture, Instance, Linear, Nib, Radial, Shape, Sign,
+    ZoneMask,
 };
 
 fn dab(x: f32, y: f32, radius: f32, feather: f32, ev: f32) -> Dab {
@@ -3398,6 +3399,915 @@ fn a_dab_is_round_in_pixels_on_a_landscape_frame() {
     assert!(!burnt(100, 50 + 22), "22px below centre");
 }
 
+// ---------------------------------------------------------------- curve masks
+//
+// `CurveStack::apply_at` is the specification and these prove the shader implements
+// *that*. Same route as Dodge & Burn's: `Viewport::export` hands back the scene-referred
+// f32 the display node consumed, so there is no 8-bit quantisation between the claim and
+// the evidence.
+
+use raw_core::curve::{CurveMask, CurveStack, Rule};
+
+/// A frame that is not square whose tone runs from below the curve's window, across it,
+/// to above it left to right, and drifts a little brighter down the frame so that tone
+/// and position vary independently.
+fn tone_and_place(w: usize, h: usize) -> LumaImage {
+    let data = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            (x / (w - 1) as f32 * 13.0 - 11.0 + 0.8 * y / (h - 1) as f32).exp2()
+        })
+        .collect();
+    LumaImage {
+        data,
+        output_dims: Dims { w, h },
+        source_dims: Dims { w: w * 2, h: h * 2 },
+        clipped: Vec::new(),
+    }
+}
+
+fn sky_grad(feather: f32) -> Shape {
+    Shape::Linear(Linear {
+        x0: 0.8,
+        y0: 0.1,
+        x1: 0.25,
+        y1: 0.85,
+        feather,
+        ev: 0.0,
+    })
+}
+
+fn turned_spot() -> Shape {
+    Shape::Radial(Radial {
+        cx: 0.4,
+        cy: 0.6,
+        inner: 0.05,
+        outer: 0.35,
+        aspect: 1.8,
+        angle: 35.0,
+        feather: 0.7,
+        invert: false,
+        ev: 0.0,
+    })
+}
+
+/// An unmasked lift, an inverted diagonal Linear, and a turned Radial at 70% opacity:
+/// every kind of segment, in an order that makes each one depend on the one before.
+fn three_passes() -> CurveStack {
+    let mut stack = CurveStack::default();
+    stack.instances[0].curve.add(0.4, 0.55);
+    let second = stack.add_instance().expect("room");
+    stack.instances[second].curve.add(0.6, 0.45);
+    let mut inverted = CurveMask::of_shape(sky_grad(0.6));
+    inverted.invert = true;
+    stack.instances[second].mask = Some(inverted);
+    let third = stack.add_instance().expect("room");
+    stack.instances[third].curve.add(0.5, 0.62);
+    stack.instances[third].opacity = 0.7;
+    stack.instances[third].mask = Some(CurveMask::of_shape(turned_spot()));
+    stack
+}
+
+/// The worst relative disagreement between an export and `apply_at`, over every pixel.
+fn worst_against_reference(luma: &LumaImage, stack: &CurveStack, out: &[f32]) -> f32 {
+    let (w, h) = (luma.output_dims.w, luma.output_dims.h);
+    let aspect = h as f32 / w as f32;
+    let mut worst = 0.0f32;
+    for y in 0..h {
+        for x in 0..w {
+            // The shader reads `source_coord`, which at 1:1 with an untouched
+            // composition is the pixel center, normalized by the stored image's size.
+            let (nx, ny) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+            let scene = luma.data[y * w + x];
+            let want = stack.apply_at(scene, nx, ny, aspect, 0.0);
+            let got = out[y * w + x];
+            worst = worst.max((got - want).abs() / want.abs().max(1e-6));
+        }
+    }
+    worst
+}
+
+#[test]
+fn a_masked_curve_agrees_with_the_cpu_reference() {
+    // Every pixel of a three-pass stack — an unmasked lift, an inverted diagonal Linear
+    // and a turned Radial at 70% — on a frame that is not square, with the first
+    // columns below the curve's window and the last above it. Below the window each
+    // pixel scales to meet its own floor, which is the part a uniform slope would get
+    // wrong, and this stack lifts the floor in some places and not others.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (160usize, 96usize);
+    let luma = tone_and_place(w, h);
+    let p = Params {
+        curve: three_passes(),
+        ..Default::default()
+    };
+    assert!(p.curve.has_masks());
+
+    let (ew, eh, out) = exported(&luma, &p);
+    assert_eq!((ew as usize, eh as usize), (w, h));
+
+    let worst = worst_against_reference(&luma, &p.curve, &out);
+    // f32 arithmetic in a different order on a different device, and a table lerp
+    // against an exact spline. A tenth of a percent is far below anything visible and
+    // far above anything structural — a mask applied to the wrong pass, an unmasked run
+    // composed out of order — could hide in.
+    assert!(
+        worst < 1e-3,
+        "worst relative disagreement with the CPU reference: {worst}"
+    );
+}
+
+#[test]
+fn a_mask_that_is_off_renders_byte_for_byte_as_no_mask() {
+    let Some(_) = headless_device() else { return };
+    let luma = tone_and_place(96, 64);
+    let masked = Params {
+        curve: three_passes(),
+        ..Default::default()
+    };
+    let mut off = masked.clone();
+    for pass in &mut off.curve.instances {
+        if let Some(mask) = &mut pass.mask {
+            mask.enabled = false;
+        }
+    }
+    let mut none = masked.clone();
+    for pass in &mut none.curve.instances {
+        pass.mask = None;
+    }
+    let (_, _, a) = exported(&luma, &off);
+    let (_, _, b) = exported(&luma, &none);
+    assert_eq!(a, b, "a switched-off mask changed the picture");
+    let (_, _, c) = exported(&luma, &masked);
+    assert_ne!(a, c, "the mask did nothing, so the test above proved nothing");
+}
+
+#[test]
+fn a_mask_limits_a_pass_to_its_shape_and_leaves_the_rest_alone() {
+    // A property beside the numeric one, since "it matches the CPU" would pass if both
+    // were wrong the same way: a lifted pass, masked to a sky grad, brightens the top
+    // of a flat frame and leaves the bottom exactly as it found it.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (120usize, 80usize);
+    let luma = flat(0.2, w, h);
+    let mut curve = CurveStack::default();
+    curve.instances[0].curve.add(0.5, 0.7);
+    curve.instances[0].mask = Some(CurveMask::of_shape(Shape::Linear(Linear {
+        x0: 0.5,
+        y0: 0.0,
+        x1: 0.5,
+        y1: 0.5,
+        feather: 1.0,
+        ev: 0.0,
+    })));
+    let p = Params {
+        curve,
+        ..Default::default()
+    };
+    let (_, _, out) = exported(&luma, &p);
+    let at = |x: usize, y: usize| out[y * w + x];
+    assert!(at(60, 1) > 0.2 * 1.3, "the top edge is lifted: {}", at(60, 1));
+    // Not bit for bit: a masked stack takes a log2 and exp2 round trip, a few parts
+    // in ten million, which is not a thing a display can show.
+    assert!(
+        (at(60, h - 2) - 0.2).abs() < 1e-6,
+        "the bottom is as it was: {}",
+        at(60, h - 2)
+    );
+    assert!(
+        at(60, h / 4) > 0.2 && at(60, h / 4) < at(60, 1),
+        "the grad fades between"
+    );
+    // A Linear is unbounded across its drag: every column of one row agrees.
+    for x in [0, 30, 90, w - 1] {
+        assert!((at(x, 5) - at(60, 5)).abs() < 1e-6, "column {x} differs");
+    }
+}
+
+#[test]
+fn a_curve_mask_is_welded_to_the_negative_at_every_zoom() {
+    // The bug shape the Dodge & Burn test of the same name guards: masks are in
+    // normalized coordinates and the view has a scale, so a mistake in the mapping is
+    // invisible at 100% and obvious at 33%. A lifted spot, off-center in both axes, at
+    // five scales: the brightened patch must be over the same part of the PICTURE.
+    let Some(_) = headless_device() else { return };
+    let luma = flat(0.3, 200, 150);
+    let mut curve = CurveStack::default();
+    curve.instances[0].curve.add(0.5, 0.75);
+    curve.instances[0].mask = Some(CurveMask::of_shape(Shape::Radial(Radial {
+        cx: 0.25,
+        cy: 0.7,
+        inner: 0.0,
+        outer: 0.12,
+        aspect: 1.0,
+        angle: 0.0,
+        feather: 0.0,
+        invert: false,
+        ev: 0.0,
+    })));
+    let p = Params {
+        curve,
+        ..no_dither()
+    };
+    for scale in [1.0f32, 0.75, 0.5, 0.33, 0.25] {
+        let view = ViewGeometry {
+            scale,
+            off_x: 0.0,
+            off_y: 0.0,
+            ..Default::default()
+        };
+        let out = render_composed(&luma, 220, 180, view, &p).expect("render");
+        let plain = px(&out, 220, 5, 5)[0];
+        let (mut sx, mut sy, mut n) = (0.0f64, 0.0f64, 0u32);
+        for y in 0..(150.0 * scale) as u32 {
+            for x in 0..(200.0 * scale) as u32 {
+                if px(&out, 220, x, y)[0].saturating_sub(plain) > 20 {
+                    sx += x as f64;
+                    sy += y as f64;
+                    n += 1;
+                }
+            }
+        }
+        assert!(n > 4, "at scale {scale} the mask did not render at all");
+        let cx = (sx / n as f64) as f32 / (200.0 * scale);
+        let cy = (sy / n as f64) as f32 / (150.0 * scale);
+        assert!((cx - 0.25).abs() < 0.02, "at scale {scale} the spot sat at x={cx}");
+        assert!((cy - 0.70).abs() < 0.02, "at scale {scale} the spot sat at y={cy}");
+    }
+}
+
+#[test]
+fn a_curve_mask_stays_on_the_picture_through_a_turn_and_a_crop() {
+    // Masks are stored against the negative, so a quarter turn and a crop cannot move
+    // one off what it was laid on. The reference is asked at each exported pixel's own
+    // place on the NEGATIVE, found through the frame, so a mask that followed the
+    // output instead would disagree everywhere.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (160usize, 96usize);
+    let luma = flat(0.25, w, h);
+    let mut curve = CurveStack::default();
+    curve.instances[0].curve.add(0.5, 0.72);
+    curve.instances[0].mask = Some(CurveMask::of_shape(turned_spot()));
+    let mut p = Params {
+        curve,
+        ..Default::default()
+    };
+    p.composition.orientation = Some(Orientation::Rotate90);
+    p.composition.crop = Rect {
+        x: 0.1,
+        y: 0.15,
+        w: 0.75,
+        h: 0.7,
+    };
+    let frame = Frame::resolve(luma.output_dims, Orientation::Rotate0, &p.composition);
+    let (device, queue) = headless_device().expect("an adapter");
+    let mut ctx = GpuContext::new(&device);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let (ow, oh, out) = vp
+        .export(&mut ctx, &device, &queue, &p, &frame, |_, _| {})
+        .expect("export");
+    assert_eq!((ow, oh), (frame.crop.w, frame.crop.h));
+
+    let aspect = h as f32 / w as f32;
+    let mut worst = 0.0f32;
+    let mut lifted = 0;
+    for y in 0..oh as usize {
+        for x in 0..ow as usize {
+            let (fx, fy) = (
+                frame.crop.x as f32 + x as f32 + 0.5,
+                frame.crop.y as f32 + y as f32 + 0.5,
+            );
+            let (sx, sy) = frame.to_source(fx, fy);
+            let want = p
+                .curve
+                .apply_at(0.25, sx / w as f32, sy / h as f32, aspect, 0.0);
+            let got = out[y * ow as usize + x];
+            worst = worst.max((got - want).abs() / want);
+            lifted += usize::from(got > 0.26);
+        }
+    }
+    assert!(lifted > 100, "the mask never reached the picture");
+    assert!(worst < 1e-3, "worst disagreement through a turn and crop: {worst}");
+}
+
+#[test]
+fn moving_a_mask_on_a_live_viewport_redraws_it_without_rebaking() {
+    // The second render changes where the mask lies and nothing a table is made of, so
+    // the viewport re-sends segments and leaves the tables where they were. If the
+    // segments were not re-sent, the second image would still be the first.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (120usize, 80usize);
+    let luma = tone_and_place(w, h);
+    let first = Params {
+        curve: three_passes(),
+        ..Default::default()
+    };
+    let mut second = first.clone();
+    if let Some(mask) = &mut second.curve.instances[2].mask {
+        mask.shape = Some(Shape::Radial(Radial {
+            cx: 0.75,
+            cy: 0.3,
+            inner: 0.0,
+            outer: 0.2,
+            aspect: 0.7,
+            angle: -20.0,
+            feather: 0.5,
+            invert: false,
+            ev: 0.0,
+        }));
+    }
+    assert!(first.curve.same_luts(&second.curve) && !first.curve.same_render(&second.curve));
+
+    let (device, queue) = headless_device().expect("an adapter");
+    let frame = upright(&luma);
+    let mut ctx = GpuContext::new(&device);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let (_, _, a) = vp
+        .export(&mut ctx, &device, &queue, &first, &frame, |_, _| {})
+        .expect("export");
+    let (_, _, b) = vp
+        .export(&mut ctx, &device, &queue, &second, &frame, |_, _| {})
+        .expect("export");
+    assert!(worst_against_reference(&luma, &first.curve, &a) < 1e-3);
+    assert!(
+        worst_against_reference(&luma, &second.curve, &b) < 1e-3,
+        "the moved mask was not drawn"
+    );
+    assert_ne!(a, b);
+
+    // And back to a stack with no mask: the original single-table path again, which
+    // must not be left reading segments the last render wrote.
+    let mut plain = first.clone();
+    for pass in &mut plain.curve.instances {
+        pass.mask = None;
+    }
+    let (_, _, c) = vp
+        .export(&mut ctx, &device, &queue, &plain, &frame, |_, _| {})
+        .expect("export");
+    let (_, _, fresh) = exported(&luma, &plain);
+    assert_eq!(c, fresh, "an unmasked stack differed after a masked one");
+}
+
+// ------------------------------------------------------- curve masks: tone ranges
+//
+// A tone range is a mask of the picture, read from the same edge-aware basis Dodge & Burn's
+// tone masks are, so these tests hold the shader to `CurveStack::apply_at` with the tone
+// supplied, and hold the preparation to its rule: no tone range, no basis build.
+
+/// A band of tones around middle gray, per-pixel (not edge-aware) and undiffused, so the
+/// CPU reference, which evaluates the trapezoid on the raw basis, is the specification.
+fn band(lo: f32, hi: f32) -> ZoneMask {
+    ZoneMask {
+        enabled: true,
+        lo,
+        hi,
+        f_lo: 1.0,
+        f_hi: 1.25,
+        edge_aware: false,
+        blur: 0.0,
+        ..ZoneMask::default()
+    }
+}
+
+/// Like `worst_against_reference`, with the pixel's own basis EV supplied, which is what a
+/// tone range reads. At 1:1 with a proxy as large as the image it is exactly the pixel's.
+fn worst_against_reference_with_tone(luma: &LumaImage, stack: &CurveStack, out: &[f32]) -> f32 {
+    let (w, h) = (luma.output_dims.w, luma.output_dims.h);
+    let aspect = h as f32 / w as f32;
+    let mut worst = 0.0f32;
+    for y in 0..h {
+        for x in 0..w {
+            let (nx, ny) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+            let scene = luma.data[y * w + x];
+            let tone_ev = (scene / 0.18).log2();
+            let want = stack.apply_at(scene, nx, ny, aspect, tone_ev);
+            let got = out[y * w + x];
+            worst = worst.max((got - want).abs() / want.abs().max(1e-6));
+        }
+    }
+    worst
+}
+
+/// An unmasked lift, then a tone alone, then a shape and a tone under each rule in turn:
+/// every way a tone can be a part of a mask, in an order that makes each depend on the last.
+fn tone_passes() -> CurveStack {
+    let mut stack = CurveStack::default();
+    stack.instances[0].curve.add(0.4, 0.55);
+    let add = |stack: &mut CurveStack, x: f32, y: f32, mask: CurveMask| {
+        let i = stack.add_instance().expect("room");
+        stack.instances[i].curve.add(x, y);
+        stack.instances[i].mask = Some(mask);
+    };
+    add(
+        &mut stack,
+        0.55,
+        0.45,
+        CurveMask {
+            enabled: true,
+            shape: None,
+            invert: false,
+            tone: Some(band(-2.5, 0.0)),
+            rule: Rule::Intersect,
+        },
+    );
+    for (rule, lo, hi, y) in [
+        (Rule::Intersect, -3.0, 1.0, 0.62),
+        (Rule::Subtract, -1.5, 2.0, 0.40),
+        (Rule::Add, -4.0, -2.0, 0.58),
+    ] {
+        add(
+            &mut stack,
+            0.5,
+            y,
+            CurveMask {
+                enabled: true,
+                shape: Some(turned_spot()),
+                invert: false,
+                tone: Some(band(lo, hi)),
+                rule,
+            },
+        );
+    }
+    stack
+}
+
+#[test]
+fn a_tone_masked_curve_agrees_with_the_cpu_reference() {
+    // Every pixel of a five-pass stack whose masks are a tone alone and a shape and a tone
+    // under Intersect, Subtract and Add, on a frame that is not square, with tones from
+    // well below the curve's window to above it. Each tone has its own layer of the array,
+    // so a layer given to the wrong pass is a disagreement everywhere.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (160usize, 96usize);
+    let luma = tone_and_place(w, h);
+    let p = Params {
+        curve: tone_passes(),
+        ..Default::default()
+    };
+    assert!(p.curve.needs_zones() && p.curve.tone_masks().len() == 4);
+
+    let (ew, eh, out) = exported(&luma, &p);
+    assert_eq!((ew as usize, eh as usize), (w, h));
+    let worst = worst_against_reference_with_tone(&luma, &p.curve, &out);
+    assert!(
+        worst < 1e-3,
+        "worst relative disagreement with the CPU reference: {worst}"
+    );
+}
+
+#[test]
+fn a_sample_of_the_basis_says_what_an_edge_aware_tone_range_selects() {
+    // The reference above holds only for a range read per pixel. One that is edge-aware and
+    // diffused reads the picture regionally, so the trapezoid on a pixel's own tone is not
+    // what the shader looked up. The sampler gets that right by reading the viewport's own
+    // basis: with each range weighed by `Basis` at the pixel, the CPU agrees with the render
+    // on every pixel, and on a rippled picture the per-pixel reference visibly does not.
+    let (device, queue) = gpu!(headless_device());
+    let (w, h) = (160usize, 96usize);
+    let mut luma = tone_and_place(w, h);
+    for (i, v) in luma.data.iter_mut().enumerate() {
+        *v *= if (i % w + i / w) % 2 == 0 { 1.25 } else { 0.8 };
+    }
+    let mut p = Params {
+        curve: tone_passes(),
+        ..Default::default()
+    };
+    for (i, instance) in p.curve.instances.iter_mut().enumerate() {
+        if let Some(tone) = instance.mask.as_mut().and_then(|m| m.tone.as_mut()) {
+            tone.edge_aware = true;
+            // Two of the four diffused as well, so both halves of the preparation are read.
+            tone.blur = if i % 2 == 0 { 0.02 } else { 0.0 };
+        }
+    }
+    let frame = Frame::resolve(luma.output_dims, Orientation::Rotate0, &p.composition);
+    let mut ctx = GpuContext::new(&device);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let (_, _, out) = vp
+        .export(&mut ctx, &device, &queue, &p, &frame, |_, _| {})
+        .expect("export");
+    let builds = vp.basis_rebuilds();
+    let basis = vp.zone_basis(&p);
+    assert_eq!(
+        vp.basis_rebuilds(),
+        builds,
+        "the sample read a basis of its own, not the one the masks were made from"
+    );
+    assert_eq!((basis.w, basis.h), (w, h), "small enough that the proxy is the image");
+
+    // Each range prepared once and read at pixel centers, which is `weight_at` without
+    // preparing the mask again for every pixel.
+    let prepared: Vec<(ZoneMask, Option<Vec<f32>>)> = p
+        .curve
+        .tone_masks()
+        .into_iter()
+        .map(|tone| (tone, basis.evaluate(&tone)))
+        .collect();
+    let aspect = h as f32 / w as f32;
+    let passes = p.curve.instances.len();
+    let (mut worst, mut worst_per_pixel) = (0.0f32, 0.0f32);
+    for y in 0..h {
+        for x in 0..w {
+            let (nx, ny) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+            let scene = luma.data[y * w + x];
+            let want = p.curve.apply_before_at(passes, scene, nx, ny, aspect, &|tone| {
+                let (_, mask) = prepared
+                    .iter()
+                    .find(|(t, _)| t == tone)
+                    .expect("asked about a range the stack has");
+                mask.as_ref().map_or(1.0, |m| m[y * w + x])
+            });
+            let got = out[y * w + x];
+            worst = worst.max((got - want).abs() / want.abs().max(1e-6));
+            let naive = p.curve.apply_at(scene, nx, ny, aspect, (scene / 0.18).log2());
+            worst_per_pixel = worst_per_pixel.max((got - naive).abs() / naive.abs().max(1e-6));
+        }
+    }
+    assert!(worst < 1e-3, "worst disagreement with the sampled basis: {worst}");
+    assert!(
+        worst_per_pixel > 1e-2,
+        "the picture did not tell the two readings apart: {worst_per_pixel}"
+    );
+
+    // And `weight_at` is that prepared mask, at a handful of pixels across the frame.
+    for (x, y) in [(3, 5), (40, 20), (79, 48), (120, 70), (157, 93)] {
+        let (nx, ny) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+        for (tone, mask) in &prepared {
+            let want = mask.as_ref().map_or(1.0, |m| m[y * w + x]);
+            assert!((basis.weight_at(tone, nx, ny) - want).abs() < 1e-6);
+        }
+    }
+}
+
+#[test]
+fn a_tone_alone_masks_by_brightness_and_not_by_place() {
+    // A property beside the numeric one: lifting only the bright tones of a ramp leaves the
+    // dark end exactly alone and brightens the bright end, on every row alike.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (160usize, 40usize);
+    let luma = ramp(w, h);
+    let mut curve = CurveStack::default();
+    curve.instances[0].curve.add(0.5, 0.7);
+    curve.instances[0].mask = Some(CurveMask {
+        enabled: true,
+        shape: None,
+        invert: false,
+        tone: Some(ZoneMask {
+            enabled: true,
+            lo: 0.5,
+            hi: 5.0,
+            f_lo: 0.5,
+            f_hi: 1.0,
+            edge_aware: false,
+            ..ZoneMask::default()
+        }),
+        rule: Rule::Intersect,
+    });
+    let p = Params {
+        curve,
+        ..Default::default()
+    };
+    let (_, _, out) = exported(&luma, &p);
+    let at = |x: usize, y: usize| (out[y * w + x], luma.data[y * w + x]);
+    // Deep shadows (around -9 EV) are not selected: as they were.
+    let (dark_out, dark_in) = at(8, 5);
+    assert!((dark_out - dark_in).abs() / dark_in < 1e-5, "{dark_out} vs {dark_in}");
+    // Highlights above +1 EV are selected, and the lifted curve brightens them.
+    let (bright_out, bright_in) = at(w - 30, 5);
+    assert!(bright_out > bright_in * 1.05, "{bright_out} vs {bright_in}");
+    // The same tone on another row is the same: nothing about it is a place.
+    for y in [0, 20, h - 1] {
+        assert!((at(w - 30, y).0 - bright_out).abs() < 1e-6, "row {y} differs");
+    }
+}
+
+#[test]
+fn a_fully_open_tone_is_still_a_part_on_the_gpu() {
+    // Open selects everything, and Subtracted from a shape leaves nothing. That is not the
+    // same as having no tone, and the shader has to be told one is there even though there
+    // is no mask to read: with the pass weighing nothing the picture is the unmasked one.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (120usize, 80usize);
+    let luma = tone_and_place(w, h);
+    let mut curve = CurveStack::default();
+    curve.instances[0].curve.add(0.5, 0.75);
+    curve.instances[0].mask = Some(CurveMask {
+        enabled: true,
+        shape: Some(turned_spot()),
+        invert: false,
+        tone: Some(ZoneMask {
+            enabled: true,
+            ..ZoneMask::default()
+        }),
+        rule: Rule::Subtract,
+    });
+    assert!(!curve.needs_zones(), "an open tone has nothing to prepare");
+    let p = Params {
+        curve: curve.clone(),
+        ..Default::default()
+    };
+    let (_, _, out) = exported(&luma, &p);
+    assert!(
+        worst_against_reference_with_tone(&luma, &curve, &out) < 1e-3,
+        "disagrees with the reference, which weighs the pass at zero everywhere"
+    );
+    // And the pass does nothing at all, to within the log2 and exp2 round trip, for every
+    // tone inside the curve's window. Above its top the curve is flat, as it always was,
+    // and a very bright tone clamps there whether or not a mask lets the pass through.
+    let (floor, ceiling) = ((-10.0f32).exp2(), 2.0f32.exp2());
+    let mut checked = 0;
+    for (got, want) in out.iter().zip(&luma.data) {
+        if (floor..ceiling).contains(want) {
+            checked += 1;
+            assert!((got - want).abs() / want < 1e-5, "{got} vs {want}");
+        }
+    }
+    assert!(checked > w * h / 2, "the test image barely entered the window");
+}
+
+#[test]
+fn only_a_tone_range_that_needs_the_picture_builds_a_basis() {
+    // **A stack with no tone range must never cost a basis build**: the worker is the
+    // expensive part, and a Curve with shapes, unmasked passes or a tone that is off has
+    // nothing to ask it for.
+    let (device, queue) = gpu!(headless_device());
+    let mut ctx = GpuContext::new(&device);
+    let luma = flat(0.4, 128, 128);
+    let frame = upright(&luma);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let mut render = |vp: &mut Viewport, p: &Params| {
+        vp.render(&mut ctx, &device, &queue, 128, 128, ONE_TO_ONE, p, &frame)
+    };
+
+    let mut p = no_dither();
+    p.curve = three_passes();
+    render(&mut vp, &p);
+    assert_eq!(vp.basis_rebuilds(), 0, "shapes read nothing from the picture");
+
+    // A tone that is off, and one that is fully open, have nothing to prepare either.
+    let mut off = band(-2.0, 1.0);
+    off.enabled = false;
+    p.curve.instances[0].mask = Some(CurveMask {
+        tone: Some(off),
+        ..CurveMask::of_shape(sky_grad(1.0))
+    });
+    render(&mut vp, &p);
+    let open = ZoneMask {
+        enabled: true,
+        ..ZoneMask::default()
+    };
+    p.curve.instances[0].mask = Some(CurveMask {
+        tone: Some(open),
+        ..CurveMask::of_shape(sky_grad(1.0))
+    });
+    render(&mut vp, &p);
+    assert_eq!(vp.basis_rebuilds(), 0);
+
+    // A range that selects does.
+    p.curve.instances[0].mask = Some(CurveMask {
+        tone: Some(band(-2.0, 1.0)),
+        ..CurveMask::of_shape(sky_grad(1.0))
+    });
+    render(&mut vp, &p);
+    assert_eq!(vp.basis_rebuilds(), 1);
+
+    // Moving the shape, the rule or the curve asks the worker for nothing more: the basis
+    // is the same and the range is the same.
+    if let Some(mask) = &mut p.curve.instances[0].mask {
+        mask.shape = Some(turned_spot());
+        mask.rule = Rule::Add;
+    }
+    render(&mut vp, &p);
+    p.curve.instances[2].opacity = 0.5;
+    render(&mut vp, &p);
+    assert_eq!(vp.basis_rebuilds(), 1, "a handle moved and the worker was asked again");
+
+    // Exposure moves what the range reads, so that is a new basis.
+    p.exposure.ev = 0.5;
+    render(&mut vp, &p);
+    assert_eq!(vp.basis_rebuilds(), 2);
+}
+
+#[test]
+fn moving_a_shape_under_a_tone_redraws_it_and_keeps_the_tone_in_its_layer() {
+    // Moving a handle changes only the segments, and the segment must still find its tone
+    // where it was: the second image is checked against the reference, so a layer lost on
+    // the cheap path is a disagreement and not a silent fallback to "selects everything".
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (160usize, 96usize);
+    let luma = tone_and_place(w, h);
+    let first = Params {
+        curve: tone_passes(),
+        ..Default::default()
+    };
+    let mut second = first.clone();
+    if let Some(mask) = &mut second.curve.instances[2].mask {
+        mask.shape = Some(Shape::Radial(Radial {
+            cx: 0.7,
+            cy: 0.3,
+            inner: 0.0,
+            outer: 0.25,
+            aspect: 0.8,
+            angle: -15.0,
+            feather: 0.6,
+            invert: false,
+            ev: 0.0,
+        }));
+    }
+    assert!(first.curve.same_luts(&second.curve) && first.curve.same_tone(&second.curve));
+    assert!(!first.curve.same_render(&second.curve));
+
+    let (device, queue) = headless_device().expect("an adapter");
+    let frame = upright(&luma);
+    let mut ctx = GpuContext::new(&device);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let mut take = |p: &Params| {
+        vp.export(&mut ctx, &device, &queue, p, &frame, |_, _| {})
+            .expect("export")
+            .2
+    };
+    let a = take(&first);
+    let b = take(&second);
+    assert!(worst_against_reference_with_tone(&luma, &first.curve, &a) < 1e-3);
+    assert!(
+        worst_against_reference_with_tone(&luma, &second.curve, &b) < 1e-3,
+        "the moved shape lost its tone"
+    );
+    assert_ne!(a, b);
+}
+
+#[test]
+fn dodge_and_burn_and_the_curve_share_the_zone_mask_array() {
+    // A Dodge & Burn layer with a tone mask and a Curve pass with a tone range in one
+    // render: the array holds both, D&B's first, and each reads its own layer. The Curve
+    // reads the basis as it stood BEFORE the burn, so the burn cannot move the range that
+    // places the curve, which is the decision the plan records. Both are checked against
+    // their references at once.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (160usize, 96usize);
+    let luma = tone_and_place(w, h);
+    let db_band = band(-4.0, -0.5);
+    let layer = Instance {
+        mask: db_band,
+        ..Instance::of(
+            Sign::Burn,
+            "Linear Burn 1".into(),
+            Shape::Linear(Linear {
+                x0: 0.1,
+                y0: 0.1,
+                x1: 0.9,
+                y1: 0.8,
+                feather: 0.8,
+                ev: -1.2,
+            }),
+        )
+    };
+    let mut curve = CurveStack::default();
+    curve.instances[0].curve.add(0.5, 0.72);
+    curve.instances[0].mask = Some(CurveMask {
+        enabled: true,
+        shape: None,
+        invert: false,
+        tone: Some(band(-3.0, 0.5)),
+        rule: Rule::Intersect,
+    });
+    let p = Params {
+        dodgeburn: DodgeBurnParams {
+            enabled: true,
+            instances: vec![layer],
+        },
+        curve: curve.clone(),
+        ..Default::default()
+    };
+    let (_, _, out) = exported(&luma, &p);
+
+    let aspect = h as f32 / w as f32;
+    let mut worst = 0.0f32;
+    for y in 0..h {
+        for x in 0..w {
+            let (nx, ny) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+            let scene = luma.data[y * w + x];
+            let tone_ev = (scene / 0.18).log2();
+            let burnt = scene
+                * p.dodgeburn
+                    .ev_at(nx, ny, aspect, &[db_band.evaluate(tone_ev)])
+                    .exp2();
+            let want = curve.apply_at(burnt, nx, ny, aspect, tone_ev);
+            worst = worst.max((out[y * w + x] - want).abs() / want.abs().max(1e-6));
+        }
+    }
+    assert!(worst < 1e-3, "worst disagreement with both references: {worst}");
+}
+
+#[test]
+fn a_tone_mask_is_cut_at_every_pixel_and_not_on_the_proxys_grid() {
+    // Every other tone-mask test renders a negative the proxy's own size, where each pixel
+    // is a proxy pixel's center. This one is four times wider, so nearly every pixel falls
+    // between centers, which is where a mask cut at the centers and blended up drew its
+    // boundary as stairs. A slanted hard edge, a dark disk on the bright side, and a burn
+    // over the whole frame through a steep edge-aware range, through the same range
+    // inverted and limited to an island, and through it diffused: each must agree on every
+    // pixel with `PreparedMask::at`, which blends the tone and then cuts it.
+    let Some(_) = headless_device() else { return };
+    let proxy = raw_core::zone::PROXY_WIDTH;
+    let (w, h) = (proxy * 4, proxy * 8 / 3);
+    let (dark, bright) = (0.03f32, 0.5f32);
+    let data = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            let disk = (x - 0.8 * w as f32).hypot(y - 0.5 * h as f32) < 0.08 * w as f32;
+            if x < 0.4 * w as f32 + 0.37 * y || disk {
+                dark
+            } else {
+                bright
+            }
+        })
+        .collect();
+    let luma = LumaImage {
+        data,
+        output_dims: Dims { w, h },
+        source_dims: Dims { w, h },
+        clipped: Vec::new(),
+    };
+    let steep = ZoneMask {
+        enabled: true,
+        hi: 0.5 * ((dark / 0.18).log2() + (bright / 0.18).log2()),
+        f_hi: 0.25,
+        ..ZoneMask::default()
+    };
+    let mut island = ZoneMask {
+        invert: true,
+        ..steep
+    };
+    island.island.enabled = true;
+    assert!(island.island.set((0.1, 0.5)), "a seed on the dark ground");
+    let diffused = ZoneMask {
+        blur: 0.01,
+        ..steep
+    };
+
+    let basis = raw_core::zone::Basis::build(&luma, &Default::default(), &Default::default());
+    assert_eq!(
+        basis.w * 4,
+        w,
+        "four pixels of the negative to one of the proxy"
+    );
+    let aspect = h as f32 / w as f32;
+    for (name, tone) in [("steep", steep), ("island", island), ("diffused", diffused)] {
+        let p = Params {
+            dodgeburn: DodgeBurnParams {
+                enabled: true,
+                instances: vec![Instance {
+                    mask: tone,
+                    ..instance(
+                        Sign::Burn,
+                        vec![Gesture::new(vec![dab(0.5, 0.5, 0.9, 0.0, -1.0)])],
+                    )
+                }],
+            },
+            ..Default::default()
+        };
+        let (_, _, out) = exported(&luma, &p);
+        let prepared = basis.prepare(&tone);
+        // The old way, for contrast: the mask at the centers, blended as it came.
+        let centers = basis.evaluate(&tone).expect("a bounded range");
+        let blended = |u: f32, v: f32| {
+            let (bw, bh) = (basis.w, basis.h);
+            let fx = (u * bw as f32 - 0.5).clamp(0.0, (bw - 1) as f32);
+            let fy = (v * bh as f32 - 0.5).clamp(0.0, (bh - 1) as f32);
+            let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+            let (x1, y1) = ((x0 + 1).min(bw - 1), (y0 + 1).min(bh - 1));
+            let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+            let at = |x: usize, y: usize| centers[y * bw + x];
+            let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
+            let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
+            top + (bottom - top) * ty
+        };
+        let (mut worst, mut worst_old) = (0.0f32, 0.0f32);
+        for y in 0..h {
+            for x in 0..w {
+                let (nx, ny) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+                let scene = luma.data[y * w + x];
+                let burnt = |m: f32| scene * p.dodgeburn.ev_at(nx, ny, aspect, &[m]).exp2();
+                let got = out[y * w + x];
+                let want = burnt(prepared.at(nx, ny));
+                worst = worst.max((got - want).abs() / want.max(1e-6));
+                let old = burnt(blended(nx, ny));
+                worst_old = worst_old.max((got - old).abs() / old.max(1e-6));
+            }
+        }
+        assert!(
+            worst < 1e-3,
+            "{name}: worst disagreement with the cut reference: {worst}"
+        );
+        if name != "diffused" {
+            assert!(
+                worst_old > 0.05,
+                "{name}: the render cannot be told from a mask blended up: {worst_old}"
+            );
+        }
+    }
+}
+
 #[test]
 fn contrast_mask_zone_basis_matches_gpu_and_selects_middle_grey() {
     let (device, queue) = gpu!(headless_device());
@@ -3493,8 +4403,8 @@ fn contrast_mask_zone_basis_matches_gpu_across_dark_and_bright_regions() {
 
 #[test]
 fn a_zone_mask_holds_a_burn_to_its_own_tones() {
-    // The mask, end to end: proxy, guided filter, trapezoid, strip upload,
-    // bilinear read in the shader. A frame that is dark on the left and bright on
+    // The mask, end to end: proxy, guided filter, upload, and the shader's
+    // bilinear read and trapezoid. A frame that is dark on the left and bright on
     // the right, one burn covering the whole width, and a Shadows mask on it. The
     // dark half must darken and the bright half must not.
     let Some(_) = headless_device() else { return };
@@ -3802,7 +4712,7 @@ fn the_shader_agrees_with_the_cpu_reference_on_brush_shapes() {
         clipped: Vec::new(),
     };
 
-    let shaped = |x, y, aspect, angle, nib, feather| Dab {
+    let shaped = |x, y, aspect, angle, nib, feather, falloff| Dab {
         x,
         y,
         radius: 0.09,
@@ -3812,6 +4722,7 @@ fn the_shader_agrees_with_the_cpu_reference_on_brush_shapes() {
         aspect,
         angle,
         nib,
+        falloff,
     };
     let dodgeburn = DodgeBurnParams {
         enabled: true,
@@ -3819,17 +4730,21 @@ fn the_shader_agrees_with_the_cpu_reference_on_brush_shapes() {
             Sign::Burn,
             vec![
                 // A long soft ellipse, a turned card, and a hard round one, in one
-                // pass — so the max-within-a-gesture rule runs over three shapes.
+                // pass — so the max-within-a-gesture rule runs over three shapes. The
+                // card has the bell a stroke saved before the core falloff keeps.
                 Gesture::new(vec![
-                    shaped(0.25, 0.4, 3.0, 34.0, Nib::Round, 0.6),
-                    shaped(0.5, 0.55, 0.45, -62.0, Nib::Card, 0.35),
-                    shaped(0.75, 0.35, 1.0, 0.0, Nib::Round, 0.0),
+                    shaped(0.25, 0.4, 3.0, 34.0, Nib::Round, 0.6, Falloff::Core),
+                    shaped(0.5, 0.55, 0.45, -62.0, Nib::Card, 0.35, Falloff::Bell),
+                    shaped(0.75, 0.35, 1.0, 0.0, Nib::Round, 0.0, Falloff::Core),
                 ]),
                 // And a second pass of cards, which is the gesture a straight edge
-                // is actually used for.
+                // is actually used for, half with each falloff.
                 Gesture::new(
                     (0..6)
-                        .map(|i| shaped(0.2 + i as f32 * 0.12, 0.75, 1.6, 15.0, Nib::Card, 0.5))
+                        .map(|i| {
+                            let falloff = if i % 2 == 0 { Falloff::Core } else { Falloff::Bell };
+                            shaped(0.2 + i as f32 * 0.12, 0.75, 1.6, 15.0, Nib::Card, 0.5, falloff)
+                        })
                         .collect(),
                 ),
             ],
@@ -4049,9 +4964,14 @@ fn the_mask_view_is_yellow_and_keeps_its_gradient() {
     let (device, queue) = gpu!(headless_device());
     let mut ctx = GpuContext::new(&device);
     let mut vp = Viewport::new(&device, &queue, &luma);
+    // The layer's mask, as the mask view draws any mask: its tone mask, since a brushed
+    // layer has no shape a mask can hold.
+    vp.set_mask_view(Some(&raw_core::curve::CurveMask::of_layer(
+        &p.dodgeburn.instances[0],
+    )));
     let view = ViewGeometry {
         overlays: Overlays {
-            zone_mask: 0,
+            mask: Some(raw_gpu::MaskLook::Mask),
             ..Overlays::NONE
         },
         ..ONE_TO_ONE
@@ -4690,4 +5610,465 @@ fn measure_tiled_export_and_readback() {
             samples[1]
         );
     }
+}
+
+// ----------------------------------------------------- curve masks: seeing the mask
+//
+// The mask view draws one Curve pass's mask over the picture, as red film on what it
+// protects, or in the picture's place. These hold it to the weight the curve applies, and
+// to costing the picture nothing when it is off.
+
+use raw_gpu::MaskLook;
+
+/// The live frame for `params`, with `mask` handed to the mask view and drawn as `look`.
+fn viewed(
+    luma: &LumaImage,
+    params: &Params,
+    mask: Option<&CurveMask>,
+    look: Option<MaskLook>,
+) -> Option<(Vec<u8>, u64)> {
+    let (device, queue) = headless_device()?;
+    let mut ctx = GpuContext::new(&device);
+    let mut vp = Viewport::new(&device, &queue, luma);
+    vp.set_mask_view(mask);
+    let view = with_overlays(Overlays {
+        mask: look,
+        ..Overlays::NONE
+    });
+    let (w, h) = (luma.output_dims.w as u32, luma.output_dims.h as u32);
+    vp.render(&mut ctx, &device, &queue, w, h, view, params, &upright(luma));
+    let (_, _, px) = vp.read_back(&device, &queue)?;
+    Some((px, vp.basis_rebuilds()))
+}
+
+/// What the film does to a display pixel where the mask weighs `m`: toward the solid
+/// red `MaskLook::film` gives for the picture's own lightness there.
+fn filmed(under: [u8; 3], m: f32) -> [f32; 3] {
+    let k = 1.0 - m;
+    let lum = (0.2126 * f32::from(under[0])
+        + 0.7152 * f32::from(under[1])
+        + 0.0722 * f32::from(under[2]))
+        / 255.0;
+    let film = MaskLook::film(lum);
+    let mix = |v: u8, film: f32| f32::from(v) * (1.0 - k) + film * 255.0 * k;
+    [
+        mix(under[0], film[0]),
+        mix(under[1], film[1]),
+        mix(under[2], film[2]),
+    ]
+}
+
+#[test]
+fn the_overlay_films_what_a_mask_protects_and_leaves_what_it_selects_clear() {
+    // A sky grad across a flat picture: full on the left, gone on the right, with a soft
+    // middle. The film is Photoshop's: red over what the mask protects, three quarters
+    // deep where it protects completely, thinning with the mask and absent where the
+    // curve applies in full.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (96usize, 32usize);
+    let luma = flat(0.18, w, h);
+    let mask = CurveMask::of_shape(Shape::Linear(Linear {
+        x0: 0.25,
+        y0: 0.5,
+        x1: 0.75,
+        y1: 0.5,
+        feather: 1.0,
+        ev: 0.0,
+    }));
+    let p = no_dither();
+    let (plain, _) = viewed(&luma, &p, None, None).expect("an adapter");
+    let (film, builds) =
+        viewed(&luma, &p, Some(&mask), Some(MaskLook::Overlay)).expect("an adapter");
+    assert_eq!(builds, 0, "a shape reads nothing from the picture");
+
+    let aspect = h as f32 / w as f32;
+    let mut soft = 0;
+    for x in 0..w {
+        let nx = (x as f32 + 0.5) / w as f32;
+        let m = mask.weight_at(nx, 0.5, aspect, 0.0);
+        let under = rgb(&plain, w, x, 16);
+        let got = rgb(&film, w, x, 16);
+        let want = filmed(under, m);
+        for c in 0..3 {
+            assert!(
+                (f32::from(got[c]) - want[c]).abs() <= 1.5,
+                "column {x}, weight {m}: {got:?} against {want:?}"
+            );
+        }
+        if m >= 1.0 {
+            assert_eq!(got, under, "column {x}: film over what the mask selects");
+        }
+        if m > 0.05 && m < 0.95 {
+            soft += 1;
+        }
+    }
+    assert!(soft > w / 4, "the grad had no soft middle to check");
+    // Fully protected, the film is solid: none of the picture's green or blue is left
+    // to turn the red pink, and the red is darker than full so a bright picture under
+    // it cannot be mistaken for a clear one.
+    let (under, got) = (rgb(&plain, w, w - 2, 16), rgb(&film, w, w - 2, 16));
+    assert!(got[1] <= 8 && got[2] <= 8, "picture showing through the film: {got:?}");
+    assert!(got[0] < 200 && got[0] > under[0] / 2, "{got:?} over {under:?}");
+}
+
+#[test]
+fn the_mask_view_draws_the_weight_the_curve_applies() {
+    // A turned radial joined with a tone range under each rule, on a picture with tones
+    // and place both varying, read per pixel so the CPU reference is exact. The view
+    // shows the mask alone, in Dodge & Burn's yellow, and every pixel of it is the
+    // weight `CurveMask::weight_at` gives.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (120usize, 72usize);
+    let luma = tone_and_place(w, h);
+    let p = no_dither();
+    let aspect = h as f32 / w as f32;
+    for rule in [Rule::Intersect, Rule::Subtract, Rule::Add] {
+        let mask = CurveMask {
+            enabled: true,
+            shape: Some(turned_spot()),
+            invert: rule == Rule::Subtract,
+            tone: Some(band(-2.0, 1.0)),
+            rule,
+        };
+        let (shown, builds) =
+            viewed(&luma, &p, Some(&mask), Some(MaskLook::Mask)).expect("an adapter");
+        assert_eq!(builds, 1, "the tone range is read from the picture, once");
+        let mut worst = 0.0f32;
+        for y in 0..h {
+            for x in 0..w {
+                let (nx, ny) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+                let tone_ev = (luma.data[y * w + x] / 0.18).log2();
+                let m = mask.weight_at(nx, ny, aspect, tone_ev);
+                let got = rgb(&shown, w, x, y);
+                let want = [m * 255.0, m * 0.886 * 255.0, m * 0.157 * 255.0];
+                for c in 0..3 {
+                    worst = worst.max((f32::from(got[c]) - want[c]).abs());
+                }
+            }
+        }
+        assert!(worst <= 1.5, "{rule:?}: the view is {worst} levels from the weight");
+    }
+}
+
+#[test]
+fn a_mask_is_seen_before_its_pass_has_a_curve_and_with_the_module_off() {
+    // A mask is laid first and the curve drawn after, so the view cannot depend on the
+    // pass running: here the stack is untouched, and then bypassed, and the film is the
+    // same as over a stack that runs.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (96usize, 64usize);
+    let luma = tone_and_place(w, h);
+    let mask = CurveMask {
+        tone: Some(band(-2.0, 1.0)),
+        ..CurveMask::of_shape(turned_spot())
+    };
+    let untouched = no_dither();
+    assert!(!untouched.curve.needs_zones() && !untouched.curve.has_masks());
+    let (plain, _) = viewed(&luma, &untouched, None, None).expect("an adapter");
+    let (film, builds) =
+        viewed(&luma, &untouched, Some(&mask), Some(MaskLook::Overlay)).expect("an adapter");
+    assert_eq!(builds, 1, "the viewed tone range was not prepared");
+    assert_ne!(film, plain, "nothing was drawn for a pass with no curve");
+
+    let aspect = h as f32 / w as f32;
+    for (x, y) in [(8, 8), (40, 36), (60, 20), (90, 60)] {
+        let (nx, ny) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+        let tone_ev = (luma.data[y * w + x] / 0.18).log2();
+        let want = filmed(rgb(&plain, w, x, y), mask.weight_at(nx, ny, aspect, tone_ev));
+        let got = rgb(&film, w, x, y);
+        for c in 0..3 {
+            assert!((f32::from(got[c]) - want[c]).abs() <= 1.5, "({x}, {y}): {got:?}");
+        }
+    }
+
+    // Bypassed, the module renders as untouched, and the mask is still there to see.
+    let mut off = no_dither();
+    off.curve.instances[0].curve.add(0.4, 0.6);
+    off.curve.instances[0].mask = Some(mask.clone());
+    off.curve.enabled = false;
+    let (bypassed, _) =
+        viewed(&luma, &off.effective(), Some(&mask), Some(MaskLook::Overlay)).expect("an adapter");
+    assert_eq!(bypassed, film);
+}
+
+#[test]
+fn a_viewed_mask_that_is_not_drawn_changes_nothing() {
+    // The host hands the viewport the selected mask whenever there is one. Until an
+    // overlay asks for it, the picture, the export and the histogram are what they were.
+    let (device, queue) = gpu!(headless_device());
+    let (w, h) = (96usize, 64usize);
+    let luma = tone_and_place(w, h);
+    let mut p = no_dither();
+    p.curve = tone_passes();
+    let frame = upright(&luma);
+    let mask = CurveMask::of_shape(turned_spot());
+
+    let mut ctx = GpuContext::new(&device);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let live = |vp: &mut Viewport, ctx: &mut GpuContext, look| {
+        let view = with_overlays(Overlays {
+            mask: look,
+            ..Overlays::NONE
+        });
+        vp.render(ctx, &device, &queue, w as u32, h as u32, view, &p, &frame);
+        vp.read_back(&device, &queue).expect("a frame").2
+    };
+    let before = live(&mut vp, &mut ctx, None);
+    let (_, _, exported) = vp
+        .export(&mut ctx, &device, &queue, &p, &frame, |_, _| {})
+        .expect("export");
+
+    vp.set_mask_view(Some(&mask));
+    assert_eq!(live(&mut vp, &mut ctx, None), before, "handed over, not asked for");
+    let filmed = live(&mut vp, &mut ctx, Some(MaskLook::Overlay));
+    assert_ne!(filmed, before, "asked for, and nothing was drawn");
+    let (_, _, again) = vp
+        .export(&mut ctx, &device, &queue, &p, &frame, |_, _| {})
+        .expect("export");
+    assert_eq!(again, exported, "the film reached an export");
+
+    // Moving the viewed shape redraws the film and asks the worker for nothing.
+    let builds = vp.basis_rebuilds();
+    let mut moved = mask.clone();
+    if let Some(Shape::Radial(r)) = &mut moved.shape {
+        r.cx += 0.2;
+    }
+    vp.set_mask_view(Some(&moved));
+    assert_ne!(live(&mut vp, &mut ctx, Some(MaskLook::Overlay)), filmed);
+    assert_eq!(vp.basis_rebuilds(), builds);
+
+    // And taking it away takes the film away.
+    vp.set_mask_view(None);
+    assert_eq!(live(&mut vp, &mut ctx, Some(MaskLook::Overlay)), before);
+}
+
+// ------------------------------------------------------- curve masks: painted
+//
+// A mask's shape can be strokes of Dodge & Burn's brush. These hold the curve pass, and
+// the mask view, to `CurveMask::weight_at` for what has been painted, with the same dab
+// scan and cull the layers use.
+
+/// A soft stroke across the frame at height `y`, as one pass: `paint` adds to a mask,
+/// and not erases from it. A card when `card` gives its aspect and angle.
+fn mask_stroke(y: f32, paint: bool, card: Option<(f32, f32)>) -> Gesture {
+    Gesture::new(
+        (0..9)
+            .map(|i| Dab {
+                x: 0.15 + 0.08 * i as f32,
+                y: y + 0.02 * i as f32,
+                radius: 0.12,
+                feather: 0.6,
+                opacity: 0.9,
+                ev: if paint { 0.25 } else { -0.25 },
+                aspect: card.map_or(1.0, |c| c.0),
+                angle: card.map_or(0.0, |c| c.1),
+                nib: if card.is_some() { Nib::Card } else { Nib::Round },
+                falloff: Falloff::Core,
+            })
+            .collect(),
+    )
+}
+
+/// An unmasked lift; a round painted mask of two passes and an eraser pass; and an
+/// inverted card mask joined to a tone range by Add. Every way a painted shape enters a
+/// mask, each pass depending on the last.
+fn painted_passes() -> CurveStack {
+    let mut stack = CurveStack::default();
+    stack.instances[0].curve.add(0.4, 0.55);
+    let round = stack.add_instance().expect("room");
+    stack.instances[round].curve.add(0.55, 0.42);
+    stack.instances[round].mask = Some(CurveMask::of_shape(Shape::Brush {
+        nib: Nib::Round,
+        passes: vec![
+            mask_stroke(0.25, true, None),
+            mask_stroke(0.55, true, None),
+            mask_stroke(0.40, false, None),
+        ],
+    }));
+    let card = stack.add_instance().expect("room");
+    stack.instances[card].curve.add(0.5, 0.63);
+    stack.instances[card].opacity = 0.8;
+    stack.instances[card].mask = Some(CurveMask {
+        enabled: true,
+        shape: Some(Shape::Brush {
+            nib: Nib::Card,
+            passes: vec![mask_stroke(0.6, true, Some((0.4, 25.0)))],
+        }),
+        invert: true,
+        tone: Some(band(-3.0, 0.5)),
+        rule: Rule::Add,
+    });
+    stack
+}
+
+#[test]
+fn a_painted_curve_mask_agrees_with_the_cpu_reference() {
+    // Every pixel of the three-pass stack, on a frame that is not square, with tones
+    // from below the curve's window to above it. The painted weight is the CPU's
+    // `Shape::painted_at`, read through the same reference a gradient's is.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (160usize, 96usize);
+    let luma = tone_and_place(w, h);
+    let p = Params {
+        curve: painted_passes(),
+        ..Default::default()
+    };
+    assert!(p.curve.has_masks());
+    let (ew, eh, out) = exported(&luma, &p);
+    assert_eq!((ew as usize, eh as usize), (w, h));
+    let worst = worst_against_reference_with_tone(&luma, &p.curve, &out);
+    assert!(
+        worst < 1e-3,
+        "worst relative disagreement with the CPU reference: {worst}"
+    );
+
+    // And it is the paint that did it: with the strokes taken off, the picture differs.
+    let mut bare = p.clone();
+    for instance in &mut bare.curve.instances {
+        if let Some(Shape::Brush { passes, .. }) =
+            instance.mask.as_mut().and_then(|m| m.shape.as_mut())
+        {
+            passes.clear();
+        }
+    }
+    let (_, _, unpainted) = exported(&luma, &bare);
+    assert_ne!(unpainted, out);
+}
+
+#[test]
+fn a_painted_mask_with_no_strokes_holds_its_pass_back_everywhere() {
+    // Picked and not yet painted on: the mask is live and selects nothing, so the pass
+    // does nothing, and the frame is the one without that pass. Inverted, it is the one
+    // with the pass applied everywhere.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (96usize, 64usize);
+    let luma = tone_and_place(w, h);
+    let mut stack = CurveStack::default();
+    stack.instances[0].curve.add(0.4, 0.6);
+    let plain = Params {
+        curve: stack.clone(),
+        ..Default::default()
+    };
+    stack.instances[0].mask = Some(CurveMask::of_shape(Shape::Brush {
+        nib: Nib::Round,
+        passes: Vec::new(),
+    }));
+    let empty = Params {
+        curve: stack.clone(),
+        ..Default::default()
+    };
+    let (_, _, held) = exported(&luma, &empty);
+    let worst = worst_against_reference(&luma, &empty.curve, &held);
+    assert!(worst < 1e-3, "{worst}");
+    // Tones above the curve's window are left out: a masked stack clamps those to the
+    // window's top, as an unmasked one does, whatever the mask weighs.
+    let ceiling = raw_core::curve::HI_EV.exp2();
+    let untouched = held
+        .iter()
+        .zip(&luma.data)
+        .filter(|(_, tone)| **tone < ceiling * 0.99)
+        .map(|(got, want)| (got - want).abs() / want.abs().max(1e-6))
+        .fold(0.0f32, f32::max);
+    assert!(untouched < 1e-5, "an unpainted mask let its pass through: {untouched}");
+
+    stack.instances[0].mask.as_mut().unwrap().invert = true;
+    let inverted = Params {
+        curve: stack,
+        ..Default::default()
+    };
+    let (_, _, everywhere) = exported(&luma, &inverted);
+    let (_, _, unmasked) = exported(&luma, &plain);
+    let apart = everywhere
+        .iter()
+        .zip(&unmasked)
+        .map(|(a, b)| (a - b).abs() / b.abs().max(1e-6))
+        .fold(0.0f32, f32::max);
+    assert!(apart < 1e-3, "inverted and empty is the pass everywhere: {apart}");
+}
+
+#[test]
+fn a_painted_mask_longer_than_one_cull_chunk_still_agrees() {
+    // The cull walks the strokes in chunks of 4096 and the walk carries a pass across
+    // the boundary. Five thousand dabs in three passes, the middle one straddling it.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (72usize, 48usize);
+    let luma = tone_and_place(w, h);
+    let pass = |n: usize, y: f32, paint: bool| {
+        Gesture::new(
+            (0..n)
+                .map(|i| Dab {
+                    x: 0.05 + 0.9 * i as f32 / n as f32,
+                    y: y + 0.1 * ((i as f32) * 0.05).sin(),
+                    radius: 0.06,
+                    feather: 0.5,
+                    opacity: 1.0,
+                    ev: if paint { 1.0 } else { -1.0 },
+                    ..Dab::ROUND
+                })
+                .collect(),
+        )
+    };
+    let mut stack = CurveStack::default();
+    stack.instances[0].curve.add(0.45, 0.6);
+    stack.instances[0].mask = Some(CurveMask::of_shape(Shape::Brush {
+        nib: Nib::Round,
+        passes: vec![pass(3000, 0.3, true), pass(1500, 0.6, true), pass(500, 0.45, false)],
+    }));
+    let p = Params {
+        curve: stack,
+        ..Default::default()
+    };
+    let (_, _, out) = exported(&luma, &p);
+    let worst = worst_against_reference(&luma, &p.curve, &out);
+    assert!(worst < 1e-3, "worst disagreement across a chunk boundary: {worst}");
+}
+
+#[test]
+fn the_mask_view_draws_what_has_been_painted() {
+    // The view of a painted mask is the weight the curve blends by, on every pixel: the
+    // display pass scans the same strokes with the same cull. With a tone joined, too.
+    let Some(_) = headless_device() else { return };
+    let (w, h) = (120usize, 72usize);
+    let luma = tone_and_place(w, h);
+    let p = no_dither();
+    let aspect = h as f32 / w as f32;
+    let stack = painted_passes();
+    for pass in [1, 2] {
+        let mask = stack.instances[pass].mask.clone().expect("a painted mask");
+        let (shown, _) = viewed(&luma, &p, Some(&mask), Some(MaskLook::Mask)).expect("an adapter");
+        let mut worst = 0.0f32;
+        let mut lit = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let (nx, ny) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+                let tone_ev = (luma.data[y * w + x] / 0.18).log2();
+                let m = mask.weight_at(nx, ny, aspect, tone_ev);
+                lit += usize::from(m > 0.5);
+                let got = rgb(&shown, w, x, y);
+                worst = worst.max((f32::from(got[0]) - m * 255.0).abs());
+            }
+        }
+        assert!(worst <= 1.5, "pass {pass}: the view is {worst} levels from the weight");
+        assert!(lit > w * h / 20 && lit < w * h, "pass {pass}: nothing to tell apart");
+    }
+
+    // Shown, then painted on some more: the view follows the strokes.
+    let (device, queue) = gpu!(headless_device());
+    let mut ctx = GpuContext::new(&device);
+    let mut vp = Viewport::new(&device, &queue, &luma);
+    let frame = upright(&luma);
+    let view = with_overlays(Overlays {
+        mask: Some(MaskLook::Overlay),
+        ..Overlays::NONE
+    });
+    let mut mask = stack.instances[1].mask.clone().expect("a painted mask");
+    vp.set_mask_view(Some(&mask));
+    vp.render(&mut ctx, &device, &queue, w as u32, h as u32, view, &p, &frame);
+    let before = vp.read_back(&device, &queue).expect("a frame").2;
+    if let Some(Shape::Brush { passes, .. }) = &mut mask.shape {
+        passes.push(mask_stroke(0.8, true, None));
+    }
+    vp.set_mask_view(Some(&mask));
+    vp.render(&mut ctx, &device, &queue, w as u32, h as u32, view, &p, &frame);
+    assert_ne!(vp.read_back(&device, &queue).expect("a frame").2, before);
 }

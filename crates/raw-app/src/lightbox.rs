@@ -252,6 +252,37 @@ impl Pane {
             Self::Exif => "METADATA",
         }
     }
+
+    /// Whether the pane can be closed or popped out. Everything but the grid, which
+    /// is the mode: a Lightbox without it is a sidebar with nothing beside it.
+    pub fn closable(self) -> bool {
+        self != Self::Grid
+    }
+}
+
+/// Which list the arrow keys move through: the grid's tiles or the folder tree.
+///
+/// **Set by the last click**, the way a Mac list takes the keyboard when you click
+/// in it: a tile or the grid gives it to the grid, a folder row to the tree. Whichever
+/// has it draws its selection in ruby and the other in gray, so the arrows' target is
+/// on screen before they are pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Focus {
+    #[default]
+    Grid,
+    Tree,
+}
+
+/// The gray a selection is drawn in while the other list has the keyboard.
+const UNFOCUSED_RING: egui::Color32 = egui::Color32::from_gray(140);
+const UNFOCUSED_FILL: egui::Color32 = egui::Color32::from_gray(48);
+
+/// What a pane's contents asked for this frame, docked or floating.
+#[derive(Default)]
+struct PaneAsk {
+    open: Option<PathBuf>,
+    nav: Option<PathBuf>,
+    close: bool,
 }
 
 /// The default arrangement: the three lists tabbed down the left, the grid filling
@@ -832,7 +863,7 @@ pub struct Lightbox {
     entries: Vec<Entry>,
     generation: u32,
     tiles: HashMap<u32, Tile>,
-    queue: decode::Queue<Key, Option<raw_core::preview::Rgb8>>,
+    queue: decode::Queue<Key, Option<Thumb>>,
     /// Quick Look cannot wait behind a screenful of thumbnail jobs. One dedicated
     /// worker also bounds its peak memory: full previews are much larger than tiles.
     preview_queue: decode::Queue<Key, Option<raw_core::preview::Rgb8>>,
@@ -911,7 +942,8 @@ pub struct Lightbox {
     /// Files the grid cannot draw. Mirrors `Settings::lightbox_other_files`. Private
     /// for the same reason as `show_folders`.
     show_other_files: bool,
-    /// Draw the thumbnails as gray. Mirrors `Settings::lightbox_gray`; mutation goes
+    /// Draw the camera's thumbnails as gray, and leave developed ones as rendered — see
+    /// [`Thumb`]. Mirrors `Settings::lightbox_gray`; mutation goes
     /// through [`Lightbox::set_grey`] because changing it invalidates every thumbnail
     /// texture already in hand.
     grey: bool,
@@ -928,6 +960,9 @@ pub struct Lightbox {
     manual: Vec<String>,
     /// The tile being dragged, and where it would land — `None` when nothing is.
     drag: Option<(u32, usize)>,
+    /// The tile a press selected, until that press ends — so its click, arriving at
+    /// the release, is not acted on a second time. See `tile_ui`.
+    pressed_tile: Option<u32>,
     /// The multi-selection, as entry indices.
     ///
     /// **Separate from `selected`, which stays the anchor.** The two are different
@@ -950,6 +985,22 @@ pub struct Lightbox {
     tuck: crate::layout::Tuck,
     /// `tab` has taken the panels away and left the grid.
     panels_hidden: bool,
+    /// Panels closed with their `×`. They keep their place in the tree, so the Window
+    /// menu, their key or `tab` puts them back where they were — Develop's rule, and
+    /// persisted as Develop's open panels are.
+    closed: Vec<Pane>,
+    /// Panels popped out into windows of their own. Not persisted, for Develop's
+    /// reason: a window that came back somewhere off-screen is a panel you cannot find.
+    /// Drawn only while Lightbox is up, as Develop's are only while Develop is.
+    out: Vec<Pane>,
+    /// A floating panel asked for by name — the Window menu, `⇧F` — to bring to the
+    /// front on the next frame, since it is already open.
+    raise: Option<Pane>,
+    /// Which list the arrow keys move through. See [`Focus`].
+    focus: Focus,
+    /// The tree's current row moved by key and should be scrolled into view when it
+    /// is next drawn.
+    tree_follow: bool,
     /// Folders you keep. Order is the order you added them.
     pub favorites: Vec<PathBuf>,
     /// A click on the start page, waiting for `App` to carry it out.
@@ -975,6 +1026,24 @@ pub struct Lightbox {
     /// same cost the Date sort pays, for one file rather than a folder. Re-read only
     /// when the selection moves.
     exif: Option<(PathBuf, Vec<Facts>)>,
+    /// **The read happens on a worker**, because it can take a third of a second:
+    /// rawler's DNG decoder ignores its "dimensions only" flag and decodes the whole
+    /// frame to report a size. On the UI thread that was a frozen grid — the new
+    /// selection's ring could not draw until the panel beside it had finished
+    /// reading — every time a tile was picked with METADATA showing.
+    ///
+    /// One key, so a quick run of clicks leaves at most one read running and the
+    /// latest one waiting; the results carry `exif_generation` so a read begun before
+    /// an IPTC save cannot land after it.
+    exif_queue: decode::Queue<u8, (u64, PathBuf, Vec<Facts>)>,
+    /// Bumped wherever `exif` is dropped as stale, retiring reads still in flight.
+    exif_generation: u64,
+    /// Facts read since the folder opened, oldest first, so going back to a frame
+    /// shows it at once. Bounded by [`EXIF_REMEMBERED`].
+    exif_remembered: Vec<(PathBuf, Vec<Facts>)>,
+    /// The file the last read was asked for, so a frame drawn while it runs does not
+    /// ask again.
+    exif_asked: Option<PathBuf>,
     /// A contextual filesystem action failed; the Lightbox footer carries the error.
     action_note: Option<String>,
     /// Develop settings copied from one tile, kept across folder changes for the
@@ -1119,6 +1188,11 @@ impl Lightbox {
             restore_panel_pixels: true,
             tuck: Default::default(),
             panels_hidden: false,
+            closed: Vec::new(),
+            out: Vec::new(),
+            raise: None,
+            focus: Focus::Grid,
+            tree_follow: false,
             favorites: Vec::new(),
             splash: None,
             preview: None,
@@ -1126,6 +1200,11 @@ impl Lightbox {
             preview_failed: std::collections::HashSet::new(),
             preview_focus: None,
             exif: None,
+            exif_queue: decode::Queue::new(1),
+            exif_generation: 0,
+            exif_remembered: Vec::new(),
+            exif_asked: None,
+            pressed_tile: None,
             action_note: template_note,
             copied_develop: None,
             rename_dialog: None,
@@ -1159,6 +1238,11 @@ impl Lightbox {
         self.restore_panel_pixels = true;
         self.favorites =
             eframe::get_value::<Vec<PathBuf>>(storage, "lightbox.favorites").unwrap_or_default();
+        self.closed = eframe::get_value::<Vec<Pane>>(storage, CLOSED_KEY)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.closable())
+            .collect();
     }
 
     /// Re-check which files have a sidecar, and drop the tiles of any that changed.
@@ -1202,7 +1286,17 @@ impl Lightbox {
                 continue;
             }
             e.developed = when;
-            e.edited = developed(&raw_core::sidecar::read(&e.path));
+            let side = raw_core::sidecar::read(&e.path);
+            e.edited = developed(&side);
+            // The rating and label come from the same file, and Develop can set them
+            // on the picture it is holding. Read as `entry_for` reads them.
+            let meta = side.ok().map(|s| s.metadata);
+            e.rating = meta
+                .as_ref()
+                .and_then(|m| m.rating)
+                .unwrap_or(0)
+                .clamp(0, 5);
+            e.label = meta.and_then(|m| m.label);
             stale.push(i as u32);
         }
         if !stale.is_empty() {
@@ -1223,6 +1317,12 @@ impl Lightbox {
         self.panel_sizes.clear();
         self.tree_restructured = false;
         self.tuck = Default::default();
+        // **Every panel back, docked.** A reset that left a closed panel closed or a
+        // floating one floating would be the half-reset Develop's own reset is tested
+        // against: the arrangement you asked for, minus the panel you were missing.
+        self.closed.clear();
+        self.out.clear();
+        self.raise = None;
     }
 
     pub fn save(&self, storage: &mut dyn eframe::Storage) {
@@ -1241,6 +1341,7 @@ impl Lightbox {
         }
         eframe::set_value(storage, PIXEL_SIZES_KEY, &sizes);
         eframe::set_value(storage, "lightbox.favorites", &self.favorites);
+        eframe::set_value(storage, CLOSED_KEY, &self.closed);
     }
 
     fn restore_panel_widths(&mut self, width: f32, default: f32) {
@@ -1353,17 +1454,31 @@ impl Lightbox {
             dropped: false,
             resizing: false,
             panel_width: sidebar_width,
+            close_pane: None,
+            float: None,
         };
         let area = ui.available_rect_before_wrap();
         tree.ui(&mut panes, ui);
-        let (open, nav, close, dropped, resizing) = (
+        let (open, mut nav, mut close, dropped, resizing) = (
             panes.open,
             panes.nav,
             panes.close,
             panes.dropped,
             panes.resizing,
         );
+        let (close_pane, float) = (panes.close_pane, panes.float);
         self.tree = tree;
+        if let Some(pane) = close_pane {
+            self.close_pane(pane);
+        }
+        if let Some(pane) = float {
+            self.float_pane(pane);
+        }
+        // The floating panels, each in its own window. After the tree, so a folder
+        // picked in one goes the same way as a folder picked in the frame.
+        let floated = self.float_windows(ui.ctx(), icons, recent);
+        nav = nav.or(floated.nav);
+        close |= floated.close;
         if let Some(grid) = self.tree.tiles.find_pane(&Pane::Grid) {
             // Outside `input`: ending the drag writes to the context `input` reads.
             let tucked = ui.input(|i| {
@@ -1398,6 +1513,104 @@ impl Lightbox {
         open
     }
 
+    /// One pane's contents, docked in the tree or floating in a window of its own.
+    /// What it asked for comes back, for the caller to carry out once the frame's
+    /// panes have drawn.
+    fn pane_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        icons: &crate::icons::Icons,
+        recent: &[PathBuf],
+        pane: Pane,
+    ) -> PaneAsk {
+        let mut ask = PaneAsk::default();
+        match pane {
+            Pane::Grid => ask.open = self.grid_ui(ui, icons, recent),
+            Pane::Folders => match self.tree_ui(ui, icons) {
+                Nav::None => {}
+                Nav::Open(dir) => ask.nav = Some(dir),
+                Nav::Close => ask.close = true,
+            },
+            Pane::Search => self.search_ui(ui, icons),
+            Pane::Favorites => ask.nav = self.favorites_ui(ui, icons),
+            Pane::Exif => self.exif_ui(ui, icons),
+        }
+        ask
+    }
+
+    /// Draw each popped-out panel in its window, docking any whose window was closed.
+    ///
+    /// The same shape as Develop's floating panels: the app's own bar with the dock
+    /// button, the panel's ground, then the very contents the tree draws. Not called
+    /// while `tab` has the panels hidden, which takes the windows away too.
+    fn float_windows(
+        &mut self,
+        ctx: &egui::Context,
+        icons: &crate::icons::Icons,
+        recent: &[PathBuf],
+    ) -> PaneAsk {
+        let mut asked = PaneAsk::default();
+        let raise = self.raise.take();
+        let app_active = crate::platform::app_is_active(ctx);
+        for pane in self.out.clone() {
+            let id = egui::ViewportId::from_hash_of(("monopro-lightbox", pane.label()));
+            if raise == Some(pane) {
+                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+            }
+            let mut docked = false;
+            let mut toggle = false;
+            let title = pane.label().to_lowercase();
+            ctx.show_viewport_immediate(
+                id,
+                crate::platform::panel_viewport(&title, [320.0, 600.0], app_active),
+                |ui, _class| {
+                    if ui.ctx().input(|i| i.viewport().close_requested()) {
+                        docked = true;
+                    }
+                    toggle |= crate::take_bare_tab(ui.ctx());
+                    // A floating tree's arrows arrive at its own window, not the main
+                    // one, so they are read here.
+                    if pane == Pane::Folders && !ui.ctx().egui_wants_keyboard_input() {
+                        let keys = [
+                            egui::Key::ArrowUp,
+                            egui::Key::ArrowDown,
+                            egui::Key::ArrowLeft,
+                            egui::Key::ArrowRight,
+                        ];
+                        for key in keys {
+                            if ui.input(|i| i.key_pressed(key)) {
+                                self.focus = Focus::Tree;
+                                self.tree_key(key);
+                            }
+                        }
+                    }
+                    let ground = theme::Ground {
+                        design: theme::CHROME_DEEP.r(),
+                        to: self.grounds[1],
+                    };
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(ground.to)))
+                        .show(ui, |ui| {
+                            crate::layout::floating_bar(icons, ui, pane.label(), &mut docked);
+                            ui.add_space(4.0);
+                            let ask = theme::reground_ui(ui, ground, |ui| {
+                                self.pane_contents(ui, icons, recent, pane)
+                            });
+                            asked.nav = asked.nav.take().or(ask.nav);
+                            asked.close |= ask.close;
+                        });
+                },
+            );
+            if docked {
+                self.dock_pane(pane);
+            }
+            if toggle {
+                self.toggle_panels();
+            }
+        }
+        asked
+    }
+
     /// `tab`: take the panels away, or bring them back.
     ///
     /// The same gesture Develop has and the same meaning — see the picture with
@@ -1405,10 +1618,15 @@ impl Lightbox {
     /// comes back is exactly the arrangement that went away.
     pub fn toggle_panels(&mut self) {
         self.panels_hidden = !self.panels_hidden;
-        // "Every panel back" includes the ones tucked at the edge, as in Develop.
+        // "Every panel back" includes the ones tucked at the edge and the ones closed
+        // with their `×`, as in Develop: `tab` twice is always the way to all of them.
         if !self.panels_hidden {
             for (id, width) in self.tuck.take() {
                 self.remember_width(id, width);
+            }
+            if !self.closed.is_empty() {
+                self.closed.clear();
+                self.tree_restructured = true;
             }
         }
     }
@@ -1768,10 +1986,45 @@ impl Lightbox {
         for id in self.tree.tiles.tile_ids().collect::<Vec<_>>() {
             self.tree.set_visible(id, true);
         }
+        // Closed and popped-out panes keep their tiles and lose their visibility, and a
+        // tab strip or column with nothing left showing goes with them — otherwise
+        // closing all three tabs would leave an empty tab bar.
+        for pane in self.closed.iter().chain(&self.out) {
+            if let Some(id) = self.tree.tiles.find_pane(pane) {
+                self.tree.set_visible(id, false);
+            }
+        }
+        if let Some(root) = self.tree.root {
+            crate::layout::settle_container(&mut self.tree, root);
+        }
         if let Some(grid) = self.tree.tiles.find_pane(&Pane::Grid) {
             self.tuck.settle(&mut self.tree, grid);
         }
     }
+
+    /// The `×`: take a panel out of the frame until something asks for it back.
+    fn close_pane(&mut self, pane: Pane) {
+        if pane.closable() && !self.closed.contains(&pane) {
+            self.closed.push(pane);
+            self.tree_restructured = true;
+        }
+    }
+
+    /// The pop-out button: the panel leaves the frame for a window of its own.
+    fn float_pane(&mut self, pane: Pane) {
+        if pane.closable() && !self.out.contains(&pane) {
+            self.out.push(pane);
+            self.tree_restructured = true;
+        }
+    }
+
+    /// Back into the frame, where it left from. Closing the window does this too: a
+    /// panel that vanished with no way back would be a control that destroys itself.
+    fn dock_pane(&mut self, pane: Pane) {
+        self.out.retain(|p| *p != pane);
+        self.tree_restructured = true;
+    }
+
 
     /// The width a column returning from a tuck comes back at.
     fn remember_width(&mut self, id: egui_tiles::TileId, width: f32) {
@@ -1902,6 +2155,16 @@ impl Lightbox {
     /// Make a pane visible and current — the Window menu's job.
     pub fn reveal_pane(&mut self, want: Pane) {
         self.panels_hidden = false;
+        // A closed panel asked for by name comes back; a floating one is already open,
+        // so it is raised instead.
+        if self.closed.contains(&want) {
+            self.closed.retain(|p| *p != want);
+            self.tree_restructured = true;
+        }
+        if self.out.contains(&want) {
+            self.raise = Some(want);
+            return;
+        }
         self.heal_tree();
         let id = self
             .tree
@@ -2551,7 +2814,7 @@ impl Lightbox {
         self.preview = None;
         self.preview_textures.clear();
         self.preview_focus = None;
-        self.exif = None;
+        self.forget_exif();
         self.iptc = None;
         self.reindex();
         self.search.reindex();
@@ -2755,7 +3018,7 @@ impl Lightbox {
         self.generation = self.generation.wrapping_add(1);
         self.tiles.clear();
         self.clear_selection();
-        self.exif = None;
+        self.forget_exif();
         self.drag = None;
         self.enter = None;
         self.manual.clear();
@@ -3196,6 +3459,7 @@ impl Lightbox {
     /// Accept only the current folder generation and keep failures out of busy state.
     pub fn collect(&mut self, ctx: &egui::Context) {
         self.poll_relist(ctx);
+        self.collect_exif(ctx);
         self.preview_failed
             .retain(|key| key.generation == self.generation);
         if self.queue.in_flight() > 0 || self.preview_queue.in_flight() > 0 {
@@ -3248,8 +3512,12 @@ impl Lightbox {
                 }
             };
             match got {
-                Some(img) => {
-                    let colour = if self.grey {
+                Some(Thumb { img, developed }) => {
+                    // **GRAY is for the camera's picture, not for yours.** A developed
+                    // tile is already monochrome by construction, and any color it has
+                    // is the toning you put there — graying it took away the one
+                    // thing it had to say.
+                    let colour = if self.grey && !developed {
                         grey_image(&img)
                     } else {
                         egui::ColorImage::from_rgb([img.w, img.h], &img.data)
@@ -3541,6 +3809,17 @@ pub fn store_edited_tile(
         && stamp.matches(image)
 }
 
+/// A tile's pixels, and whether they are a developed render of the frame rather than
+/// the camera's or the file's own picture.
+///
+/// The difference matters to anything that grays a tile: the camera's picture is in
+/// color and graying it is a preview of the frame as monochrome, while a developed
+/// render is monochrome already and its only color is chemical toning.
+pub(crate) struct Thumb {
+    pub img: raw_core::preview::Rgb8,
+    pub developed: bool,
+}
+
 /// One thumbnail: the disk cache if it has one, the raw's embedded JPEG otherwise.
 ///
 /// Runs on a queue worker, so it takes owned data and touches nothing shared.
@@ -3549,7 +3828,7 @@ fn thumbnail(
     cache: Option<&Path>,
     prefer_edited: bool,
     upright_as: Option<raw_core::Orientation>,
-) -> Option<raw_core::preview::Rgb8> {
+) -> Option<Thumb> {
     // **The edited tile first, when it is wanted and there is one.** This is the
     // prototype's second pass, except the render happened in Develop rather than
     // here — see [`store_edited_tile`]. A file nobody has opened since the feature
@@ -3560,7 +3839,10 @@ fn thumbnail(
         && let Ok(bytes) = std::fs::read(&file)
         && let Some(img) = decode_jpeg(&bytes)
     {
-        return Some(img);
+        return Some(Thumb {
+            img,
+            developed: true,
+        });
     }
 
     let cached = cache
@@ -3571,7 +3853,10 @@ fn thumbnail(
         && let Ok(bytes) = std::fs::read(file)
         && let Some(img) = decode_jpeg(&bytes)
     {
-        return Some(img);
+        return Some(Thumb {
+            img,
+            developed: false,
+        });
     }
 
     // A raw hands over its embedded JPEG; an ordinary picture is simply decoded and
@@ -3606,7 +3891,10 @@ fn thumbnail(
         }
     }
 
-    Some(img)
+    Some(Thumb {
+        img,
+        developed: false,
+    })
 }
 
 /// Contact sheets share Lightbox's edited-tile contract but may ask for more pixels
@@ -3619,23 +3907,30 @@ pub(crate) fn contact_thumbnail(
     prefer_edited: bool,
     edge: u32,
     upright_as: Option<raw_core::Orientation>,
-) -> Option<raw_core::preview::Rgb8> {
+) -> Option<Thumb> {
     if prefer_edited
         && let Some(dir) = cache
         && let Some(file) = edited_cache_name(path, dir)
         && let Ok(bytes) = std::fs::read(file)
         && let Some(image) = decode_jpeg(&bytes)
     {
-        return Some(image);
+        return Some(Thumb {
+            img: image,
+            developed: true,
+        });
     }
     if edge <= raw_core::preview::TILE_EDGE {
         return thumbnail(path, cache, false, upright_as);
     }
-    if is_raw(path) {
+    let img = if is_raw(path) {
         raw_core::preview::screen(path, edge, upright_as)
     } else {
         image_screen(path, edge)
-    }
+    }?;
+    Some(Thumb {
+        img,
+        developed: false,
+    })
 }
 
 /// Every raw in a folder, and optionally in everything below it.
@@ -3891,6 +4186,13 @@ fn captured_at(path: &Path, cache: Option<&Path>) -> Option<std::time::SystemTim
     }
     when
 }
+
+/// Where the closed panels are kept in app memory, beside the tree.
+const CLOSED_KEY: &str = "lightbox.closed";
+
+/// How many frames' facts the Metadata pane remembers. A screenful of stepping back
+/// and forth, at a few hundred bytes each.
+const EXIF_REMEMBERED: usize = 32;
 
 /// What the camera recorded, as rows for the shared EXIF `key / value` grid.
 /// Goes through `raw_core::sensor::Metadata` rather than reaching for rawler here,
@@ -4402,7 +4704,11 @@ fn write_order(dir: &Path, order: &[String]) {
 /// another application put in the standard blocks; a rating is a small change to a
 /// large document, and treating it as the whole document would silently discard
 /// somebody's work. This is the same promise `Metadata`'s own note makes.
-fn write_metadata(image: &Path, rating: i32, label: Option<&str>) -> std::io::Result<()> {
+pub(crate) fn write_metadata(
+    image: &Path,
+    rating: i32,
+    label: Option<&str>,
+) -> std::io::Result<()> {
     use raw_core::sidecar::Loaded;
 
     let (params, mut metadata) = match raw_core::sidecar::read(image) {
@@ -4780,6 +5086,10 @@ struct Panes<'a> {
     resizing: bool,
     /// The sidebar's shipped width, which a double-clicked seam puts a panel back at.
     panel_width: f32,
+    /// A panel's `×` or pop-out button, acted on after the pass because both change
+    /// what the tree is drawing.
+    close_pane: Option<Pane>,
+    float: Option<Pane>,
 }
 
 impl Panes<'_> {
@@ -4807,74 +5117,27 @@ impl Panes<'_> {
             // that never appears and a drop that never lands, which is what "the panel
             // disappears if I dock it right" was.
             let handle = tile_id.egui_id(self.tree_id);
-            let bar_h = theme::size::HEADER + 12.0;
-            let bar = egui::Rect::from_min_size(
-                ui.max_rect().min,
-                egui::vec2(ui.max_rect().width(), bar_h),
-            );
-            ui.painter().rect_filled(bar, 0.0, theme::CHROME_DEEP);
-            // Every panel begins with the same top rule. Favorites used to be the
-            // only pane with one, which made stacked Folders and Search look joined.
-            ui.painter().line_segment(
-                [
-                    egui::pos2(bar.min.x, bar.min.y + 0.5),
-                    egui::pos2(bar.max.x, bar.min.y + 0.5),
-                ],
-                crate::layout::panel_rule(),
-            );
-            ui.painter().line_segment(
-                [
-                    egui::pos2(bar.min.x, bar.max.y - 0.5),
-                    egui::pos2(bar.max.x, bar.max.y - 0.5),
-                ],
-                crate::layout::panel_rule(),
-            );
-            let text = ui.painter().layout_no_wrap(
-                pane.label().to_owned(),
-                egui::FontId::proportional(theme::size::HEADER),
-                theme::RUBY,
-            );
-            let at = egui::pos2(bar.min.x + 10.0, bar.center().y);
-            ui.painter().galley(
-                egui::pos2(at.x, at.y - text.rect.height() * 0.5),
-                text.clone(),
-                theme::RUBY,
-            );
-            let hit_rect = egui::Rect::from_min_size(
-                egui::pos2(at.x, at.y - text.rect.height() * 0.5),
-                text.rect.size(),
-            );
-            let hit = ui.interact(hit_rect, handle, egui::Sense::drag());
-            // **Started, not "is being dragged".** `egui_tiles` begins the drag when
-            // it sees this once; saying it again on every frame of the drag restarts
-            // it, and a drag that keeps restarting never reaches a drop.
-            dragged = hit.drag_started();
-            hit.on_hover_cursor(egui::CursorIcon::Grab);
-            ui.advance_cursor_after_rect(bar);
+            let clicks = crate::layout::lone_bar(ui, self.icons, handle, pane.label(), CLOSE_TIP);
+            dragged = clicks.dragged;
+            if clicks.close {
+                self.close_pane = Some(*pane);
+            }
+            if clicks.float {
+                self.float = Some(*pane);
+            }
         }
 
-        match *pane {
-            Pane::Grid => {
-                if let Some(p) = self.lb.grid_ui(ui, self.icons, self.recent) {
-                    self.open = Some(p);
-                }
-            }
-            Pane::Folders => match self.lb.tree_ui(ui, self.icons) {
-                Nav::None => {}
-                Nav::Open(dir) => self.nav = Some(dir),
-                Nav::Close => self.close = true,
-            },
-            Pane::Search => self.lb.search_ui(ui, self.icons),
-            Pane::Favorites => {
-                if let Some(dir) = self.lb.favorites_ui(ui, self.icons) {
-                    self.nav = Some(dir);
-                }
-            }
-            Pane::Exif => self.lb.exif_ui(ui, self.icons),
-        }
+        let ask = self.lb.pane_contents(ui, self.icons, self.recent, *pane);
+        self.open = self.open.take().or(ask.open);
+        self.nav = self.nav.take().or(ask.nav);
+        self.close |= ask.close;
         dragged
     }
 }
+
+/// What a closed Lightbox panel's `×` says about getting it back.
+const CLOSE_TIP: &str = "close panel — the Window menu or tab brings it back";
+
 
 impl egui_tiles::Behavior<Pane> for Panes<'_> {
     fn pane_ui(
@@ -5002,15 +5265,35 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         tabs: &egui_tiles::Tabs,
         scroll_offset: &mut f32,
     ) {
+        // **The showing panel's `×` and pop-out, at the strip's right end** — the
+        // same two, in the same order, as a lone panel's bar carries. Not a `×` on
+        // every tab as Develop has: three of them push METADATA behind a scroll arrow
+        // at the sidebar's width, and a tab you cannot see is worse than a control
+        // that acts on the one you can. Drawn first: the bar is laid out right to
+        // left, so these take their place before the tabs measure what is left.
+        crate::layout::paint_strip_top_rule(ui);
+        let pad = self.tab_title_spacing(ui.visuals());
+        if let Some(active) = tabs.active.and_then(|id| tiles.get_pane(&id).copied())
+            && active.closable()
+        {
+            let id = ui.id().with(active.label());
+            ui.add_space(pad);
+            let (_, close) = ui.allocate_space(egui::Vec2::splat(crate::icons::BOX));
+            if crate::layout::close_button(ui, self.icons, id.with("close"), close, CLOSE_TIP) {
+                self.close_pane = Some(active);
+            }
+            ui.add_space(pad);
+            let (_, float) = ui.allocate_space(egui::Vec2::splat(crate::icons::BOX));
+            if crate::layout::float_button(ui, self.icons, id.with("float"), float) {
+                self.float = Some(active);
+            }
+        }
         let required: f32 = tabs
             .children
             .iter()
             .filter(|id| tiles.is_visible(**id))
             .filter_map(|id| tiles.get_pane(id))
-            .map(|pane| {
-                theme::header_size(ui.painter(), pane.label()).x
-                    + 2.0 * self.tab_title_spacing(ui.visuals())
-            })
+            .map(|pane| theme::header_size(ui.painter(), pane.label()).x + 2.0 * pad)
             .sum();
         if ui.available_width() >= required {
             *scroll_offset = 0.0;
@@ -5387,10 +5670,95 @@ impl Lightbox {
                         .interact(blank, ui.id().with("tree-blank"), egui::Sense::click())
                         .clicked()
                 {
+                    self.focus = Focus::Tree;
                     nav = Nav::Close;
                 }
             });
         nav
+    }
+
+    /// Whether the arrow keys belong to the folder tree: it was clicked last, and it
+    /// is somewhere to be seen. A closed tree, or one `tab` has taken away, gives them
+    /// back to the grid rather than moving through folders nobody can watch.
+    pub fn tree_has_keys(&self) -> bool {
+        self.focus == Focus::Tree && !self.panels_hidden && !self.closed.contains(&Pane::Folders)
+    }
+
+    /// An arrow key while the tree has the keyboard.
+    ///
+    /// **↑ and ↓ go to the folder above or below and open it**, as clicking its name
+    /// would, because the tree's highlight *is* the open folder — a second cursor that
+    /// moved while the grid stayed put would be two answers to "which folder". **→
+    /// expands** a folder, or steps into its first child once it is open; **← folds
+    /// it**, or steps out to its parent once it is folded. The disclosure the keys do
+    /// not ask for is left alone: arriving at a folder by key does not open it up the
+    /// way a click on its name does, or ↓ would descend into every folder it passed.
+    pub fn tree_key(&mut self, key: egui::Key) {
+        let rows = self.visible_folder_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let at = self
+            .folder
+            .as_ref()
+            .and_then(|f| rows.iter().position(|r| r == f));
+        let Some(i) = at else {
+            // Nothing in the tree is open yet: any arrow starts at the top.
+            self.go_by_key(&rows[0]);
+            return;
+        };
+        let here = rows[i].clone();
+        let open = self.folders.expanded.contains(&here);
+        let has_kids = !self.folders.children_of(&here).is_empty();
+        let to = match key {
+            egui::Key::ArrowDown => (i + 1 < rows.len()).then(|| i + 1),
+            egui::Key::ArrowUp => i.checked_sub(1),
+            egui::Key::ArrowRight if has_kids && !open => {
+                self.folders.expanded.insert(here);
+                None
+            }
+            egui::Key::ArrowRight if has_kids => Some(i + 1),
+            egui::Key::ArrowLeft if has_kids && open => {
+                self.folders.expanded.remove(&here);
+                None
+            }
+            egui::Key::ArrowLeft => here
+                .parent()
+                .and_then(|parent| rows.iter().position(|r| r == parent)),
+            _ => None,
+        };
+        if let Some(to) = to {
+            self.go_by_key(&rows[to]);
+        }
+    }
+
+    /// Open a folder the keys moved to, keeping its disclosure as it was and the tree
+    /// scrolled to it.
+    fn go_by_key(&mut self, dir: &Path) {
+        let was_open = self.folders.expanded.contains(dir);
+        self.open_folder(dir);
+        if !was_open {
+            self.folders.expanded.remove(dir);
+        }
+        self.tree_follow = true;
+    }
+
+    /// Every folder row the tree is showing, top to bottom: each root, and under each
+    /// open folder its children, as `folder_row` draws them.
+    fn visible_folder_rows(&mut self) -> Vec<PathBuf> {
+        fn walk(tree: &mut FolderTree, dir: &Path, out: &mut Vec<PathBuf>) {
+            out.push(dir.to_path_buf());
+            if tree.expanded.contains(dir) {
+                for kid in tree.children_of(dir).to_vec() {
+                    walk(tree, &kid, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for root in self.folders.roots.clone() {
+            walk(&mut self.folders, &root, &mut out);
+        }
+        out
     }
 
     /// One folder and, if it is open, its children.
@@ -5428,7 +5796,16 @@ impl Lightbox {
         let hit = ui.interact(label_rect, ui.id().with(("row", dir)), egui::Sense::click());
 
         if current {
-            ui.painter().rect_filled(rect, 2.0, theme::RUBY_FILL_DIM);
+            // Ruby while the tree has the keyboard, gray while the grid does.
+            let fill = if self.focus == Focus::Tree {
+                theme::RUBY_FILL_DIM
+            } else {
+                UNFOCUSED_FILL
+            };
+            ui.painter().rect_filled(rect, 2.0, fill);
+            if std::mem::take(&mut self.tree_follow) {
+                ui.scroll_to_rect(rect, None);
+            }
         } else if hit.hovered() || tri.hovered() {
             ui.painter().rect_filled(rect, 2.0, theme::CHROME_DEEP);
         }
@@ -5486,6 +5863,9 @@ impl Lightbox {
             colour,
         );
 
+        if tri.clicked() || hit.clicked() {
+            self.focus = Focus::Tree;
+        }
         if tri.clicked() {
             if open {
                 self.folders.expanded.remove(dir);
@@ -5740,7 +6120,7 @@ impl Lightbox {
                 draft.saved[i] = draft.values[i].clone();
             }
         }
-        self.exif = None;
+        self.forget_exif();
         if !errors.is_empty() {
             self.action_note = Some(format!("IPTC was not saved — {}", errors.join("; ")));
         }
@@ -5792,7 +6172,7 @@ impl Lightbox {
         self.search.update_iptc(&saved, &updates);
 
         self.iptc = Some(IptcDraft::load(paths));
-        self.exif = None;
+        self.forget_exif();
         self.action_note = if errors.is_empty() {
             Some(format!("Applied metadata template “{}”", template.name))
         } else {
@@ -6131,6 +6511,65 @@ impl Lightbox {
 
     /// Camera and file facts remain read-only; IPTC beneath them is an authored
     /// sidecar overlay. A multi-selection edits only the field that was touched.
+    /// Drop the shown facts and everything remembered, and retire any read in flight.
+    /// For when what a file says may have changed: an IPTC save, another folder.
+    fn forget_exif(&mut self) {
+        self.exif = None;
+        self.exif_remembered.clear();
+        self.exif_generation = self.exif_generation.wrapping_add(1);
+        self.exif_queue.cancel(0);
+    }
+
+    /// Show `path`'s facts if they are known, or ask a worker for them.
+    fn want_exif(&mut self, path: &Path) {
+        if self.exif.as_ref().is_some_and(|(p, _)| p == path) {
+            return;
+        }
+        if let Some((_, facts)) = self.exif_remembered.iter().find(|(p, _)| p == path) {
+            self.exif = Some((path.to_path_buf(), facts.clone()));
+            return;
+        }
+        if self.exif_asked.as_deref() == Some(path) && self.exif_queue.is_busy(0) {
+            return;
+        }
+        let generation = self.exif_generation;
+        let path = path.to_path_buf();
+        self.exif_asked = Some(path.clone());
+        self.exif_queue.submit(0, decode::FOREGROUND, move || {
+            let facts = read_exif(&path);
+            (generation, path, facts)
+        });
+    }
+
+    /// Take a finished read: remember it, and show it if it is still the selection's.
+    fn collect_exif(&mut self, ctx: &egui::Context) {
+        while let Some((_, got)) = self.exif_queue.poll() {
+            let Ok((generation, path, facts)) = got else {
+                continue;
+            };
+            if generation != self.exif_generation {
+                continue;
+            }
+            self.exif_remembered.retain(|(p, _)| *p != path);
+            self.exif_remembered.push((path.clone(), facts.clone()));
+            if self.exif_remembered.len() > EXIF_REMEMBERED {
+                self.exif_remembered.remove(0);
+            }
+            let selected = self
+                .selected
+                .and_then(|i| self.entries.get(i as usize))
+                .is_some_and(|e| e.path == path);
+            if selected {
+                self.exif = Some((path, facts));
+            }
+        }
+        // Nothing wakes the frame when a worker finishes, so look again soon while a
+        // read is out. Only then: an idle Lightbox stays idle.
+        if self.exif_queue.in_flight() > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
     pub fn exif_ui(&mut self, ui: &mut egui::Ui, icons: &crate::icons::Icons) {
         let Some(path) = self
             .selected
@@ -6141,9 +6580,10 @@ impl Lightbox {
             return;
         };
 
-        if self.exif.as_ref().is_none_or(|(p, _)| *p != path) {
-            self.exif = Some((path.clone(), read_exif(&path)));
-        }
+        self.want_exif(&path);
+        // Until it lands, the last frame's rows stay up, faded: the panel keeps its
+        // shape rather than collapsing and refilling under the pointer on every click.
+        let reading = self.exif.as_ref().is_none_or(|(p, _)| *p != path);
 
         let paths = self.iptc_paths();
         if self
@@ -6204,7 +6644,12 @@ impl Lightbox {
                 if sections.is_empty() {
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
-                        ui.label(theme::caption("this file records nothing").color(theme::DIM));
+                        let say = if reading {
+                            "reading…"
+                        } else {
+                            "this file records nothing"
+                        };
+                        ui.label(theme::caption(say).color(theme::DIM));
                     });
                 }
                 ui.add_space(6.0);
@@ -6214,6 +6659,9 @@ impl Lightbox {
                 });
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
+                    if reading {
+                        ui.multiply_opacity(0.4);
+                    }
                     egui::Grid::new("lightbox-exif-rows")
                         .num_columns(2)
                         .spacing([10.0, 3.0])
@@ -6869,7 +7317,9 @@ impl Lightbox {
                 // and `theme::label_colour` are spelt the way they are two lines from
                 // a button that is not.
                 if theme::bracket(ui, if self.grey { "GRAY" } else { "COLOR" }, self.grey, 8.0)
-                    .on_hover_text(theme::tip("Show the thumbnails as gray"))
+                    .on_hover_text(theme::tip(
+                        "Show the camera's thumbnails as gray — developed ones keep their toning",
+                    ))
                     .clicked()
                 {
                     act.grey = Some(!self.grey);
@@ -7041,6 +7491,7 @@ impl Lightbox {
             && !over_tile
         {
             self.clear_selection();
+            self.focus = Focus::Grid;
         }
 
         // A drag that ended outside any tile, or on the one it started from, still
@@ -7104,7 +7555,19 @@ impl Lightbox {
             egui::Sense::click_and_drag(),
         );
 
-        if r.clicked() {
+        // **On the press, not the release**, as Finder selects. egui reports a click
+        // when the button comes back up, so the ring used to arrive a beat after the
+        // tile was pressed — the lag the maintainer saw stepping tile to tile. The click
+        // is still honored when press and release land in one frame, which is the one
+        // time egui reports no press; `pressed_tile` stops a slower click acting twice,
+        // which for `⌘` would add the tile and take it straight back out.
+        let pressed = r.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
+        let unpressed_click = r.clicked() && self.pressed_tile.take() != Some(idx);
+        if pressed {
+            self.pressed_tile = Some(idx);
+        }
+        if pressed || unpressed_click {
+            self.focus = Focus::Grid;
             // **`⌘` adds one, `⇧` takes a run, a plain click starts again** — the
             // gestures every file browser has. The anchor is what a run is measured
             // from, which is why it is kept apart from the batch.
@@ -7169,6 +7632,10 @@ impl Lightbox {
                 egui::Stroke::new(2.0, theme::RUBY),
             );
         }
+        if r.drag_stopped() {
+            // A drag ends without a click, so the press it began with is settled here.
+            self.pressed_tile = None;
+        }
         if r.drag_stopped()
             && let Some((dragged, before)) = self.drag.take()
         {
@@ -7219,8 +7686,13 @@ impl Lightbox {
         // the border so the grid reads as pictures rather than as cards; a selection
         // you could not see would be a different thing entirely, so the ring stays
         // and only the resting fill goes.
+        let focused = self.focus == Focus::Grid;
         let fill = if in_batch {
-            theme::RUBY_FILL_DIM
+            if focused {
+                theme::RUBY_FILL_DIM
+            } else {
+                UNFOCUSED_FILL
+            }
         } else if r.hovered() && !selected {
             theme::CHROME
         } else {
@@ -7242,18 +7714,20 @@ impl Lightbox {
         // ground, the anchor is a full ruby ring, and a batch member that is not the
         // anchor gets a thinner one — so a five-tile selection reads as five tiles
         // with one of them being where the next `⇧`-click will measure from.
+        // Gray while the folder tree has the keyboard — see [`Focus`].
+        let ink = if focused { theme::RUBY } else { UNFOCUSED_RING };
         if selected {
             ui.painter().rect_stroke(
                 card,
                 2.0,
-                egui::Stroke::new(1.5, theme::RUBY),
+                egui::Stroke::new(1.5, ink),
                 egui::StrokeKind::Inside,
             );
         } else if in_batch {
             ui.painter().rect_stroke(
                 card,
                 2.0,
-                egui::Stroke::new(1.0, theme::RUBY.gamma_multiply(0.6)),
+                egui::Stroke::new(1.0, ink.gamma_multiply(0.6)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -8647,7 +9121,9 @@ mod tests {
 
         let t = std::time::Instant::now();
         let cold =
-            thumbnail(&raw, Some(&cache), false, None).expect("a tile from a raw that has one");
+            thumbnail(&raw, Some(&cache), false, None)
+                .expect("a tile from a raw that has one")
+                .img;
         let cold_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let files: Vec<_> = std::fs::read_dir(&cache).unwrap().flatten().collect();
@@ -8658,7 +9134,9 @@ mod tests {
         );
 
         let t = std::time::Instant::now();
-        let warm = thumbnail(&raw, Some(&cache), false, None).expect("the cached tile");
+        let warm = thumbnail(&raw, Some(&cache), false, None)
+            .expect("the cached tile")
+            .img;
         let warm_ms = t.elapsed().as_secs_f64() * 1e3;
 
         assert_eq!(
@@ -9251,6 +9729,212 @@ mod tests {
         let e = &later.entries[0];
         assert_eq!(e.rating, 4);
         assert_eq!(e.label.as_deref(), Some("green"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metadata_is_read_off_the_frame_and_a_stale_read_never_lands() {
+        // The pane used to read on the UI thread, which froze the grid for a third of
+        // a second per DNG. Asking returns at once; the facts arrive on a later frame.
+        let (dir, raw) = scratch("exif-worker");
+        let mut lb = Lightbox::new();
+        lb.open_folder(&dir);
+        lb.selected = Some(0);
+        let ctx = egui::Context::default();
+        let wait = |lb: &mut Lightbox| {
+            let start = std::time::Instant::now();
+            while lb.exif_queue.in_flight() > 0 && start.elapsed().as_secs() < 10 {
+                lb.collect_exif(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            lb.collect_exif(&ctx);
+        };
+
+        lb.want_exif(&raw);
+        assert!(lb.exif.is_none(), "the read happened on the spot");
+        wait(&mut lb);
+        assert!(lb.exif.as_ref().is_some_and(|(p, _)| *p == raw));
+
+        // Remembered: going back to a frame needs no second read.
+        lb.exif = None;
+        lb.want_exif(&raw);
+        assert!(lb.exif.is_some(), "a frame already read was read again");
+        assert_eq!(lb.exif_queue.in_flight(), 0);
+
+        // A read begun before the facts were declared stale is not shown after.
+        lb.forget_exif();
+        lb.want_exif(&raw);
+        let begun = lb.exif_generation;
+        lb.exif_generation = lb.exif_generation.wrapping_add(1);
+        wait(&mut lb);
+        assert!(lb.exif.is_none(), "generation {begun}'s read landed after it was retired");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_arrows_walk_the_folder_tree_once_it_has_the_keyboard() {
+        let root = std::env::temp_dir().join(format!("monopro-lb-treekeys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["a/a1", "a/a2", "b"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let mut lb = Lightbox::new();
+        lb.folders.roots = vec![root.clone()];
+        lb.folders.expanded = [root.clone()].into();
+        lb.open_folder(&root);
+        assert!(!lb.tree_has_keys(), "the grid has them until the tree is clicked");
+        lb.focus = Focus::Tree;
+        assert!(lb.tree_has_keys());
+
+        // The folder in front, relative to the root, its parts joined with `/` on every
+        // platform: Windows writes `a\a1`, and the walk is the same either way.
+        let here = |lb: &Lightbox| {
+            lb.folder
+                .as_ref()
+                .and_then(|f| f.strip_prefix(&root).ok())
+                .map(|p| {
+                    p.components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+        };
+        lb.tree_key(egui::Key::ArrowDown);
+        assert_eq!(here(&lb).as_deref(), Some("a"));
+        assert!(
+            !lb.folders.expanded.contains(&root.join("a")),
+            "arriving by key opened the folder up"
+        );
+        lb.tree_key(egui::Key::ArrowRight);
+        assert_eq!(here(&lb).as_deref(), Some("a"), "the first → only expands");
+        lb.tree_key(egui::Key::ArrowRight);
+        assert_eq!(here(&lb).as_deref(), Some("a/a1"), "the second steps in");
+        lb.tree_key(egui::Key::ArrowDown);
+        lb.tree_key(egui::Key::ArrowDown);
+        assert_eq!(here(&lb).as_deref(), Some("b"));
+        lb.tree_key(egui::Key::ArrowUp);
+        assert_eq!(here(&lb).as_deref(), Some("a/a2"));
+        lb.tree_key(egui::Key::ArrowLeft);
+        assert_eq!(here(&lb).as_deref(), Some("a"), "← from a leaf goes to its parent");
+        lb.tree_key(egui::Key::ArrowLeft);
+        assert!(!lb.folders.expanded.contains(&root.join("a")), "← folds an open folder");
+        lb.tree_key(egui::Key::ArrowDown);
+        assert_eq!(here(&lb).as_deref(), Some("b"), "a folded folder's children are skipped");
+
+        // A closed tree gives the keys back to the grid.
+        lb.close_pane(Pane::Folders);
+        assert!(!lb.tree_has_keys());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_closed_panel_keeps_its_place_and_comes_back_by_name_or_by_tab() {
+        let mut lb = Lightbox::new();
+        let visible = |lb: &Lightbox, pane: Pane| {
+            lb.tree
+                .tiles
+                .find_pane(&pane)
+                .is_some_and(|id| lb.tree.is_visible(id))
+        };
+        lb.settle_visibility();
+        assert!(visible(&lb, Pane::Search));
+
+        lb.close_pane(Pane::Search);
+        lb.settle_visibility();
+        assert!(!visible(&lb, Pane::Search), "closed, and still drawn");
+        assert!(lb.tree.tiles.find_pane(&Pane::Search).is_some(), "closing removed it");
+
+        // The grid is the mode, and has no `×`.
+        lb.close_pane(Pane::Grid);
+        lb.settle_visibility();
+        assert!(visible(&lb, Pane::Grid));
+
+        // By name: the Window menu, `⇧S`.
+        lb.reveal_pane(Pane::Search);
+        lb.settle_visibility();
+        assert!(visible(&lb, Pane::Search));
+
+        // All three tabs closed takes their strip with them, and `tab` twice puts
+        // every one back.
+        for pane in [Pane::Folders, Pane::Search, Pane::Exif] {
+            lb.close_pane(pane);
+        }
+        lb.settle_visibility();
+        let strip = lb
+            .tree
+            .tiles
+            .find_pane(&Pane::Folders)
+            .and_then(|id| lb.tree.tiles.parent_of(id))
+            .expect("the tab strip");
+        assert!(!lb.tree.is_visible(strip), "an empty tab strip was left standing");
+        lb.toggle_panels();
+        lb.toggle_panels();
+        lb.settle_visibility();
+        for pane in [Pane::Folders, Pane::Search, Pane::Exif] {
+            assert!(visible(&lb, pane), "{pane:?} stayed closed through tab");
+        }
+    }
+
+    #[test]
+    fn resetting_the_layout_brings_back_closed_and_floating_panels() {
+        let mut lb = Lightbox::new();
+        lb.close_pane(Pane::Search);
+        lb.float_pane(Pane::Favorites);
+        lb.reset_tree();
+        lb.settle_visibility();
+        for pane in [Pane::Search, Pane::Favorites] {
+            let id = lb.tree.tiles.find_pane(&pane).expect("in the default tree");
+            assert!(lb.tree.is_visible(id), "{pane:?} was left out by a reset");
+        }
+        assert!(lb.closed.is_empty() && lb.out.is_empty());
+    }
+
+    #[test]
+    fn a_popped_out_panel_leaves_the_frame_and_docks_back_into_its_place() {
+        let mut lb = Lightbox::new();
+        lb.float_pane(Pane::Favorites);
+        lb.settle_visibility();
+        let id = lb.tree.tiles.find_pane(&Pane::Favorites).expect("kept in the tree");
+        assert!(!lb.tree.is_visible(id), "floating and docked at once");
+
+        // Asking for it by name raises the window rather than docking it.
+        lb.reveal_pane(Pane::Favorites);
+        assert_eq!(lb.raise, Some(Pane::Favorites));
+        assert!(lb.out.contains(&Pane::Favorites));
+
+        lb.dock_pane(Pane::Favorites);
+        lb.settle_visibility();
+        assert!(lb.tree.is_visible(id));
+
+        lb.float_pane(Pane::Grid);
+        assert!(lb.out.is_empty(), "the grid floated");
+    }
+
+    #[test]
+    fn a_rating_set_in_develop_reaches_the_grid_on_the_way_back() {
+        // Develop rates the picture it holds by writing the sidecar, which is all the
+        // grid hears of it. `refresh_edited` is what runs on the way back.
+        let (dir, raw) = scratch("develop-rating");
+        let mut lb = Lightbox::new();
+        lb.open_folder(&dir);
+        assert_eq!(lb.entries[0].rating, 0);
+
+        // Past the mtime granularity of any filesystem the tests run on.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_metadata(&raw, 3, Some("blue")).unwrap();
+        lb.refresh_edited();
+        assert_eq!(lb.entries[0].rating, 3);
+        assert_eq!(lb.entries[0].label.as_deref(), Some("blue"));
+
+        // And taken back off, which writes the absence rather than a nought.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_metadata(&raw, 0, None).unwrap();
+        lb.refresh_edited();
+        assert_eq!(lb.entries[0].rating, 0);
+        assert_eq!(lb.entries[0].label, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10185,7 +10869,12 @@ mod tests {
         })
         .unwrap();
 
-        let got = thumbnail(&raw, Some(&cache), true, None).expect("the edited tile");
+        let Thumb {
+            img: got,
+            developed,
+        } = thumbnail(&raw, Some(&cache), true, None).expect("the edited tile");
+        // Said so, because GRAY leaves a developed tile's toning alone.
+        assert!(developed, "an edited tile has to say it is one");
         assert_eq!(
             (got.w, got.h),
             (w as usize, h as usize),

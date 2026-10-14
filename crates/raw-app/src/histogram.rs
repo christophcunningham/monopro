@@ -207,11 +207,98 @@ impl PartialEq for MappingKey {
     fn eq(&self, other: &Self) -> bool {
         self.ev == other.ev
             && self.black == other.black
-            && self.curve.same_render(&other.curve)
+            // `same_luts`, not `same_render`: this mapping reads the curve through its
+            // table, which ignores where a mask lies, so dragging a mask's handle must
+            // not read as a new mapping and re-bin every histogram behind it.
+            && self.curve.same_luts(&other.curve)
             && self.tone_map == other.tone_map
             && self.gamma == other.gamma
     }
 }
+
+/// What the curve editor draws behind the selected pass, and says beneath it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurveGhost {
+    /// The tones entering the pass, on the curve's own axis. **Inside the pass's mask**
+    /// when it has one that is on: each sample counts by how much of the pass reaches
+    /// it, so the ghost is the tones the curve touches and not the whole frame's.
+    pub bins: [u32; BINS],
+    /// The mean EV change the pass makes, opacity included, over those same tones.
+    /// `None` when there is no tone with a finite EV to average, or a mask selects
+    /// nothing.
+    pub average: Option<f32>,
+    /// How much of the frame the mask selects, as a fraction of it, when there is one.
+    pub coverage: Option<f32>,
+    /// Where on the curve's axis the masked tones lie: the span holding the middle nine
+    /// tenths of what the mask selects, as positions in `[0, 1]`. For shading the axis.
+    pub span: Option<(f32, f32)>,
+}
+
+impl CurveGhost {
+    /// The line under the curve editor: the mean change the pass makes, and, for a
+    /// masked pass, that it is the change inside the mask and how much of the frame the
+    /// mask selects.
+    pub fn readout(&self) -> String {
+        let change = match self.average {
+            Some(delta) if delta.abs() < 0.005 => "unchanged".to_owned(),
+            Some(delta) => format!(
+                "{:.2} EV {}",
+                delta.abs(),
+                if delta > 0.0 { "lighter" } else { "darker" },
+            ),
+            None => "—".to_owned(),
+        };
+        match self.coverage {
+            None => format!("Average: {change}"),
+            Some(share) => {
+                let percent = share * 100.0;
+                // A mask that selects a sliver must not read as selecting nothing.
+                let of_frame = if percent > 0.0 && percent < 1.0 {
+                    "<1%".to_owned()
+                } else {
+                    format!("{percent:.0}%")
+                };
+                format!("Average: {change} inside the mask ({of_frame} of the frame)")
+            }
+        }
+    }
+}
+
+/// The tones entering one pass, sample by sample: the half of the ghost that costs a
+/// curve evaluation per sample, kept apart from the mask so a mask that moves does not
+/// pay for it again.
+struct Entering {
+    /// The passes up to the selected one, with the selected one's own mask taken off:
+    /// what the tone entering it, and the change it makes at full weight, depend on.
+    upstream: raw_core::CurveStack,
+    stop: usize,
+    aspect: f32,
+    /// The basis the passes above were weighed by, as its address; zero for none.
+    basis: usize,
+    bins: [u32; BINS],
+    average: Option<f32>,
+    /// Per sample: the bin its entering tone falls in, and the EV change the pass makes
+    /// to it at full weight (not finite where the tone has no EV).
+    bin: Vec<u8>,
+    delta: Vec<f32>,
+    /// Counts the times this was rebuilt, so what is made from it knows when it is stale.
+    serial: u64,
+}
+
+/// The ghost inside the selected pass's mask, and what it was made from.
+struct Masked {
+    serial: u64,
+    mask: raw_core::curve::CurveMask,
+    aspect: f32,
+    basis: usize,
+    ghost: CurveGhost,
+}
+
+/// How many samples the masked ghost weighs. A mask is weighed again on every frame of
+/// a handle drag, and a radial's weight is a sine and a cosine, so this is a quarter of
+/// the samples the ghost is binned from: enough for a distribution, in about a
+/// millisecond.
+const MASK_BUDGET: usize = 50_000;
 
 pub struct Histogram {
     pub mode: Mode,
@@ -229,7 +316,19 @@ pub struct Histogram {
     // Keep unquantized post-exposure samples: remapping whole histogram bins
     // through a contrast-expanding curve leaves artificial holes.
     curve_samples: Vec<f32>,
-    curve_cache: Option<(raw_core::CurveStack, usize, [u32; BINS], Option<f32>)>,
+    /// Where each of those samples is on the negative, source-normalized, in step with
+    /// `curve_samples`: what lets the ghost be taken inside a mask.
+    curve_at: Vec<(f32, f32)>,
+    curve_cache: Option<Entering>,
+    curve_masked: Option<Masked>,
+    /// The selected pass's tone range, prepared for the basis at this address.
+    curve_tone: Option<(raw_core::ZoneMask, usize, raw_core::zone::PreparedMask)>,
+    /// What each pass's painted mask covers, as a small picture, by the pass's place in
+    /// the stack; `None` for a pass whose mask is not painted. Kept across frames and
+    /// brought up to date with only the dabs that are new, because weighing a sample
+    /// against the strokes themselves is every dab for every sample.
+    curve_cover: Vec<Option<raw_core::dodgeburn::Coverage>>,
+    curve_serial: u64,
     pub rgb: [[u32; BINS]; 3],
     sample_key: Option<(f32, f32, u64, Option<raw_core::Frame>)>,
     rgb_key: Option<(MappingKey, u64)>,
@@ -249,7 +348,12 @@ impl Default for Histogram {
             tonal: [0; BINS],
             curve_in: [0; BINS],
             curve_samples: Vec::new(),
+            curve_at: Vec::new(),
             curve_cache: None,
+            curve_masked: None,
+            curve_tone: None,
+            curve_cover: Vec::new(),
+            curve_serial: 0,
             rgb: [[0; BINS]; 3],
             sample_key: None,
             rgb_key: None,
@@ -270,7 +374,8 @@ impl Histogram {
             return;
         }
         if let Some(map) = &mut self.map {
-            if !map.curve.same_render(&params.curve) {
+            // Mask-blind, for the reason `MappingKey` is: the table does not depend on it.
+            if !map.curve.same_luts(&params.curve) {
                 map.lut = params.curve.bake();
                 map.identity = params.curve.is_identity();
                 map.curve = params.curve.clone();
@@ -315,16 +420,19 @@ impl Histogram {
             return;
         }
         self.curve_samples.clear();
+        self.curve_at.clear();
         self.curve_in = [0; BINS];
         let gain = params.exposure.ev.exp2();
-        for_each_tonal_sample(luma, frame, |v| {
+        for_each_tonal_sample(luma, frame, |v, x, y| {
             let scene = (v - params.exposure.black) * gain;
             self.curve_samples.push(scene);
+            self.curve_at.push((x, y));
             let bin = ((raw_core::Curve::to_normalized(scene) * (BINS - 1) as f32) as usize)
                 .min(BINS - 1);
             self.curve_in[bin] += 1;
         });
         self.curve_cache = None;
+        self.curve_masked = None;
         self.sample_key = Some(key);
     }
 
@@ -354,44 +462,298 @@ impl Histogram {
         self.tonal = bins;
     }
 
-    /// Bin individual samples at the selected layer's input, before quantization.
-    /// Cache between UI frames; refresh invalidates it when the source changes.
-    pub fn curve_input(&mut self, stack: &raw_core::CurveStack, stop: usize) -> [u32; BINS] {
-        let mut prefix = stack.clone();
-        prefix.instances.truncate(stop.saturating_add(1));
-        if let Some((previous, layer, bins, _)) = &self.curve_cache
-            && previous.same_render(&prefix)
-            && *layer == stop
-        {
-            return *bins;
+    /// The ghost behind the curve editor for pass `stop`, and its Average: the tones
+    /// entering the pass, binned sample by sample before quantization, **inside the
+    /// pass's mask** when it has one that is on.
+    ///
+    /// `aspect` is the stored image's height over width, which the shapes are measured
+    /// in. `basis` is the picture's pre-Dodge & Burn basis, which a tone range is read
+    /// from; without it a tone range weighs one, so the caller passes it whenever a
+    /// pass up to `stop` has one and draws again when it arrives.
+    ///
+    /// # Two caches, because two things move
+    ///
+    /// - **The tones entering the pass** take a curve evaluation per sample, for every
+    ///   pass above. They depend on those curves and on where *their* masks lie, and
+    ///   are rebuilt only when one of those changes: the passes above are weighed at
+    ///   each sample's own place on the negative, as the shader weighs them.
+    /// - **The selected pass's mask** is weighed over them, which is arithmetic. It is
+    ///   redone on every frame of a handle drag and never re-runs a curve.
+    ///
+    /// # A painted mask is weighed from a picture of it
+    ///
+    /// A gradient's weight at a sample is a few multiplications. A painted mask's is a
+    /// test of every dab, and a mask that has been worked on has thousands, so asking
+    /// the strokes themselves for fifty thousand samples on every frame of the next
+    /// stroke would stop the brush. Each painted mask up to `stop` is kept as a
+    /// [`Coverage`](raw_core::dodgeburn::Coverage), which a stroke in progress updates
+    /// with its new dabs alone, and a sample reads it with one lookup.
+    pub fn curve_ghost(
+        &mut self,
+        stack: &raw_core::CurveStack,
+        stop: usize,
+        aspect: f32,
+        basis: Option<&Arc<raw_core::Basis>>,
+    ) -> CurveGhost {
+        let reads_picture = |instance: &raw_core::CurveInstance| {
+            instance
+                .live_mask()
+                .and_then(|mask| mask.live_tone())
+                .is_some_and(|tone| !tone.is_identity())
+        };
+        let address = |needed: bool| match basis {
+            Some(basis) if needed => Arc::as_ptr(basis) as usize,
+            _ => 0,
+        };
+
+        // ── What has been painted, for the passes that are painted ───────────
+        if self.curve_cover.len() < stack.instances.len() {
+            self.curve_cover.resize_with(stack.instances.len(), || None);
         }
-        let mut bins = [0; BINS];
-        let mut total_ev = 0.0f64;
-        let mut count = 0usize;
-        for &scene in &self.curve_samples {
-            let entering = stack.apply_before(stop, scene);
-            let x = raw_core::Curve::to_normalized(entering);
-            let bin = ((x * (BINS - 1) as f32) as usize).min(BINS - 1);
-            bins[bin] += 1;
-            let output = if stack.enabled {
-                stack.apply_before(stop + 1, scene)
-            } else {
-                entering
-            };
-            if entering > 0.0 && output > 0.0 && entering.is_finite() && output.is_finite() {
-                total_ev += output.log2() as f64 - entering.log2() as f64;
-                count += 1;
+        for (i, slot) in self.curve_cover.iter_mut().enumerate() {
+            let painted = stack
+                .instances
+                .get(i)
+                .and_then(|instance| instance.live_mask())
+                .and_then(|mask| mask.shape.as_ref())
+                .filter(|shape| shape.nib().is_some());
+            match painted {
+                // Brought up to date only for the passes this ghost reads. One below the
+                // selection keeps what it had, and catches up if it is ever selected.
+                Some(shape) if i <= stop => {
+                    if slot.as_ref().is_none_or(|cover| cover.aspect() != aspect) {
+                        *slot = Some(raw_core::dodgeburn::Coverage::new(aspect));
+                    }
+                    if let Some(cover) = slot {
+                        cover.update(shape.passes());
+                    }
+                }
+                Some(_) => {}
+                None => *slot = None,
             }
         }
-        let average = (count > 0).then(|| (total_ev / count as f64) as f32);
-        self.curve_cache = Some((prefix, stop, bins, average));
-        bins
+        // How much of pass `pass` reaches a sample: its shape from the picture when it
+        // is painted and from the shape itself otherwise, joined with its tone.
+        let covers = &self.curve_cover;
+        let weight = |pass: usize,
+                      mask: &raw_core::curve::CurveMask,
+                      (x, y): (f32, f32),
+                      tone: &dyn Fn(&raw_core::ZoneMask) -> f32| {
+            let covered = match covers.get(pass).and_then(Option::as_ref) {
+                Some(cover) => Some(cover.at(x, y)),
+                None => mask.shape_coverage(x, y, aspect),
+            };
+            mask.weigh(covered, mask.live_tone().map(tone))
+        };
+
+        // ── The tones entering the pass ──────────────────────────────────────
+        let mut upstream = stack.clone();
+        upstream.instances.truncate(stop.saturating_add(1));
+        if let Some(selected) = upstream.instances.get_mut(stop) {
+            selected.mask = None;
+        }
+        let masked_above = stack
+            .instances
+            .iter()
+            .take(stop)
+            .any(|instance| instance.live_mask().is_some());
+        let above_basis = address(stack.instances.iter().take(stop).any(reads_picture));
+        let stale = self.curve_cache.as_ref().is_none_or(|entry| {
+            entry.stop != stop
+                || entry.aspect != aspect
+                || entry.basis != above_basis
+                || !entry.upstream.same_render(&upstream)
+        });
+        if stale {
+            // Each tone range above, prepared once and read at every sample.
+            let prepared: Vec<(raw_core::ZoneMask, raw_core::zone::PreparedMask)> =
+                match basis.filter(|_| above_basis != 0) {
+                    Some(basis) => {
+                        let mut tones: Vec<raw_core::ZoneMask> = Vec::new();
+                        for instance in stack.instances.iter().take(stop) {
+                            if let Some(tone) = instance.live_mask().and_then(|m| m.live_tone())
+                                && !tones.contains(tone)
+                            {
+                                tones.push(*tone);
+                            }
+                        }
+                        tones.into_iter().map(|t| (t, basis.prepare(&t))).collect()
+                    }
+                    None => Vec::new(),
+                };
+            // The selected pass alone and unmasked: the change it makes at full weight.
+            let solo = upstream.instances.get(stop).map(|selected| raw_core::CurveStack {
+                enabled: true,
+                instances: vec![selected.clone()],
+            });
+            // **Each pass's spline is derived here, once**, and not once a sample: asked
+            // of the stack tone by tone, this loop was about 24 ms a frame at two hundred
+            // thousand samples, every frame a point or an opacity was dragged.
+            let above = stack.passes_before(stop);
+            let selected = solo.as_ref().map(|solo| solo.passes_before(1));
+            let mut bins = [0; BINS];
+            let mut bin = Vec::with_capacity(self.curve_samples.len());
+            let mut delta = Vec::with_capacity(self.curve_samples.len());
+            let mut total_ev = 0.0f64;
+            let mut count = 0usize;
+            // What one sample adds, given the tone entering the pass there.
+            let mut take = |entering: f32| {
+                let at = ((raw_core::Curve::to_normalized(entering) * (BINS - 1) as f32) as usize)
+                    .min(BINS - 1);
+                bins[at] += 1;
+                bin.push(at as u8);
+                // A bypassed module changes nothing, and still has tones to average over.
+                let change = match &selected {
+                    Some(selected) if stack.enabled => selected.change_ev(entering),
+                    _ => (entering > 0.0 && entering.is_finite()).then_some(0.0),
+                };
+                match change {
+                    Some(change) => {
+                        total_ev += f64::from(change);
+                        count += 1;
+                        delta.push(change);
+                    }
+                    None => delta.push(f32::NAN),
+                }
+            };
+            // **Two loops and not one with a branch in it.** The unmasked path is the
+            // one it always was, so a stack with no mask above the pass bins exactly as
+            // it did before masks existed; and it is the common one, which measured
+            // nearly twice as slow with the masked case's calls sharing its loop.
+            if masked_above {
+                for (i, &scene) in self.curve_samples.iter().enumerate() {
+                    let at = self.curve_at.get(i).copied().unwrap_or((0.5, 0.5));
+                    take(above.apply_weighted(scene, &|pass, mask| {
+                        weight(pass, mask, at, &|tone| {
+                            prepared
+                                .iter()
+                                .find(|(range, _)| range == tone)
+                                .map_or(1.0, |(_, mask)| mask.at(at.0, at.1))
+                        })
+                    }));
+                }
+            } else {
+                for &scene in &self.curve_samples {
+                    take(above.apply(scene));
+                }
+            }
+            self.curve_serial += 1;
+            self.curve_cache = Some(Entering {
+                upstream,
+                stop,
+                aspect,
+                basis: above_basis,
+                bins,
+                average: (count > 0).then(|| (total_ev / count as f64) as f32),
+                bin,
+                delta,
+                serial: self.curve_serial,
+            });
+        }
+        let entering = self.curve_cache.as_ref().expect("just ensured");
+
+        // ── Inside the selected pass's mask ──────────────────────────────────
+        let Some(mask) = stack.instances.get(stop).and_then(|i| i.live_mask()) else {
+            return CurveGhost {
+                bins: entering.bins,
+                average: entering.average,
+                coverage: None,
+                span: None,
+            };
+        };
+        let tone = mask.live_tone().filter(|tone| !tone.is_identity());
+        let mask_basis = address(tone.is_some());
+        if let Some(made) = &self.curve_masked
+            && made.serial == entering.serial
+            && made.aspect == aspect
+            && made.basis == mask_basis
+            && made.mask == *mask
+        {
+            return made.ghost;
+        }
+        // The tone range's mask, prepared when the range or the basis changed and not
+        // when the shape beside it moved.
+        if let (Some(tone), Some(basis)) = (tone, basis) {
+            let current = self
+                .curve_tone
+                .as_ref()
+                .is_some_and(|(range, at, _)| range == tone && *at == mask_basis);
+            if !current {
+                self.curve_tone = Some((*tone, mask_basis, basis.prepare(tone)));
+            }
+        }
+        let prepared = self
+            .curve_tone
+            .as_ref()
+            .filter(|(range, at, _)| Some(range) == tone && *at == mask_basis && mask_basis != 0)
+            .map(|(_, _, mask)| mask);
+
+        let n = entering.bin.len();
+        let mut weighed = [0.0f64; BINS];
+        let (mut selected, mut counted) = (0.0f64, 0usize);
+        let (mut change, mut change_weight) = (0.0f64, 0.0f64);
+        for i in (0..n).step_by(odd_stride(n, MASK_BUDGET)) {
+            let at = self.curve_at.get(i).copied().unwrap_or((0.5, 0.5));
+            let m = f64::from(weight(stop, mask, at, &|_| {
+                prepared.map_or(1.0, |tone| tone.at(at.0, at.1))
+            }));
+            weighed[usize::from(entering.bin[i])] += m;
+            selected += m;
+            counted += 1;
+            if entering.delta[i].is_finite() {
+                change += m * f64::from(entering.delta[i]);
+                change_weight += m;
+            }
+        }
+        // Counts again, in 256ths of a sample, which is finer than the square root the
+        // editor draws them through can show.
+        let mut bins = [0u32; BINS];
+        for (out, weight) in bins.iter_mut().zip(weighed) {
+            *out = (weight * 256.0).round() as u32;
+        }
+        // The middle nine tenths of what the mask selects, as a span of the axis.
+        let span = (selected > 1.0e-6).then(|| {
+            let cut = |share: f64| {
+                let mut run = 0.0;
+                weighed
+                    .iter()
+                    .position(|weight| {
+                        run += weight;
+                        run >= selected * share
+                    })
+                    .unwrap_or(BINS - 1)
+            };
+            let x = |bin: usize| bin as f32 / (BINS - 1) as f32;
+            (x(cut(0.05)), x(cut(0.95)))
+        });
+        let ghost = CurveGhost {
+            bins,
+            average: (change_weight > 1.0e-6).then(|| (change / change_weight) as f32),
+            coverage: (counted > 0).then(|| (selected / counted as f64) as f32),
+            span,
+        };
+        self.curve_masked = Some(Masked {
+            serial: entering.serial,
+            mask: mask.clone(),
+            aspect,
+            basis: mask_basis,
+            ghost,
+        });
+        ghost
     }
 
-    /// Mean per-pixel EV change of the layer most recently passed to curve_input.
+    /// The ghost's bins for a stack whose masks read nothing from the picture. What the
+    /// tests of the binning itself call.
+    #[cfg(test)]
+    pub fn curve_input(&mut self, stack: &raw_core::CurveStack, stop: usize) -> [u32; BINS] {
+        self.curve_ghost(stack, stop, 1.0, None).bins
+    }
+
+    /// Mean per-pixel EV change of the pass most recently asked about, before its mask.
     /// Nonpositive samples have no finite EV and are excluded.
+    #[cfg(test)]
     pub fn curve_average_ev(&self) -> Option<f32> {
-        self.curve_cache.as_ref().and_then(|entry| entry.3)
+        self.curve_cache.as_ref().and_then(|entry| entry.average)
     }
 
     /// CPU tone-chain estimate `(L*, EV)` from working luminance. This remains for
@@ -539,7 +901,7 @@ fn tonal_bins(
 ) -> ([u32; BINS], [u32; BINS]) {
     let mut bins = [0u32; BINS];
     let mut curve = [0u32; BINS];
-    for_each_tonal_sample(luma, frame, |v| {
+    for_each_tonal_sample(luma, frame, |v, _, _| {
         bins[map.bin(v)] += 1;
         curve[map.curve_bin(v)] += 1;
     });
@@ -561,7 +923,7 @@ pub fn agx_auto_range(
     let map = Mapping::new(params);
     let grey_ev = 0.18f32.log2();
     let mut ev = Vec::with_capacity(BUDGET.min(luma.data.len()));
-    for_each_tonal_sample(luma, frame, |v| {
+    for_each_tonal_sample(luma, frame, |v, _, _| {
         let scene = map.scene(v);
         if scene.is_finite() && scene > 1.0e-10 {
             ev.push(scene.log2() - grey_ev);
@@ -578,15 +940,22 @@ pub fn agx_auto_range(
     Some((black, white))
 }
 
+/// Walk the frame's samples: each value, and where it is on the negative as a
+/// source-normalized pixel center, which is what a mask is laid on.
 fn for_each_tonal_sample(
     luma: &raw_core::LumaImage,
     frame: &raw_core::Frame,
-    mut add: impl FnMut(f32),
+    mut add: impl FnMut(f32, f32, f32),
 ) {
+    let (w, h) = (luma.output_dims.w.max(1), luma.output_dims.h.max(1));
     if frame.is_uncropped() {
         let step = odd_stride(luma.data.len(), BUDGET);
-        for v in luma.data.iter().step_by(step) {
-            add(*v);
+        for (i, v) in luma.data.iter().enumerate().step_by(step) {
+            add(
+                *v,
+                ((i % w) as f32 + 0.5) / w as f32,
+                ((i / w) as f32 + 0.5) / h as f32,
+            );
         }
         return;
     }
@@ -613,7 +982,11 @@ fn for_each_tonal_sample(
             if x < 0 || y < 0 || x >= lw || y >= lh {
                 continue;
             }
-            add(luma.data[y as usize * lw as usize + x as usize]);
+            add(
+                luma.data[y as usize * lw as usize + x as usize],
+                (x as f32 + 0.5) / w as f32,
+                (y as f32 + 0.5) / h as f32,
+            );
         }
     }
 }
@@ -748,7 +1121,7 @@ mod tests {
         let mut stack = raw_core::CurveStack::default();
         stack.add_instance();
         h.curve_input(&stack, 0);
-        h.curve_cache.as_mut().unwrap().2 = [77; BINS];
+        h.curve_cache.as_mut().unwrap().bins = [77; BINS];
         stack.instances[1].curve.add(0.5, 0.7);
         assert_eq!(h.curve_input(&stack, 0), [77; BINS]);
         stack.instances[0].opacity = 0.5;
@@ -831,6 +1204,527 @@ mod tests {
         assert_eq!(histogram.clipped(), (0.5, 0.25));
         assert_eq!(histogram.curve_in[4], 7);
         assert_eq!(histogram.rgb[2][8], 9);
+    }
+
+    /// A sky grad: full at the top of the negative and gone by `y1`.
+    fn sky(y1: f32) -> raw_core::curve::CurveMask {
+        use raw_core::dodgeburn::{Linear, Shape};
+        raw_core::curve::CurveMask::of_shape(Shape::Linear(Linear {
+            x0: 0.5,
+            y0: 0.0,
+            x1: 0.5,
+            y1,
+            feather: 1.0,
+            ev: 0.0,
+        }))
+    }
+
+    /// A hard edge down the middle: the left half of the negative and none of the right.
+    fn left_half() -> raw_core::curve::CurveMask {
+        use raw_core::dodgeburn::{Linear, Shape};
+        raw_core::curve::CurveMask::of_shape(Shape::Linear(Linear {
+            x0: 0.0,
+            y0: 0.5,
+            x1: 1.0,
+            y1: 0.5,
+            feather: 0.0,
+            ev: 0.0,
+        }))
+    }
+
+    /// A histogram over a picture whose left half is `left` and right half `right`, as
+    /// scene values, sampled at every pixel of a 40 by 20 negative.
+    fn two_halves(left: f32, right: f32) -> Histogram {
+        let (w, h) = (40usize, 20usize);
+        let mut histogram = Histogram::default();
+        for i in 0..w * h {
+            let (x, y) = (i % w, i / w);
+            histogram.curve_samples.push(if x < w / 2 { left } else { right });
+            histogram
+                .curve_at
+                .push(((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32));
+        }
+        histogram
+    }
+
+    /// The bin a scene value falls in on the curve's axis.
+    fn bin_of(scene: f32) -> usize {
+        ((raw_core::Curve::to_normalized(scene) * (BINS - 1) as f32) as usize).min(BINS - 1)
+    }
+
+    #[test]
+    fn moving_a_curve_mask_is_not_a_new_mapping_and_does_not_re_run_a_curve() {
+        // The CPU chain reads the curve through a table that ignores where a mask lies,
+        // so a mask handle moving 60 times a second must not rebuild it. The ghost is
+        // taken inside the mask and so does change, but by weighing the samples again:
+        // the tones entering the pass, which cost a curve evaluation each, are kept.
+        let mut a = Params::default();
+        a.curve.add(0.5, 0.65);
+        a.curve.instances[0].mask = Some(sky(0.5));
+        let mut b = a.clone();
+        b.curve.instances[0].mask = Some(sky(0.3));
+        assert!(MappingKey::of(&a) == MappingKey::of(&b));
+
+        let mut h = two_halves(0.18, 0.5);
+        let first = h.curve_ghost(&a.curve, 0, 0.5, None);
+        let built = h.curve_cache.as_ref().map(|c| c.serial);
+        let moved = h.curve_ghost(&b.curve, 0, 0.5, None);
+        assert_eq!(
+            h.curve_cache.as_ref().map(|c| c.serial),
+            built,
+            "the entering tones were rebuilt for a mask that moved"
+        );
+        assert!(
+            moved.coverage < first.coverage,
+            "a shorter grad selects less: {:?} against {:?}",
+            moved.coverage,
+            first.coverage
+        );
+        // Asked again with nothing changed, it is the same answer from the cache.
+        assert_eq!(h.curve_ghost(&b.curve, 0, 0.5, None), moved);
+
+        // But a curve that changed is still a new mapping, and new entering tones.
+        let mut c = a.clone();
+        c.curve.add(0.3, 0.2);
+        assert!(MappingKey::of(&a) != MappingKey::of(&c));
+        h.curve_ghost(&c.curve, 0, 0.5, None);
+        assert_ne!(h.curve_cache.as_ref().map(|c| c.serial), built);
+    }
+
+    #[test]
+    fn the_ghost_and_the_average_are_taken_inside_the_mask() {
+        // Dark on the left, bright on the right, and a curve that lifts the dark tone by
+        // more than the bright one. Masked to the left half, the ghost is the dark tone
+        // alone, the average is the dark tone's change, and half the frame is selected.
+        let (dark, bright) = ((-6.0f32).exp2(), (-1.0f32).exp2());
+        let mut stack = raw_core::CurveStack::default();
+        stack.instances[0]
+            .curve
+            .add(raw_core::Curve::to_normalized(dark), 0.5);
+        let change = |scene: f32| stack.apply_before(1, scene).log2() - scene.log2();
+        let (lift_dark, lift_bright) = (change(dark), change(bright));
+        assert!(lift_dark > lift_bright + 0.5, "{lift_dark} against {lift_bright}");
+
+        let mut h = two_halves(dark, bright);
+        let whole = h.curve_ghost(&stack, 0, 0.5, None);
+        assert_eq!(whole.coverage, None, "no mask, no share of the frame to report");
+        assert_eq!(whole.span, None);
+        assert_eq!(whole.bins[bin_of(dark)], 400);
+        assert_eq!(whole.bins[bin_of(bright)], 400);
+        let mean = whole.average.expect("positive tones");
+        assert!((mean - 0.5 * (lift_dark + lift_bright)).abs() < 1e-4);
+
+        stack.instances[0].mask = Some(left_half());
+        let masked = h.curve_ghost(&stack, 0, 0.5, None);
+        assert!(masked.bins[bin_of(dark)] > 0);
+        assert_eq!(masked.bins[bin_of(bright)], 0, "a tone the mask does not reach");
+        assert!((masked.coverage.unwrap() - 0.5).abs() < 0.03, "{:?}", masked.coverage);
+        assert!((masked.average.unwrap() - lift_dark).abs() < 1e-3);
+        // The axis is shaded where those tones are, and nowhere near the bright one.
+        let (lo, hi) = masked.span.expect("the mask selects something");
+        let at = raw_core::Curve::to_normalized(dark);
+        assert!(lo <= at && at <= hi + 1.0 / BINS as f32, "{lo}..{hi} around {at}");
+        assert!(hi < raw_core::Curve::to_normalized(bright));
+
+        // Switched off, the mask is not there and the ghost is the whole frame's again.
+        stack.instances[0].mask.as_mut().unwrap().enabled = false;
+        assert_eq!(h.curve_ghost(&stack, 0, 0.5, None), whole);
+
+        // A mask that selects nothing has no average to give, and says so.
+        let mut nothing = left_half();
+        nothing.invert = true;
+        let mut nowhere = two_halves(dark, dark);
+        nowhere.curve_at.iter_mut().for_each(|at| at.0 *= 0.4);
+        stack.instances[0].mask = Some(nothing);
+        let empty = nowhere.curve_ghost(&stack, 0, 0.5, None);
+        assert_eq!(empty.average, None);
+        assert_eq!(empty.coverage, Some(0.0));
+        assert_eq!(empty.span, None);
+    }
+
+    #[test]
+    fn a_mask_on_the_pass_above_shapes_what_enters_the_one_below() {
+        // The first pass lifts, on the left half only. What enters the second is lifted
+        // on the left and not on the right, which a ghost that read the first pass at
+        // full strength everywhere used to get wrong.
+        let tone = (-5.0f32).exp2();
+        let mut stack = raw_core::CurveStack::default();
+        stack.instances[0]
+            .curve
+            .add(raw_core::Curve::to_normalized(tone), 0.6);
+        stack.add_instance();
+        let lifted = stack.apply_before(1, tone);
+        assert!(bin_of(lifted) > bin_of(tone) + 4);
+
+        let mut h = two_halves(tone, tone);
+        let everywhere = h.curve_ghost(&stack, 1, 0.5, None);
+        assert_eq!(everywhere.bins[bin_of(lifted)], 800);
+
+        stack.instances[0].mask = Some(left_half());
+        let split = h.curve_ghost(&stack, 1, 0.5, None);
+        assert_eq!(split.bins[bin_of(lifted)], 400, "the left half, lifted");
+        assert_eq!(split.bins[bin_of(tone)], 400, "the right half, as it was");
+        assert_eq!(split.coverage, None, "the pass below has no mask of its own");
+
+        // Moving that mask is a change to what enters, and is rebuilt.
+        let built = h.curve_cache.as_ref().map(|c| c.serial);
+        let mut inverted = left_half();
+        inverted.invert = true;
+        stack.instances[0].mask = Some(inverted);
+        assert_eq!(h.curve_ghost(&stack, 1, 0.5, None), split);
+        assert_ne!(h.curve_cache.as_ref().map(|c| c.serial), built);
+    }
+
+    /// One hard card dab, a rectangle `half` wide either side of `x` and the full height
+    /// of a negative half as tall as it is wide: `paint` adds to a mask, or erases.
+    fn slab(x: f32, half: f32, paint: bool) -> raw_core::dodgeburn::Gesture {
+        raw_core::dodgeburn::Gesture::new(vec![raw_core::dodgeburn::Dab {
+            x,
+            y: 0.5,
+            radius: half,
+            feather: 0.0,
+            opacity: 1.0,
+            ev: if paint { 1.0 } else { -1.0 },
+            aspect: 2.0,
+            angle: 0.0,
+            nib: raw_core::dodgeburn::Nib::Card,
+            falloff: raw_core::dodgeburn::Falloff::Core,
+        }])
+    }
+
+    fn painted(passes: Vec<raw_core::dodgeburn::Gesture>) -> raw_core::curve::CurveMask {
+        raw_core::curve::CurveMask::of_shape(raw_core::dodgeburn::Shape::Brush {
+            nib: raw_core::dodgeburn::Nib::Card,
+            passes,
+        })
+    }
+
+    #[test]
+    fn a_painted_mask_weighs_the_ghost_by_what_has_been_painted() {
+        // Dark on the left, bright on the right, and the left half painted in. The ghost
+        // is the dark tone alone and half the frame is selected, read from the picture
+        // of the strokes and not from the strokes one sample at a time.
+        let (dark, bright) = ((-6.0f32).exp2(), (-1.0f32).exp2());
+        let mut stack = raw_core::CurveStack::default();
+        stack.instances[0].curve.add(0.4, 0.6);
+        stack.instances[0].mask = Some(painted(vec![slab(0.25, 0.25, true)]));
+        let mut h = two_halves(dark, bright);
+        let left = h.curve_ghost(&stack, 0, 0.5, None);
+        assert!(h.curve_cover[0].is_some(), "the painted mask has no picture");
+        assert!((left.coverage.unwrap() - 0.5).abs() < 0.03, "{:?}", left.coverage);
+        assert!(left.bins[bin_of(dark)] > 0);
+        assert_eq!(left.bins[bin_of(bright)], 0);
+
+        // A second stroke, over the right half: the ghost follows it, with both tones,
+        // and the entering tones are not rebuilt for a stroke.
+        let built = h.curve_cache.as_ref().map(|c| c.serial);
+        let both = vec![slab(0.25, 0.25, true), slab(0.75, 0.25, true)];
+        stack.instances[0].mask = Some(painted(both.clone()));
+        let all = h.curve_ghost(&stack, 0, 0.5, None);
+        assert!((all.coverage.unwrap() - 1.0).abs() < 0.03, "{:?}", all.coverage);
+        assert!(all.bins[bin_of(bright)] > 0);
+        assert_eq!(h.curve_cache.as_ref().map(|c| c.serial), built);
+
+        // An eraser pass takes the left back, and an undo of it returns it.
+        let mut erased = both.clone();
+        erased.push(slab(0.25, 0.25, false));
+        stack.instances[0].mask = Some(painted(erased));
+        let right = h.curve_ghost(&stack, 0, 0.5, None);
+        assert!((right.coverage.unwrap() - 0.5).abs() < 0.03, "{:?}", right.coverage);
+        assert_eq!(right.bins[bin_of(dark)], 0);
+        stack.instances[0].mask = Some(painted(both));
+        assert_eq!(h.curve_ghost(&stack, 0, 0.5, None), all);
+
+        // Inverted, it is everywhere but the paint.
+        let mut inverted = painted(vec![slab(0.25, 0.25, true)]);
+        inverted.invert = true;
+        stack.instances[0].mask = Some(inverted);
+        let outside = h.curve_ghost(&stack, 0, 0.5, None);
+        assert_eq!(outside.bins[bin_of(dark)], 0);
+        assert!(outside.bins[bin_of(bright)] > 0);
+
+        // No longer painted, the picture of the strokes is let go.
+        stack.instances[0].mask = Some(left_half());
+        h.curve_ghost(&stack, 0, 0.5, None);
+        assert!(h.curve_cover[0].is_none());
+    }
+
+    #[test]
+    fn a_painted_mask_above_shapes_what_enters_the_pass_below() {
+        let tone = (-5.0f32).exp2();
+        let mut stack = raw_core::CurveStack::default();
+        stack.instances[0]
+            .curve
+            .add(raw_core::Curve::to_normalized(tone), 0.6);
+        stack.add_instance();
+        let lifted = stack.apply_before(1, tone);
+        stack.instances[0].mask = Some(painted(vec![slab(0.25, 0.25, true)]));
+        let mut h = two_halves(tone, tone);
+        let split = h.curve_ghost(&stack, 1, 0.5, None);
+        // The painted half lifted and the other as it was, give or take the one column
+        // of samples the picture's edge falls across.
+        let near = |got: u32, want: u32| got.abs_diff(want) <= 20;
+        assert!(near(split.bins[bin_of(lifted)], 400), "{}", split.bins[bin_of(lifted)]);
+        assert!(near(split.bins[bin_of(tone)], 400), "{}", split.bins[bin_of(tone)]);
+        assert_eq!(split.coverage, None, "the pass below has no mask of its own");
+    }
+
+    #[test]
+    fn a_tone_range_weighs_the_ghost_by_the_picture_and_waits_for_it() {
+        // A tone-only mask on the highlights. The basis says the right half is bright;
+        // with it, the ghost is the right half alone. Until it arrives the range weighs
+        // one, which is the whole frame, and the ghost is taken again when it does.
+        let (w, h) = (40usize, 20usize);
+        let basis = Arc::new(raw_core::Basis {
+            w,
+            h,
+            ev: (0..w * h)
+                .map(|i| if i % w < w / 2 { -3.0 } else { 2.5 })
+                .collect(),
+        });
+        let (dark, bright) = ((-6.0f32).exp2(), (-1.0f32).exp2());
+        let mut stack = raw_core::CurveStack::default();
+        stack.instances[0].curve.add(0.5, 0.6);
+        stack.instances[0].mask = Some(raw_core::curve::CurveMask {
+            enabled: true,
+            shape: None,
+            invert: false,
+            tone: Some(raw_core::ZoneMask {
+                enabled: true,
+                lo: 2.0,
+                hi: 5.0,
+                f_lo: 0.5,
+                edge_aware: false,
+                ..Default::default()
+            }),
+            rule: raw_core::curve::Rule::Intersect,
+        });
+
+        let mut histogram = two_halves(dark, bright);
+        let waiting = histogram.curve_ghost(&stack, 0, 0.5, None);
+        assert_eq!(waiting.coverage, Some(1.0), "no basis yet: the range weighs one");
+        let ready = histogram.curve_ghost(&stack, 0, 0.5, Some(&basis));
+        assert!((ready.coverage.unwrap() - 0.5).abs() < 0.03, "{:?}", ready.coverage);
+        assert_eq!(ready.bins[bin_of(dark)], 0);
+        assert!(ready.bins[bin_of(bright)] > 0);
+
+        // A new basis, as after an exposure change, is weighed again.
+        let darker = Arc::new(raw_core::Basis {
+            w,
+            h,
+            ev: vec![-3.0; w * h],
+        });
+        let gone = histogram.curve_ghost(&stack, 0, 0.5, Some(&darker));
+        assert_eq!(gone.coverage, Some(0.0));
+    }
+
+    /// What the masked ghost costs on a frame where the mask moved, and on one where a
+    /// curve did. A measurement and not an assertion; run it in release:
+    ///
+    /// ```text
+    /// cargo test --release -p raw-app --bin monopro what_the_masked_ghost_costs -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn what_the_masked_ghost_costs() {
+        use raw_core::dodgeburn::{Radial, Shape};
+        let (w, h) = (500usize, 400usize);
+        let mut histogram = Histogram::default();
+        for i in 0..w * h {
+            let (x, y) = (i % w, i / w);
+            histogram
+                .curve_samples
+                .push((-8.0 + 8.0 * x as f32 / w as f32).exp2());
+            histogram
+                .curve_at
+                .push(((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32));
+        }
+        let basis = Arc::new(raw_core::Basis {
+            w: 480,
+            h: 384,
+            ev: (0..480 * 384).map(|i| -4.0 + 8.0 * (i % 480) as f32 / 480.0).collect(),
+        });
+        let spot = |cx: f32| {
+            Shape::Radial(Radial {
+                cx,
+                cy: 0.5,
+                inner: 0.05,
+                outer: 0.3,
+                aspect: 0.7,
+                angle: 20.0,
+                feather: 0.8,
+                invert: false,
+                ev: 0.0,
+            })
+        };
+        let mut stack = raw_core::CurveStack::default();
+        stack.instances[0].curve.add(0.4, 0.55);
+        stack.instances[0].mask = Some(raw_core::curve::CurveMask {
+            tone: Some(raw_core::ZoneMask {
+                enabled: true,
+                lo: -1.0,
+                hi: 2.0,
+                ..Default::default()
+            }),
+            ..raw_core::curve::CurveMask::of_shape(spot(0.5))
+        });
+        let rounds = 20u32;
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds);
+        println!("  {} samples                          ms/frame", w * h);
+        histogram.curve_ghost(&stack, 0, 0.8, Some(&basis));
+
+        let t = Instant::now();
+        for i in 0..rounds {
+            stack.instances[0].mask.as_mut().unwrap().shape = Some(spot(0.3 + 0.01 * i as f32));
+            histogram.curve_ghost(&stack, 0, 0.8, Some(&basis));
+        }
+        println!("  a shape handle dragged              {:9.2}", ms(t));
+        let t = Instant::now();
+        for i in 0..rounds {
+            let tone = stack.instances[0].mask.as_mut().unwrap().tone.as_mut().unwrap();
+            tone.hi = 1.0 + 0.02 * i as f32;
+            histogram.curve_ghost(&stack, 0, 0.8, Some(&basis));
+        }
+        println!("  a tone ruler handle dragged         {:9.2}", ms(t));
+        let t = Instant::now();
+        for i in 0..rounds {
+            stack.instances[0].opacity = 1.0 - 0.01 * i as f32;
+            histogram.curve_ghost(&stack, 0, 0.8, Some(&basis));
+        }
+        println!("  a curve or an opacity changed       {:9.2}", ms(t));
+        let t = Instant::now();
+        for _ in 0..rounds {
+            histogram.curve_ghost(&stack, 0, 0.8, Some(&basis));
+        }
+        println!("  nothing changed                     {:9.2}", ms(t));
+
+        let mut plain = stack.clone();
+        plain.instances[0].mask = None;
+        let t = Instant::now();
+        for i in 0..rounds {
+            plain.instances[0].opacity = 1.0 - 0.01 * i as f32;
+            histogram.curve_ghost(&plain, 0, 0.8, None);
+        }
+        println!("  the same, on an unmasked curve      {:9.2}", ms(t));
+
+        // A painted mask that has been worked on: two thousand dabs in forty passes.
+        let dab = |i: usize| raw_core::dodgeburn::Dab {
+            x: 0.05 + 0.9 * ((i * 37) % 1000) as f32 / 1000.0,
+            y: 0.05 + 0.9 * ((i * 91) % 1000) as f32 / 1000.0,
+            radius: 0.06,
+            feather: 0.4,
+            opacity: 1.0,
+            ev: 1.0,
+            ..raw_core::dodgeburn::Dab::ROUND
+        };
+        let mut passes: Vec<raw_core::dodgeburn::Gesture> = (0..40)
+            .map(|p| raw_core::dodgeburn::Gesture::new((0..50).map(|i| dab(p * 50 + i)).collect()))
+            .collect();
+        let mask = |passes: &[raw_core::dodgeburn::Gesture]| {
+            raw_core::curve::CurveMask::of_shape(Shape::Brush {
+                nib: raw_core::dodgeburn::Nib::Round,
+                passes: passes.to_vec(),
+            })
+        };
+        stack.instances[0].opacity = 1.0;
+        stack.instances[0].mask = Some(mask(&passes));
+        let t = Instant::now();
+        histogram.curve_ghost(&stack, 0, 0.8, None);
+        println!(
+            "  a painted mask of 2000 dabs, first   {:9.2}",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        // A stroke in progress: a new pass, growing two dabs a frame.
+        passes.push(raw_core::dodgeburn::Gesture::new(vec![dab(5000)]));
+        let t = Instant::now();
+        for i in 0..rounds as usize {
+            let stroke = passes.last_mut().unwrap().dabs_mut();
+            stroke.push(dab(5001 + 2 * i));
+            stroke.push(dab(5002 + 2 * i));
+            stack.instances[0].mask = Some(mask(&passes));
+            histogram.curve_ghost(&stack, 0, 0.8, None);
+        }
+        println!("  a stroke on it, two dabs a frame    {:9.2}", ms(t));
+        // What the same frame would cost asking the strokes themselves.
+        let shape = Shape::Brush {
+            nib: raw_core::dodgeburn::Nib::Round,
+            passes: passes.clone(),
+        };
+        let t = Instant::now();
+        let mut sum = 0.0f32;
+        for i in (0..histogram.curve_at.len()).step_by(odd_stride(w * h, MASK_BUDGET)) {
+            let (x, y) = histogram.curve_at[i];
+            sum += shape.painted_at(x, y, 0.8);
+        }
+        std::hint::black_box(sum);
+        println!(
+            "  the same frame, dab by dab           {:9.2}",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    #[test]
+    fn the_readout_says_when_the_average_is_inside_a_mask() {
+        let ghost = |average, coverage| CurveGhost {
+            bins: [0; BINS],
+            average,
+            coverage,
+            span: None,
+        };
+        assert_eq!(ghost(Some(-0.42), None).readout(), "Average: 0.42 EV darker");
+        assert_eq!(ghost(Some(0.001), None).readout(), "Average: unchanged");
+        assert_eq!(ghost(None, None).readout(), "Average: —");
+        assert_eq!(
+            ghost(Some(-0.42), Some(0.38)).readout(),
+            "Average: 0.42 EV darker inside the mask (38% of the frame)"
+        );
+        assert_eq!(
+            ghost(Some(0.3), Some(0.004)).readout(),
+            "Average: 0.30 EV lighter inside the mask (<1% of the frame)"
+        );
+        assert_eq!(
+            ghost(None, Some(0.0)).readout(),
+            "Average: — inside the mask (0% of the frame)"
+        );
+    }
+
+    #[test]
+    fn every_sample_knows_where_on_the_negative_it_is() {
+        // Uncropped, the walk is over the stored buffer and a sample's place is its
+        // pixel's center. Cropped and turned, it is the same pixel the value came from.
+        let (w, h) = (8usize, 6usize);
+        let data: Vec<f32> = (0..w * h).map(|i| i as f32).collect();
+        let (luma, frame) = upright(&data, w);
+        let mut seen = 0;
+        for_each_tonal_sample(&luma, &frame, |v, x, y| {
+            let i = v as usize;
+            assert!((x - ((i % w) as f32 + 0.5) / w as f32).abs() < 1e-6);
+            assert!((y - ((i / w) as f32 + 0.5) / h as f32).abs() < 1e-6);
+            seen += 1;
+        });
+        assert_eq!(seen, w * h);
+
+        let turned = raw_core::Frame::resolve(
+            luma.output_dims,
+            raw_core::Orientation::Rotate90,
+            &raw_core::CompositionParams {
+                crop: raw_core::composition::Rect {
+                    x: 0.25,
+                    y: 0.25,
+                    w: 0.5,
+                    h: 0.5,
+                },
+                ..Default::default()
+            },
+        );
+        let mut seen = 0;
+        for_each_tonal_sample(&luma, &turned, |v, x, y| {
+            let i = v as usize;
+            assert!((x - ((i % w) as f32 + 0.5) / w as f32).abs() < 1e-6, "{i}: {x}");
+            assert!((y - ((i / w) as f32 + 0.5) / h as f32).abs() < 1e-6, "{i}: {y}");
+            seen += 1;
+        });
+        assert!(seen > 0 && seen < w * h);
     }
 
     #[test]

@@ -115,7 +115,12 @@ pub struct Plain<'a> {
     open_on_start: bool,
     /// Open (`Some(true)`) or fold (`Some(false)`) the section on this frame only.
     force: Option<bool>,
+    /// A button at the header's right end, as `(label, tip)`. See [`Plain::action`].
+    action: Option<(&'a str, &'a str)>,
 }
+
+/// The space between two module cards, and between a tab strip and the first card.
+pub const MODULE_GAP: f32 = 7.0;
 
 /// A module whose dot is a switch, reached only through [`Module::switch`].
 #[must_use = "the clicks are reported by `show`; drop them and the header is dead"]
@@ -220,7 +225,7 @@ impl<'a> Module<'a> {
             self.name,
             Some(self.modified),
             None,
-            self.resettable.unwrap_or(self.modified),
+            self.resettable.unwrap_or(self.modified).then_some(MODULE_RESET),
             self.open_on_start,
             None,
             ui,
@@ -235,7 +240,16 @@ impl<'a> Plain<'a> {
             name,
             open_on_start: true,
             force: None,
+            action: None,
         }
+    }
+
+    /// Put a button at the right end of the header, where a module's own reset sits,
+    /// for an action that belongs to the whole panel — Develop's "reset all" on
+    /// TONAL DISTRIBUTION. Read the click from [`Self::show_action`].
+    pub fn action(mut self, label: &'a str, tip: &'a str) -> Self {
+        self.action = Some((label, tip));
+        self
     }
 
     pub fn open_on_start(mut self, yes: bool) -> Self {
@@ -265,12 +279,28 @@ impl<'a> Plain<'a> {
             self.name,
             None,
             None,
-            false,
+            None,
             self.open_on_start,
             self.force,
             ui,
             body,
         );
+    }
+
+    /// [`Self::show`], reporting whether the header's [`Self::action`] was clicked.
+    #[must_use = "the action's click is reported here; drop it and the button is dead"]
+    pub fn show_action(self, ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) -> bool {
+        draw(
+            self.name,
+            None,
+            None,
+            self.action,
+            self.open_on_start,
+            self.force,
+            ui,
+            body,
+        )
+        .reset
     }
 }
 
@@ -280,7 +310,10 @@ impl<'a> Switchable<'a> {
             self.module.name,
             Some(self.module.modified),
             Some(self.enabled),
-            self.module.resettable.unwrap_or(self.module.modified),
+            self.module
+                .resettable
+                .unwrap_or(self.module.modified)
+                .then_some(MODULE_RESET),
             self.module.open_on_start,
             None,
             ui,
@@ -329,8 +362,13 @@ fn opened_for_a_test(_: &str) -> bool {
     false
 }
 
+/// A module's own reset button, as `(label, tip)`.
+const MODULE_RESET: (&str, &str) = ("reset", "back to default");
+
 /// All three `show`s. `modified` is `None` for a plain section — no dot and no
-/// reset — and `enabled` is `None` for a module without a switch.
+/// reset — and `enabled` is `None` for a module without a switch. `reset` is the
+/// header's right-end button, as `(label, tip)`: a module's own reset, or a panel's
+/// action on a [`Plain`] section. Its click comes back as `Clicked::reset`.
 #[expect(
     clippy::too_many_arguments,
     reason = "the one drawing routine behind all three module `show`s; each flag is one of their differences"
@@ -339,7 +377,7 @@ fn draw(
     name: &str,
     modified: Option<bool>,
     enabled: Option<bool>,
-    resettable: bool,
+    reset: Option<(&str, &str)>,
     open_on_start: bool,
     force: Option<bool>,
     ui: &mut egui::Ui,
@@ -353,9 +391,8 @@ fn draw(
     // the app is running without allowing yesterday's working arrangement to
     // override the requested startup stack.
     let id = ui.make_persistent_id(("module", name));
-    let mut open = ui
-        .data_mut(|d| d.get_temp::<bool>(id))
-        .unwrap_or(open_on_start);
+    let was_open = ui.data_mut(|d| d.get_temp::<bool>(id));
+    let mut open = was_open.unwrap_or(open_on_start);
     if let Some(forced) = force {
         open = forced;
     }
@@ -367,6 +404,7 @@ fn draw(
         bypass: false,
         reset: false,
     };
+    let top = ui.cursor().top();
     card(ui, |ui| {
         ui.horizontal(|ui| {
             match enabled {
@@ -401,9 +439,9 @@ fn draw(
             if title.clicked() {
                 open = !open;
             }
-            if resettable {
+            if let Some((label, tip)) = reset {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    out.reset = theme::reset_button(ui, "reset", "back to default").clicked();
+                    out.reset = theme::reset_button(ui, label, tip).clicked();
                 });
             }
         });
@@ -413,8 +451,22 @@ fn draw(
         }
     });
 
+    // **Opened, so brought into view.** A module that opens near the bottom of the panel
+    // used to unfold below the fold, out of sight of the click that opened it. On the
+    // frame it goes from closed to open — a click on its name, or a tool revealing it —
+    // the panel glides just far enough to show its bottom edge, and never so far that
+    // its name leaves the top: egui's unaligned scroll is exactly that rule. Not on a
+    // module's first frame, which is the panel being built rather than anything opening.
+    if was_open == Some(false) && open {
+        let rect = Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+        ui.scroll_to_rect_animation(
+            rect,
+            None,
+            egui::style::ScrollAnimation::new(1600.0, egui::Rangef::new(0.12, 0.25)),
+        );
+    }
     ui.data_mut(|d| d.insert_temp(id, open));
-    ui.add_space(7.0);
+    ui.add_space(MODULE_GAP);
     out
 }
 
@@ -512,6 +564,22 @@ pub struct Row<'a> {
     decimals: usize,
     suffix: &'a str,
     tip: &'a str,
+    /// The track's response, for a range symmetric about zero: the value is
+    /// `reach · u · |u|^(p-1)` for a handle at `u` in `-1..=1`. See [`Row::shape`].
+    shape: Option<f32>,
+    readout: Option<Readout<'a>>,
+}
+
+/// A number field that shows and takes the value in other units than it is stored in —
+/// Black corr.'s L\* for a value kept in linear light.
+///
+/// `show` and `take` are each other's inverse. Typed and dragged numbers are clamped to
+/// `range` in the shown units; **the stored value is never clamped by being drawn**, so
+/// a sidecar value beyond today's range survives until it is edited.
+pub struct Readout<'a> {
+    pub show: Box<dyn Fn(f32) -> f32 + 'a>,
+    pub take: Box<dyn Fn(f32) -> f32 + 'a>,
+    pub range: std::ops::RangeInclusive<f32>,
 }
 
 impl<'a> Row<'a> {
@@ -571,6 +639,50 @@ impl<'a> Row<'a> {
             decimals: 2,
             suffix: "",
             tip: "",
+            shape: None,
+            readout: None,
+        }
+    }
+
+    /// Give the track a curved response, fine near zero and coarse at the ends: `2.0`
+    /// puts a quarter of the reach at the halfway mark. For a range symmetric about
+    /// zero, where the useful settings crowd the middle — Black corr.
+    pub fn shape(mut self, power: f32) -> Self {
+        debug_assert!(
+            (*self.range.start() + *self.range.end()).abs() < 1e-6,
+            "a shaped track needs a range symmetric about zero"
+        );
+        self.shape = Some(power);
+        self
+    }
+
+    /// Show and take the number in other units. See [`Readout`].
+    pub fn readout(mut self, readout: Readout<'a>) -> Self {
+        self.readout = Some(readout);
+        self
+    }
+
+    /// Where on the track, `0..=1`, a value sits.
+    fn track_of(&self, v: f32) -> f32 {
+        let (lo, hi) = (*self.range.start(), *self.range.end());
+        match self.shape {
+            None => ((v - lo) / (hi - lo).max(1e-9)).clamp(0.0, 1.0),
+            Some(p) => {
+                let u = (v / hi.max(1e-9)).clamp(-1.0, 1.0);
+                (u.signum() * u.abs().powf(1.0 / p) + 1.0) * 0.5
+            }
+        }
+    }
+
+    /// The value at a place on the track, `0..=1`.
+    fn value_at(&self, t: f32) -> f32 {
+        let (lo, hi) = (*self.range.start(), *self.range.end());
+        match self.shape {
+            None => lo + t * (hi - lo),
+            Some(p) => {
+                let u = t * 2.0 - 1.0;
+                u.signum() * u.abs().powf(p) * hi
+            }
         }
     }
 
@@ -638,10 +750,29 @@ impl<'a> Row<'a> {
                     egui::FontId::new(theme::size::SLIDER, egui::FontFamily::Proportional),
                 );
                 ui.style_mut().drag_value_text_style = egui::TextStyle::Button;
-                ui.add_sized(
-                    [Self::VALUE_W, h],
-                    slider_number(self.value, lo..=hi, self.decimals).suffix(self.suffix),
-                );
+                match &self.readout {
+                    None => {
+                        ui.add_sized(
+                            [Self::VALUE_W, h],
+                            slider_number(self.value, lo..=hi, self.decimals)
+                                .suffix(self.suffix),
+                        );
+                    }
+                    Some(readout) => {
+                        let (rlo, rhi) = (*readout.range.start(), *readout.range.end());
+                        let value = &mut *self.value;
+                        let field = egui::DragValue::from_get_set(|new| {
+                            if let Some(new) = new {
+                                *value = (readout.take)((new as f32).clamp(rlo, rhi));
+                            }
+                            f64::from((readout.show)(*value))
+                        })
+                        .speed(f64::from(rhi - rlo) / 300.0)
+                        .fixed_decimals(self.decimals)
+                        .suffix(self.suffix);
+                        ui.add_sized([Self::VALUE_W, h], field);
+                    }
+                }
             });
 
             // Whatever is left, capped. Both columns before it are exact now, so every
@@ -652,7 +783,7 @@ impl<'a> Row<'a> {
             // the zone mask.
             let w = ui.available_width().clamp(24.0, Self::TRACK_W);
             let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click_and_drag());
-            let t = ((*self.value - lo) / (hi - lo).max(1e-9)).clamp(0.0, 1.0);
+            let t = self.track_of(*self.value);
             // Half the handle at each end, so its edge never leaves the track.
             let (x0, x1) = (rect.left() + HANDLE_W * 0.5, rect.right() - HANDLE_W * 0.5);
             let y = rect.center().y;
@@ -661,7 +792,7 @@ impl<'a> Row<'a> {
                 && let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos())
             {
                 let u = ((p.x - x0) / (x1 - x0).max(1e-9)).clamp(0.0, 1.0);
-                *self.value = lo + u * (hi - lo);
+                *self.value = self.value_at(u);
             }
             if resp.double_clicked() {
                 *self.value = self.default;
@@ -1045,6 +1176,24 @@ impl<'a> Slider<'a> {
         self
     }
 
+    /// See [`Row::shape`].
+    pub fn shape(mut self, power: f32) -> Self {
+        self.0 = self.0.shape(power);
+        self
+    }
+
+    /// See [`Readout`].
+    pub fn readout(mut self, readout: Readout<'a>) -> Self {
+        self.0 = self.0.readout(readout);
+        self
+    }
+
+    /// See [`Row::tip`].
+    pub fn tip(mut self, s: &'a str) -> Self {
+        self.0 = self.0.tip(s);
+        self
+    }
+
     /// Returns true if the value changed for any reason, including the reset.
     pub fn show(self, ui: &mut egui::Ui) -> bool {
         self.0.show(ui)
@@ -1085,6 +1234,8 @@ pub fn curve_editor(
     drag: &mut Option<usize>,
     selected: &mut Option<usize>,
     ghost: Option<&[u32]>,
+    masked: Option<(f32, f32)>,
+    hover: Option<f32>,
 ) -> bool {
     const HIT: f32 = 9.0;
     let width = ui.available_width();
@@ -1114,6 +1265,28 @@ pub fn curve_editor(
     };
 
     painter.rect_filled(rect, 2.0, Color32::from_gray(20));
+
+    // **The tones the instance's mask selects, shaded on the axis.** A faint ruby wash
+    // over the span holding most of what the mask lets the curve reach, with a rule
+    // along its foot: where on this graph a point will actually move the picture. It is
+    // taken from the masked ghost itself and not from the tone ruler's numbers, which
+    // are in another unit (the picture before Dodge & Burn, read regionally), so it is
+    // right for a shape as well as a tone.
+    if let Some((lo, hi)) = masked {
+        let (x0, x1) = (
+            rect.left() + lo * rect.width(),
+            rect.left() + hi.max(lo) * rect.width(),
+        );
+        painter.rect_filled(
+            Rect::from_min_max(pos2(x0, rect.top()), pos2(x1.max(x0 + 1.0), rect.bottom())),
+            0.0,
+            RUBY.gamma_multiply(0.07),
+        );
+        painter.line_segment(
+            [pos2(x0, rect.bottom() - 1.0), pos2(x1.max(x0 + 1.0), rect.bottom() - 1.0)],
+            Stroke::new(2.0, RUBY.gamma_multiply(0.75)),
+        );
+    }
 
     // Match Tonal Distribution's filled outline, but keep the bins on the
     // curve's input EV axis so control points still target the correct tones.
@@ -1146,7 +1319,7 @@ pub fn curve_editor(
         painter.add(egui::Shape::line(points, Stroke::new(1.0, color)));
     }
     resp.clone().on_hover_text(crate::theme::tip(
-        "Background: sampled input tones on the curve's −10 to +2 EV axis. Height uses square-root scaling. Tonal Distribution shows output tones after the display transform. Contrast Mask is not included.",
+        "Background: sampled input tones on the curve's −10 to +2 EV axis, taken inside this instance's mask when it has one; the red band marks where most of them lie. Height uses square-root scaling. Tonal Distribution shows output tones after the display transform. Contrast Mask is not included.",
     ));
 
     // Independent spacing avoids stretched cells in a wide editor. Positions
@@ -1306,6 +1479,21 @@ pub fn curve_editor(
         line,
         Stroke::new(1.5, Color32::from_gray(215)),
     ));
+
+    // **Where the point sampler would put a point**, for the pixel under the pointer
+    // on the picture: a hollow ring on the curve, so it reads as "here, if you click"
+    // beside the solid points already placed, and a faint rule down to the axis to say
+    // which input it is. Drawn under the points, which it must not hide.
+    if let Some(x) = hover.filter(|x| x.is_finite()) {
+        let x = x.clamp(0.0, 1.0);
+        let at = to_screen([x, curve.eval(x)]);
+        painter.line_segment(
+            [pos2(at.x, rect.bottom()), pos2(at.x, at.y + 5.0)],
+            Stroke::new(1.0, Color32::from_gray(110)),
+        );
+        painter.circle_stroke(at, 5.0, Stroke::new(3.0, Color32::from_gray(20)));
+        painter.circle_stroke(at, 5.0, Stroke::new(1.5, crate::theme::BRIGHT));
+    }
 
     for (i, p) in curve.points().iter().enumerate() {
         let c = to_screen(*p);
@@ -1701,6 +1889,188 @@ fn handle(painter: &egui::Painter, at: Pos2, ink: Color32, hot: bool) {
     ));
 }
 
+/// A tonal range's controls, under a heading the caller draws: the ruler with its ghost
+/// histogram, the presets and TK9's ladder, `Inv`, the eyedropper, and the "Edge and
+/// diffusion" group.
+///
+/// **One set of controls for both modules that have a tonal range**, Dodge & Burn's layers
+/// and a Curve instance's mask, so the two read alike and one fix is a fix to both. What
+/// differs is only the heading above it, which the caller owns, and what the range is
+/// *for*. `more_id` keys the disclosure for "Edge and diffusion", which each caller makes
+/// from its own row so two ranges on screen do not open together.
+///
+/// Choosing a preset or a step of the ladder switches the range on, as editing the ruler
+/// does: asking for a range is asking to see it work.
+///
+/// **The ladder sets the trapezoid and is not a separate kind of mask.** See
+/// [`ZoneMask::LADDER`] for what each step approximates and why it is no more than that.
+///
+/// **The eyedropper ends the presets row**, at its right: it is one more way of saying
+/// where the range is, beside the others, and inside this function it is in the same
+/// place in both modules. `sampling` is whether it is armed on *this* range, and the
+/// return value is what was asked of it; arming a tool on the picture is the caller's,
+/// which owns the mode.
+///
+/// **`Island` ends the row under it**, because the two are one gesture: the island is
+/// where the eyedropper's clicks are allowed to reach from. Switching it on with no
+/// seed yet asks for the eyedropper, since a seed is placed by clicking the picture and
+/// an island with none limits nothing.
+#[must_use = "what the eyedropper was asked is reported here; drop it and the button is dead"]
+pub fn tone_range(
+    ui: &mut egui::Ui,
+    icons: &crate::icons::Icons,
+    m: &mut ZoneMask,
+    hist: &[f32],
+    drag: &mut Option<ZoneGrab>,
+    sampling: bool,
+    more_id: egui::Id,
+) -> Option<SamplerAsk> {
+    zone_ruler(ui, m, hist, drag);
+    let mut sample = None;
+    // Shadows, Midtones, Highlights, the one switch the range has of its own, and the
+    // eyedropper.
+    ui.horizontal(|ui| {
+        for (label, lo, hi, f_lo, f_hi) in ZoneMask::PRESETS {
+            let on = m.enabled && (m.lo - lo).abs() < 1e-4 && (m.hi - hi).abs() < 1e-4;
+            if theme::bracket(ui, label, on, theme::size::CAPTION).clicked() {
+                (m.lo, m.hi, m.f_lo, m.f_hi) = (lo, hi, f_lo, f_hi);
+                m.enabled = true;
+            }
+        }
+        if theme::bracket(ui, "Inv", m.invert, theme::size::CAPTION).clicked() {
+            m.invert = !m.invert;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if crate::icons::toggle(
+                ui,
+                icons,
+                "eyedropper",
+                "⌖",
+                sampling,
+                crate::icons::BOX,
+            )
+            .on_hover_text(theme::tip(
+                "Sample the range from the picture: click a tone to set the range around \
+                 it, drag a box to span the tones inside it, and hold ⇧ to add to the \
+                 range instead. Return keeps it, Esc puts it back as it was.",
+            ))
+            .clicked()
+            {
+                sample = Some(SamplerAsk::Toggle);
+            }
+        });
+    });
+    // TK9's Lights and Darks, one chip each as `L1` to `L4` and `D1` to `D4`: the whole
+    // name in a chip would be eight words across a panel that is not that wide, so the
+    // chip is the family and the step and the name is in its tooltip.
+    ui.horizontal(|ui| {
+        for (i, (name, lo, hi, f_lo, f_hi)) in ZoneMask::LADDER.into_iter().enumerate() {
+            if i == 4 {
+                ui.add_space(8.0);
+            }
+            let chip = format!("{}{}", &name[..1], &name[name.len() - 1..]);
+            let on = m.enabled
+                && [(m.lo, lo), (m.hi, hi), (m.f_lo, f_lo), (m.f_hi, f_hi)]
+                    .iter()
+                    .all(|(a, b)| (a - b).abs() < 1e-4);
+            if theme::bracket(ui, &chip, on, theme::size::CAPTION)
+                .on_hover_text(theme::tip(format!(
+                    "{name}: a soft mask with no flat top, stiffer with each step, \
+                     approximating TK9's luminosity mask of that name."
+                )))
+                .clicked()
+            {
+                (m.lo, m.hi, m.f_lo, m.f_hi) = (lo, hi, f_lo, f_hi);
+                m.enabled = true;
+            }
+        }
+        // The island, with how many seeds it has once it has any: a count is the only
+        // sign in the panel that a click on the picture took.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let seeds = m.island.seeds().len();
+            let label = if seeds > 0 {
+                format!("Island {seeds}")
+            } else {
+                "Island".to_owned()
+            };
+            if theme::bracket(ui, &label, m.island.enabled, theme::size::CAPTION)
+                .on_hover_text(theme::tip(
+                    "Island: select only the tones connected to where you click, not \
+                     every part of the picture that has them. Click the picture with \
+                     the eyedropper to place a seed, ⇧-click to add another, ⌥-click a \
+                     seed to remove it.",
+                ))
+                .clicked()
+            {
+                m.island.enabled = !m.island.enabled;
+                if m.island.enabled {
+                    // An island is this range's, so asking for one is asking for the
+                    // range; and with no seed yet, for the tool that places one.
+                    m.enabled = true;
+                    if seeds == 0 {
+                        sample = Some(SamplerAsk::Arm);
+                    }
+                }
+            }
+        });
+    });
+
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), more_id, false)
+        .show_header(ui, |ui| {
+            ui.label(theme::caption("Edge and diffusion"));
+        })
+        // **`body_unindented`.** The default body indents, and an indented row is handed less
+        // width than its neighbors — so Diffusion, Region and Edge got a shorter track
+        // starting further right than the rows directly above them. The disclosure triangle
+        // already says these three belong to the section; the indent was saying it a second
+        // time and paying for it in the one alignment the panel is built on.
+        .body_unindented(|ui| {
+            Row::new(&mut m.blur, 0.0, ZoneMask::BLUR_RANGE, "Diffusion")
+                .decimals(3)
+                .show(ui);
+            ui.horizontal(|ui| {
+                if theme::bracket(ui, "Edge-aware", m.edge_aware, theme::size::CAPTION)
+                    .on_hover_text(theme::tip(
+                        "Reads exposure REGIONALLY, so a zone selects a coherent area \
+                         with clean edges — a hand under the enlarger — instead of a \
+                         scatter of pixels of the right brightness.",
+                    ))
+                    .clicked()
+                {
+                    m.edge_aware = !m.edge_aware;
+                }
+            });
+            ui.add_enabled_ui(m.edge_aware, |ui| {
+                Row::new(
+                    &mut m.region,
+                    ZoneMask::default().region,
+                    ZoneMask::REGION_RANGE,
+                    "Region",
+                )
+                .decimals(3)
+                .show(ui);
+                Row::new(
+                    &mut m.edge,
+                    ZoneMask::default().edge,
+                    ZoneMask::EDGE_RANGE,
+                    "Edge",
+                )
+                .suffix(" EV")
+                .show(ui);
+            });
+        });
+    sample
+}
+
+/// What a tone range's controls asked of the eyedropper this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplerAsk {
+    /// Its own button: arm it, or, armed, put it away keeping what was sampled.
+    Toggle,
+    /// Arm it if it is not armed already: an island was switched on with no seed.
+    Arm,
+}
+
 /// What a zone-ruler drag has hold of. Spans frames, like `crop::Grab`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ZoneGrab {
@@ -1835,6 +2205,49 @@ pub enum BadgeClick {
     Dismiss,
 }
 
+/// A picture's star rating and label color, as the title strip shows them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Marks {
+    /// 0 is unrated.
+    pub stars: i32,
+    /// `None` for no label, and for a label word another application wrote, which
+    /// has no color here; see `theme::label_colour`.
+    pub label: Option<Color32>,
+}
+
+/// The title strip's stars: a little under the readout's size, since they hang off the
+/// end of a line of type and are not the grid's control.
+const MARK_STAR: f32 = crate::theme::size::BODY - 2.0;
+/// The room between two stars. Set as one string the face packs them point to point,
+/// and five read as one jagged bar rather than a count.
+const MARK_STAR_GAP: f32 = 2.0;
+/// The label dot's radius, a point under the grid's, to sit with the smaller stars.
+const MARK_DOT: f32 = 4.0;
+
+/// The stars, then the dot, from `left` along the strip's middle. Only what the
+/// picture carries — a readout, not the grid's control, so no hollow stars.
+fn paint_marks(painter: &egui::Painter, left: Pos2, marks: Marks) {
+    let mut x = left.x;
+    let stars = marks.stars.clamp(0, 5) as usize;
+    if stars > 0 {
+        let font = egui::FontId::proportional(MARK_STAR);
+        for _ in 0..stars {
+            let shown = painter.text(
+                pos2(x, left.y),
+                egui::Align2::LEFT_CENTER,
+                "★",
+                font.clone(),
+                crate::theme::AMBER,
+            );
+            x = shown.right() + MARK_STAR_GAP;
+        }
+        x += 8.0 - MARK_STAR_GAP;
+    }
+    if let Some(c) = marks.label {
+        painter.circle_filled(pos2(x + MARK_DOT, left.y), MARK_DOT, c);
+    }
+}
+
 /// Paint the window's app strip on macOS and its mode/status strip elsewhere.
 ///
 /// The window is created with `fullsize_content_view` and a hidden titlebar so the
@@ -1847,9 +2260,13 @@ pub enum BadgeClick {
 ///
 /// Its resting state is the exposure — ISO, aperture, shutter, focal length — set
 /// in ruby because it is the only text in the chrome that describes the photograph
-/// rather than the program. Star ratings (`⌘1`–`⌘5`) and colour labels (`⇧1`–`⇧5`)
-/// are specified to report through here too, transiently, when they exist; the
-/// hotkey table has them bound and pending.
+/// rather than the program.
+///
+/// `marks` is the picture's star rating and label color, drawn **after** the exposure
+/// rather than inside it: amber stars, as the grid draws them, then the label's dot.
+/// The maintainer's placement, and the exposure stays centered on the window
+/// whatever follows it — the marks hang off its right end, so rating a picture never
+/// moves the line you read it by. Nothing is drawn for an unrated, unlabeled picture.
 ///
 /// The undo/redo depth used to sit at the right of this strip. It came out because
 /// it is *state*, not identity — a number that changes as you work and tells you
@@ -1870,6 +2287,7 @@ pub fn title_strip(
     icons: &crate::icons::Icons,
     title: &str,
     centre: &str,
+    marks: Marks,
     update: Option<&UpdateBadge>,
     home_on: bool,
 ) -> StripClicks {
@@ -1884,18 +2302,22 @@ pub fn title_strip(
         egui::FontId::proportional(crate::theme::size::TITLE),
         Color32::from_gray(190),
     );
+    // Where the marks start: the readout's right end, or the middle if there is none.
+    let mut marks_x = rect.center().x;
     if !centre.is_empty() {
         // Centred on the *window*, not on the space left over after the title —
         // the traffic-light inset is asymmetric, so centring in the remainder
         // would put it visibly off-centre against the image below it.
-        painter.text(
+        let shown = painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             centre,
             egui::FontId::monospace(crate::theme::size::BODY),
             RUBY,
         );
+        marks_x = shown.right() + 14.0;
     }
+    paint_marks(&painter, pos2(marks_x, rect.center().y), marks);
 
     let home_box = crate::icons::BIG;
     let home_rect = Rect::from_min_size(
@@ -2405,7 +2827,7 @@ mod tests {
                 if pass == 0 {
                     ui.memory_mut(|m| m.request_focus(id));
                 }
-                curve_editor(ui, &mut curve, &mut drag, &mut selected, None);
+                curve_editor(ui, &mut curve, &mut drag, &mut selected, None, None, None);
                 let _ = ui.button("focusable control below");
             });
             assert_eq!(
@@ -2446,7 +2868,7 @@ mod tests {
                     ui.cursor().min,
                     egui::vec2(width, 220.0),
                 ));
-                curve_editor(ui, &mut curve, &mut drag, &mut selected, None);
+                curve_editor(ui, &mut curve, &mut drag, &mut selected, None, None, None);
             });
         };
 
@@ -2776,7 +3198,12 @@ mod tests {
     fn strip_width(tabs: usize, available: f32, name: f32) -> f32 {
         let n = tabs.max(1) as f32;
         let per_tab = crate::TAB_PAD * 2.0 + crate::icons::BOX + crate::CLOSE_GAP + crate::GAP_TAB;
-        let fixed = 6.0 + n * per_tab + crate::icons::BOX + crate::GAP_ICONS + crate::icons::BOX;
+        let fixed = 6.0
+            + n * per_tab
+            + crate::DUP_SEAM
+            + crate::DUP_W
+            + crate::GAP_ICONS
+            + crate::icons::BOX;
         let cap = ((available - fixed) / n).clamp(crate::NAME_MIN, crate::NAME_MAX);
         fixed + n * name.min(cap)
     }

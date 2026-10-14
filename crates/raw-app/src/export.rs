@@ -1019,8 +1019,9 @@ pub fn write(path: &Path, w: u32, h: u32, scene: &[f32], spec: &Spec) -> std::io
 ///
 /// The table is the **same one the display shader samples**, baked from the same
 /// parameters at the same size. That is what makes preview and export the same picture
-/// rather than two implementations that agree until they do not.
-fn tone(mapped: &[f32], p: &raw_core::ToningParams) -> Vec<f32> {
+/// rather than two implementations that agree until they do not. The print loupe runs
+/// its tile through this too, so the loupe and the file are toned by one function.
+pub(crate) fn tone(mapped: &[f32], p: &raw_core::ToningParams) -> Vec<f32> {
     let lut = p.bake_flat(raw_core::toning::LUT_ENTRIES);
     let last = raw_core::toning::LUT_ENTRIES - 1;
     let mut out = Vec::with_capacity(mapped.len() * 3);

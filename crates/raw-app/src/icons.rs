@@ -286,6 +286,12 @@ const SOURCES: &[(&str, &str)] = &[
     // which is what a mask does to the picture under it. Its outer edge is the outer
     // edge of Card's stroke, so the filled and the outlined square measure the same.
     ("mask", include_str!("../../../icons/mask.svg")),
+    // A Curve instance's MASK section: the on-image tool, and turning the shape inside
+    // out. The tool is a crosshair because what it does is aim at the picture; invert is a
+    // ring with one half filled, the mark for "the other side of this". Both are
+    // monopro's own, on Phosphor's grid, and the section's third button is `close`.
+    ("crosshair", include_str!("../../../icons/crosshair.svg")),
+    ("invert", include_str!("../../../icons/circle-half.svg")),
 ];
 
 pub struct Icons {

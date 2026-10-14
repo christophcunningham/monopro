@@ -1736,14 +1736,20 @@ fn load_preview(
     edge: u32,
     rotate_verticals: bool,
 ) -> Option<raw_core::preview::Rgb8> {
-    let mut image = crate::lightbox::contact_thumbnail(
+    let crate::lightbox::Thumb {
+        img: mut image,
+        developed,
+    } = crate::lightbox::contact_thumbnail(
         &source.path,
         cache,
         mode == Preview::Developed,
         edge,
         source.orientation,
     )?;
-    if mode != Preview::Color {
+    // **Developed keeps a developed render's color**, which is its toning; a frame
+    // with no render falls back to the camera's picture, and that is grayed as Gray
+    // grays it. A gray profile still writes gray — `encode_for_profile` converts.
+    if mode == Preview::Gray || (mode == Preview::Developed && !developed) {
         for pixel in image.data.chunks_exact_mut(3) {
             let gray =
                 (0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32)

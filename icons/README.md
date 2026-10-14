@@ -10,6 +10,9 @@ Only SVGs referenced by the application are included here.
 - `mask.svg`, `gradient-linear.svg` and `gradient-radial.svg` were drawn for
   monopro, on Phosphor's 256 grid with its 16-unit stroke so they sit with
   `circle.svg` and `square.svg` (Phosphor) as one set of shape icons.
+- `crosshair.svg` and `circle-half.svg` were drawn for monopro on the same grid and
+  stroke: a ringed crosshair for Adjust on image, and a ring with its right half
+  filled for Invert, in a Curve instance's MASK section.
 
 Upstream license sources (retrieved 2026-09-15):
 
